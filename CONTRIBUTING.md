@@ -81,7 +81,32 @@ python scripts/check-spdx.py
 
 ## 提交说明
 
-说清楚**为什么**，不是**改了什么** —— 改了什么 diff 里看得见。
+格式用 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/v1.0.0/)：
+
+```
+<type>(<scope>): <一句话说清楚这次提交>
+
+<正文：为什么>
+
+Signed-off-by: ...
+```
+
+- **type**：`feat` 新功能、`fix` 修 bug、`perf` 性能、`refactor` 重构、
+  `test` 测试、`docs` 文档、`ci` CI、`build` 构建和依赖、`chore` 杂项
+- **scope**：改的是哪个 crate，比如 `voice-core`、`server`、`client`、`protocol`；
+  跨好几个或者不属于任何 crate 就省掉
+- 摘要行可以写中文，不加句号。破坏兼容的改动在 type 后面加 `!`，
+  并在正文里写 `BREAKING CHANGE: ...`（改 `protocol` 的线上格式尤其要写）
+
+例子：
+
+```
+fix(voice-core): 采样率交给 Windows 转，播放坏了不再拖死采集
+perf(voice-core): APM 换成纯 Rust 的 sonora
+docs: README 重写成项目说明
+```
+
+正文说清楚**为什么**，不是**改了什么** —— 改了什么 diff 里看得见。
 
 这个项目的每个结论都是测出来的，涉及性能的改动请带上数字：
 哪个配置、测了多久、跟之前比是多少。
