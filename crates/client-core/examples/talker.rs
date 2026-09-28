@@ -6,10 +6,12 @@
 //! 得真有一路声音在解码、混音、过抖动缓冲，不然量到的是一个闲着的客户端。
 //!
 //! ```text
-//! cargo run --release -p client-core --example talker -- gouhuo://j/... [--seconds N] [--name 名字]
+//! cargo run --release -p client-core --example talker -- gouhuo://j/... [--seconds N] [--name 名字] [--silent] [--gain 0.03]
 //! ```
 //!
-//! 不给 `--seconds` 就一直说到 Ctrl-C。
+//! 不给 `--seconds` 就一直说到 Ctrl-C。`--silent` 只进频道不说话 ——
+//! 看界面时要有「在但没说话」的人来对照。`--gain` 把声音压小（1 是原样）：
+//! 界面上「在说话」只看有没有收到包，跟音量无关，调界面时不用听一屋子嗡嗡声。
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -29,7 +31,7 @@ struct LoopingVoice {
 }
 
 impl LoopingVoice {
-    fn new() -> Self {
+    fn new(gain: f32) -> Self {
         let rate = SAMPLE_RATE as f32;
         let clip = (0..SAMPLE_RATE as usize)
             .map(|i| {
@@ -39,7 +41,7 @@ impl LoopingVoice {
                 let voiced: f32 = (1..=6)
                     .map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32)
                     .sum();
-                voiced * envelope * 0.15
+                voiced * envelope * 0.15 * gain
             })
             .collect();
         Self {
@@ -69,10 +71,14 @@ fn main() {
     };
     let mut seconds: Option<f64> = None;
     let mut name = "说话机器人".to_string();
+    let mut silent = false;
+    let mut gain = 1.0_f32;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--name" => name = args.next().unwrap_or(name),
+            "--silent" => silent = true,
+            "--gain" => gain = args.next().and_then(|s| s.parse().ok()).unwrap_or(gain),
             other => {
                 eprintln!("不认识的参数：{other}");
                 std::process::exit(2);
@@ -107,18 +113,27 @@ fn main() {
             upstream_key: *keys.upstream.as_bytes(),
             downstream_key: *keys.downstream.as_bytes(),
             jitter: default_jitter(),
-            mode: TransmitMode::Always,
+            // 按住说话、但没人按：一帧都不发。
+            mode: if silent {
+                TransmitMode::PushToTalk
+            } else {
+                TransmitMode::Always
+            },
         },
-        Box::new(LoopingVoice::new()),
+        Box::new(LoopingVoice::new(gain)),
         Box::new(NullRender::default()),
         None,
     )
     .expect("语音链路起不来");
 
-    println!(
-        "「{name}」在说话（会话 {}，每帧 {FRAME_SAMPLES} 个采样）",
-        client.session_id()
-    );
+    if silent {
+        println!("「{name}」进来了，不说话（会话 {}）", client.session_id());
+    } else {
+        println!(
+            "「{name}」在说话（会话 {}，每帧 {FRAME_SAMPLES} 个采样）",
+            client.session_id()
+        );
+    }
     // 测量脚本靠这一行把它的音量调成 0：客户端照样解码、混音，只是不从音箱里出声。
     println!(
         "公钥 {}",
