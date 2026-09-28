@@ -1,0 +1,436 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// 篝火场景：固定镜头，一圈 8 块石头围着火，每块石头是频道里的一个人。
+//
+// 这个画面只有一个任务：**瞄一眼就知道谁在、谁在说话**。挂在后台打游戏的人
+// 切出来只看一两秒，所以氛围永远让位给这两件事。
+//
+// 谁坐哪块石头、底图和石头的像素画，都是 Rust 那边画好的（src/campfire/）。
+// 这里只管摆位置、把像素图不插值地放大、叠上字和状态。
+//
+// **几何比例两边各写了一份**：火塘在 (0.5, 0.55)、石头大小 `s`、座位角度。
+// 改这里要同时改 src/campfire/mod.rs 和 scene.rs。
+
+import { Theme, Btn } from "theme.slint";
+import { Slider, ComboBox } from "std-widgets.slint";
+
+/// 一个座位。模型固定 8 条，第 n 条就是 n 号座位 ——
+/// 这样「点开的是谁」可以记座位号，有人进出时不会点着 A 变成 B。
+export struct Seat {
+    /// 这个位子上有没有人。空位也占一条。
+    present: bool,
+    id: int,
+    name: string,
+    /// 刻在石头上的那一个字。
+    glyph: string,
+    /// 石头形状和颜色的种子，按公钥算的：同一个人在谁那里看都是同一块石头。
+    seed: int,
+    /// 像素石头：平时的、说话时的（绿描边 + 一圈火光）。
+    stone: image,
+    stone-talking: image,
+    muted: bool,
+    deafened: bool,
+    speaking: bool,
+    is-me: bool,
+    // 下面几个跟左边名单那一行一样，点开石头时用
+    volume: int,
+    role: int,
+    can-kick: bool,
+    can-ban: bool,
+    can-set-role: bool,
+}
+
+component StoneSeat {
+    in property <Seat> data;
+    in property <bool> talking;
+    /// 坐在火后面那半圈：名字写在石头上面，免得被火挡住。
+    in property <bool> up;
+    in property <length> s;
+    callback clicked();
+
+    width: 104px;
+    height: root.s + 24px;
+
+    accessible-role: button;
+    accessible-label: root.data.name
+        + (root.data.is-me ? "（我）" : "")
+        + (root.talking ? "，正在说话" : root.data.deafened ? "，关了耳朵" : root.data.muted ? "，闭麦" : "");
+    accessible-action-default => { root.clicked(); }
+
+    stone := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.up ? 24px : 0;
+        width: root.s * 1.45;
+        height: root.s;
+        opacity: root.data.deafened ? 0.5 : 1;
+
+        // 像素图比石头本身每边多几格，放说话时的那圈光；居中放
+        Image {
+            source: root.talking ? root.data.stone-talking : root.data.stone;
+            image-rendering: pixelated;
+            width: self.source.width * 4px;
+            height: self.source.height * 4px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+
+        // 刻出来的字：下沿一道很淡的亮边
+        Text {
+            y: 1.2px;
+            text: root.data.glyph;
+            color: root.talking ? transparent : #ffffff17;
+            font-size: root.s * 0.42;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+        Text {
+            text: root.data.glyph;
+            color: root.talking ? #FFD166 : #101014b0;
+            font-size: root.s * 0.42;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+
+        if root.data.muted || root.data.deafened: Rectangle {
+            width: root.s * 0.4;
+            height: self.width;
+            x: parent.width - self.width * 0.8;
+            y: parent.height - self.height * 0.8;
+            border-radius: self.width / 2;
+            border-width: 2px;
+            border-color: #0f1013;
+            background: root.data.deafened ? Theme.danger : Theme.warn;
+            Image {
+                source: root.data.deafened ? @image-url("icons/ear-off.svg") : @image-url("icons/mic-off.svg");
+                width: parent.width * 0.6;
+                height: self.width;
+            }
+        }
+    }
+
+    Rectangle {
+        y: root.up ? 0 : root.s + 4px;
+        height: 20px;
+        width: Math.min(label.preferred-width + 14px, parent.width);
+        x: (parent.width - self.width) / 2;
+        border-radius: 4px;
+        background: #101114b8;
+        label := Text {
+            text: root.data.name + (root.data.is-me ? "（我）" : "");
+            width: parent.width - 14px;
+            color: root.talking ? #ffffff : (root.data.is-me ? Theme.accent : Theme.dim);
+            font-size: 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    TouchArea {
+        // 点自己没有反应 —— 跟左边名单一样，自己的开关在左下角。
+        enabled: !root.data.is-me;
+        mouse-cursor: root.data.is-me ? default : pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Campfire inherits Rectangle {
+    in property <[Seat]> seats;
+    /// 座位满了之后来的人，按先后。
+    in property <[Seat]> waiting;
+    /// 排队的人里有没有人在说话 —— 有的话「还有 N 人」上亮个绿点。
+    in property <bool> waiting-talking;
+    /// 自己在不在发声。服务端不会把自己的说话状态转回来，自己那块石头看这个。
+    in property <bool> transmitting;
+    /// 像素底图：夜色、火光、柴堆、火苗。一格是 4 个逻辑像素。
+    in property <image> backdrop;
+
+    /// 画面大小变了，Rust 那边要按新尺寸重画底图和石头。
+    callback resized(length, length);
+    init => { root.resized(self.width, self.height); }
+    changed width => { root.resized(self.width, self.height); }
+    changed height => { root.resized(self.width, self.height); }
+
+    callback set-volume(int, float);
+    callback save-volumes();
+    callback kick(int);
+    callback ban(int);
+    callback set-role(int, int);
+
+    background: #0f1013;
+    clip: true;
+
+    property <length> s: Math.clamp(Math.min(self.width, self.height) * 0.125, 34px, 62px);
+    property <length> fx: self.width / 2;
+    property <length> fy: self.height * 0.55;
+    property <length> rx: self.width * 0.31;
+    property <length> ry: self.height * 0.25;
+
+    // 0 号座位是自己，在最靠镜头的地方稍微偏左。整圈转半格，
+    // 让开火正上方那个会被火苗挡住的位置。
+    pure function angle(seat: int) -> angle { 112.5deg + seat * 45deg }
+    pure function seat-x(seat: int) -> length { root.fx + root.rx * Math.cos(root.angle(seat)) }
+    pure function seat-y(seat: int) -> length { root.fy + root.ry * Math.sin(root.angle(seat)) }
+
+    // 点开了谁：座位号（或排队序号）+ 那人的 id。**两个都要对得上才画** ——
+    // 人走了、位子被别人补上的时候，卡片不能变成别人的。
+    property <int> card: -1;
+    property <int> card-id: -1;
+    property <bool> card-waiting: false;
+    property <Seat> card-data: root.card-waiting ? root.waiting[root.card] : root.seats[root.card];
+    property <bool> card-open: root.card >= 0 && root.card-data.present && root.card-data.id == root.card-id;
+    property <int> ban-armed: -1;
+    property <bool> list-open: false;
+
+    function open-card(index: int, id: int, waiting: bool) {
+        root.card = index;
+        root.card-id = id;
+        root.card-waiting = waiting;
+        root.ban-armed = -1;
+        root.list-open = false;
+    }
+    function close-card() {
+        root.card = -1;
+        root.ban-armed = -1;
+    }
+
+    // ---- 底图 ----
+    Image {
+        width: 100%;
+        height: 100%;
+        source: root.backdrop;
+        image-rendering: pixelated;
+        image-fit: fill;
+        accessible-role: none;
+    }
+
+    // ---- 一圈人 ----
+    for seat[i] in root.seats: StoneSeat {
+        visible: seat.present;
+        data: seat;
+        talking: seat.speaking || (seat.is-me && root.transmitting);
+        up: Math.sin(root.angle(i)) < -0.05;
+        s: root.s;
+        x: root.seat-x(i) - self.width / 2;
+        y: self.up ? root.seat-y(i) - root.s / 2 - 24px : root.seat-y(i) - root.s / 2;
+        clicked => { root.open-card(i, seat.id, false); }
+    }
+
+    // ---- 座位满了：还有 N 人 ----
+    if root.waiting.length > 0: Rectangle {
+        x: parent.width - self.width - 10px;
+        y: parent.height - self.height - 10px;
+        width: more-row.preferred-width;
+        height: 28px;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: more-touch.has-hover ? Theme.hover : Theme.raised;
+
+        accessible-role: button;
+        accessible-label: "还有 " + root.waiting.length + " 人没坐下" + (root.waiting-talking ? "，其中有人在说话" : "");
+        accessible-action-default => { root.list-open = !root.list-open; }
+
+        more-row := HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 12px;
+            spacing: 6px;
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.waiting-talking ? Theme.speaking : Theme.faint;
+            }
+            Text {
+                text: "还有 " + root.waiting.length + " 人";
+                color: Theme.text;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+        more-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.list-open = !root.list-open;
+                root.close-card();
+            }
+        }
+    }
+
+    // ---- 点空白处收起卡片和名单 ----
+    if root.card-open || root.list-open: TouchArea {
+        clicked => {
+            root.close-card();
+            root.list-open = false;
+        }
+    }
+
+    if root.list-open && root.waiting.length > 0: Rectangle {
+        width: 200px;
+        x: parent.width - self.width - 10px;
+        y: parent.height - self.height - 44px;
+        height: list.preferred-height;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.raised;
+        drop-shadow-blur: 20px;
+        drop-shadow-color: #00000070;
+
+        list := VerticalLayout {
+            padding: 6px;
+            Text {
+                text: "座位满了，这些人还没坐下";
+                color: Theme.dim;
+                font-size: 12px;
+                height: 24px;
+                vertical-alignment: center;
+            }
+            for person[i] in root.waiting: Rectangle {
+                height: 28px;
+                border-radius: 6px;
+                background: row-touch.has-hover ? Theme.hover : transparent;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 8px;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: person.speaking ? Theme.speaking
+                            : person.deafened ? Theme.danger
+                            : person.muted ? Theme.warn : Theme.faint;
+                    }
+                    Text {
+                        text: person.name;
+                        color: Theme.text;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                }
+                row-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.open-card(i, person.id, true); }
+                }
+            }
+        }
+    }
+
+    // ---- 点开一个人：音量，有权限的话还有管理操作 ----
+    if root.card-open: Rectangle {
+        width: Math.min(290px, parent.width - 16px);
+        height: card-body.preferred-height;
+        x: root.card-waiting
+            ? parent.width - self.width - 10px
+            : Math.clamp(root.seat-x(root.card) - self.width / 2, 8px, parent.width - self.width - 8px);
+        y: root.card-waiting
+            ? parent.height - self.height - 44px
+            : (root.seat-y(root.card) + root.s / 2 + 28px + self.height < parent.height - 8px
+                ? root.seat-y(root.card) + root.s / 2 + 28px
+                : Math.max(8px, root.seat-y(root.card) - root.s / 2 - 28px - self.height));
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.raised;
+        drop-shadow-blur: 20px;
+        drop-shadow-color: #00000070;
+
+        // 卡片上的点击别漏到下面那层「点空白处收起」
+        TouchArea { }
+
+        card-body := VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+
+            Text {
+                text: root.card-data.name;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                height: 34px;
+                spacing: 8px;
+                vol := Slider {
+                    minimum: 0;
+                    maximum: 400;
+                    value: root.card-data.volume;
+                    horizontal-stretch: 1;
+                    changed(v) => { root.set-volume(root.card-data.id, v); }
+                    released(v) => { root.save-volumes(); }
+                }
+                Text {
+                    text: root.card-data.volume + "%";
+                    color: Theme.dim;
+                    font-size: 12px;
+                    width: 40px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+                Btn {
+                    width: 52px;
+                    height: 26px;
+                    y: (parent.height - self.height) / 2;
+                    label: root.card-data.volume == 0 ? "恢复" : "静音";
+                    clicked => {
+                        // 同左边名单：滑条拖过之后就不再跟着绑定走，要亲手拨过去。
+                        vol.value = root.card-data.volume == 0 ? 100 : 0;
+                        root.set-volume(root.card-data.id, vol.value);
+                        root.save-volumes();
+                    }
+                }
+            }
+
+            if root.card-data.can-kick || root.card-data.can-ban || root.card-data.can-set-role: HorizontalLayout {
+                height: 34px;
+                spacing: 6px;
+                if root.card-data.can-set-role: ComboBox {
+                    horizontal-stretch: 1;
+                    model: ["访客", "成员", "频道管理", "管理员"];
+                    current-index: root.card-data.role - 1;
+                    selected(v) => { root.set-role(root.card-data.id, self.current-index); }
+                }
+                if !root.card-data.can-set-role: Rectangle { horizontal-stretch: 1; }
+                if root.card-data.can-kick: Btn {
+                    width: 52px;
+                    height: 26px;
+                    y: (parent.height - self.height) / 2;
+                    label: "踢出";
+                    clicked => {
+                        root.kick(root.card-data.id);
+                        root.close-card();
+                    }
+                }
+                // 同左边名单：封禁要点两下。
+                if root.card-data.can-ban: Btn {
+                    width: root.ban-armed == root.card-data.id ? 76px : 52px;
+                    height: 26px;
+                    y: (parent.height - self.height) / 2;
+                    label: root.ban-armed == root.card-data.id ? "确认封禁" : "封禁";
+                    primary: root.ban-armed == root.card-data.id;
+                    clicked => {
+                        if (root.ban-armed == root.card-data.id) {
+                            root.ban(root.card-data.id);
+                            root.close-card();
+                        } else {
+                            root.ban-armed = root.card-data.id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

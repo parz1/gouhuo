@@ -2,6 +2,8 @@
 
 import { Theme, Btn, Field, Dot, LevelBar } from "theme.slint";
 import { ScrollView, Slider, ComboBox } from "std-widgets.slint";
+import { Campfire, Seat } from "campfire.slint";
+export { Seat }
 
 // 频道树和成员名单压成的一行。
 //
@@ -163,10 +165,17 @@ export component App inherits Window {
     icon: @image-url("icons/flame.svg");
     background: Theme.bg;
     default-font-family: Theme.font;
-    min-width: 720px;
-    min-height: 480px;
-    preferred-width: 900px;
-    preferred-height: 620px;
+    // 挂在游戏旁边用的，要能缩得很小。窄到放不下左边的频道树时，
+    // 频道树收起来，用左上角的「频道」叫出来（见 narrow）。
+    min-width: 400px;
+    min-height: 360px;
+    preferred-width: 760px;
+    preferred-height: 520px;
+
+    /// 窗口窄到左边频道树和篝火并排放不下。这时两个只显示一个。
+    property <bool> narrow: root.width < 640px;
+    /// 窄窗口时：现在显示的是不是频道树。
+    property <bool> tree-open: false;
 
     // ---- 状态 ----
     in-out property <bool> connected: false;
@@ -180,6 +189,33 @@ export component App inherits Window {
     in property <string> my-fingerprint;
     in property <[Row]> rows;
     in property <[ChatRow]> chat;
+    /// 篝火：固定 8 条，第 n 条是 n 号座位。见 campfire.slint。
+    in property <[Seat]> seats;
+    /// 座位满了之后来的人。
+    in property <[Seat]> waiting;
+    in property <bool> waiting-talking: false;
+    /// 我所在的频道叫什么，篝火上面那一栏显示。
+    in property <string> channel-name;
+    /// 篝火的像素底图，Rust 那边按画面大小画好。
+    in property <image> campfire-backdrop;
+    /// 篝火画面大小变了，要重画底图和石头。
+    callback campfire-resized(length, length);
+    /// 篝火现在是不是摆在眼前（不是在看文字聊天、设置、窄窗口下的频道树）。
+    /// Rust 那边看它决定火要不要动 —— 看不见的火一帧都不画。
+    out property <bool> campfire-shown: root.connected && !root.show-settings && !root.chat-open
+        && !(root.narrow && root.tree-open);
+    /// 右边显示文字聊天还是篝火。纯界面状态。
+    in-out property <bool> chat-open: false;
+    /// 上次看聊天时有几条，用来判断有没有没看过的。
+    ///
+    /// 按条数比，所以聊天记录攒满（client-core 的 MAX_CHAT_LINES）以后
+    /// 新消息就不提示了。一次开黑攒不到两百条，先这样。
+    property <int> chat-seen: 0;
+    changed chat => {
+        if (root.chat-open) {
+            root.chat-seen = root.chat.length;
+        }
+    }
     in-out property <string> draft;
     in-out property <bool> self-muted: false;
     in-out property <bool> self-deafened: false;
@@ -405,8 +441,8 @@ export component App inherits Window {
         spacing: 0;
 
         // ---- 左：频道树 + 成员 ----
-        Rectangle {
-            width: 260px;
+        if !root.narrow || root.tree-open: Rectangle {
+            width: root.narrow ? root.width : 260px;
             background: Theme.panel;
 
             VerticalLayout {
@@ -426,6 +462,14 @@ export component App inherits Window {
                             vertical-alignment: center;
                             overflow: elide;
                             horizontal-stretch: 1;
+                        }
+                        // 窄窗口时频道树占满整个窗口，这里回到篝火
+                        if root.narrow: Btn {
+                            width: 56px;
+                            height: 28px;
+                            y: (parent.height - self.height) / 2;
+                            label: "篝火";
+                            clicked => { root.tree-open = false; }
                         }
                         Btn {
                             width: 34px;
@@ -598,6 +642,7 @@ export component App inherits Window {
                                 clicked => {
                                     if (row.is-channel) {
                                         root.join-channel(row.id);
+                                        root.tree-open = false;
                                     } else {
                                         volume-open = volume-open == row.id ? -1 : row.id;
                                     }
@@ -867,10 +912,10 @@ export component App inherits Window {
             }
         }
 
-        Rectangle { width: 1px; background: Theme.line; }
+        if !root.narrow: Rectangle { width: 1px; background: Theme.line; }
 
-        // ---- 右：文字 ----
-        Rectangle {
+        // ---- 右：篝火，或者文字聊天 ----
+        if !root.narrow || !root.tree-open: Rectangle {
             background: Theme.bg;
             horizontal-stretch: 1;
 
@@ -881,15 +926,59 @@ export component App inherits Window {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         spacing: 8px;
+                        // 不用「☰」：雅黑里没有这个字，画出来是个方框
+                        if root.narrow: Btn {
+                            width: 52px;
+                            y: (parent.height - self.height) / 2;
+                            label: "频道";
+                            clicked => { root.tree-open = true; }
+                        }
                         Text {
-                            text: "频道文字";
+                            text: root.chat-open ? "频道文字" : root.channel-name;
                             color: Theme.dim;
                             font-size: 13px;
                             vertical-alignment: center;
+                            overflow: elide;
                             horizontal-stretch: 1;
                         }
+                        // 窄窗口时左下角那一条（闭麦、关耳朵）跟着频道树收起来了，搬到这里
+                        if root.narrow: Btn {
+                            width: 40px;
+                            y: (parent.height - self.height) / 2;
+                            label: root.self-muted ? "🔇" : "🎤";
+                            clicked => { root.toggle-mute(); }
+                        }
+                        if root.narrow: Btn {
+                            width: 40px;
+                            y: (parent.height - self.height) / 2;
+                            label: root.self-deafened ? "🔕" : "🔊";
+                            clicked => { root.toggle-deafen(); }
+                        }
+                        // 篝火和文字来回切。有没看过的消息时按钮上亮个点 ——
+                        // 看着篝火的时候，别人发的链接不能就这么错过了。
+                        Rectangle {
+                            width: root.narrow ? 56px : 72px;
+                            height: 36px;
+                            y: (parent.height - self.height) / 2;
+                            Btn {
+                                width: 100%;
+                                label: root.chat-open ? "篝火" : "文字";
+                                clicked => {
+                                    root.chat-open = !root.chat-open;
+                                    root.chat-seen = root.chat.length;
+                                }
+                            }
+                            if !root.chat-open && root.chat.length > root.chat-seen: Rectangle {
+                                x: parent.width - 12px;
+                                y: 4px;
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                            }
+                        }
                         Btn {
-                            width: 72px;
+                            width: root.narrow ? 56px : 72px;
                             y: (parent.height - self.height) / 2;
                             label: "离开";
                             clicked => { root.leave(); }
@@ -940,7 +1029,22 @@ export component App inherits Window {
                     }
                 }
 
-                ScrollView {
+                if !root.chat-open: Campfire {
+                    vertical-stretch: 1;
+                    seats: root.seats;
+                    waiting: root.waiting;
+                    waiting-talking: root.waiting-talking;
+                    transmitting: root.transmitting;
+                    backdrop: root.campfire-backdrop;
+                    resized(w, h) => { root.campfire-resized(w, h); }
+                    set-volume(id, v) => { root.set-user-volume(id, v); }
+                    save-volumes => { root.save-user-volumes(); }
+                    kick(id) => { root.kick-user(id); }
+                    ban(id) => { root.ban-user(id); }
+                    set-role(id, index) => { root.set-role(id, index); }
+                }
+
+                if root.chat-open: ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
                         padding: Theme.pad;
@@ -981,7 +1085,7 @@ export component App inherits Window {
                     }
                 }
 
-                Rectangle {
+                if root.chat-open: Rectangle {
                     height: 60px;
                     HorizontalLayout {
                         padding: 12px;

@@ -26,6 +26,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Time",
     "Win32_Graphics_Dwm",
+    # 篝火：看前台是不是全屏游戏，是的话火就别烧了（src/main.rs 的 fire_pace）
+    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     # 只开一个实例、把链接转交给已经在跑的那个：见 src/single_instance.rs
     "Win32_Security",

@@ -52,6 +52,14 @@ const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// 界面线程不管窗口在不在都每秒醒 190 次左右，跟游戏抢的就是这种零碎的调度。
 const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// 篝火的火苗多久动一下。10 帧：像素画本来就是一跳一跳的，再快看不出区别，
+/// 只是多花 CPU —— 而这个窗口是要挂在游戏旁边一晚上的。
+const FIRE_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 窗口不在前台时（比如放在副屏上）火慢下来：4 帧，看得出在烧就够了。
+const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+mod campfire;
 mod settings;
 mod single_instance;
 mod update;
@@ -232,6 +240,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     TRAY.with(|slot| *slot.borrow_mut() = tray);
     load_devices(&app, &state);
     spawn_status_poll(app.as_weak(), Arc::clone(&state));
+    spawn_fire(app.as_weak());
     listen_for_other_instances(&app, &state, instance_key);
     if let Some(hotkeys) = hotkeys {
         spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
@@ -437,6 +446,8 @@ struct State {
     /// 念名字的后台线程。**第一次要念的时候才起** —— 大多数人不开这个功能，
     /// 不该为它常驻一个线程和一个语音合成引擎。
     announcer: Option<Announcer>,
+    /// 篝火上谁坐哪块石头。跨刷新保留 —— 坐下了就不挪。
+    seats: campfire::SeatMap,
 }
 
 thread_local! {
@@ -449,6 +460,11 @@ thread_local! {
     /// 托盘图标。丢掉它图标就没了，所以跟定时器一样放在这儿活到最后。
     /// `None` = 建不起来（系统不支持之类）—— 那样点 × 就只能退出，不能收起来。
     static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) };
+    /// 篝火：画面多大、哪个频道的柴堆、火烧到哪儿了。
+    /// 大小是界面报上来的，频道是名单刷新时定的；任何一个变了就重画底图。
+    static CAMPFIRE: RefCell<campfire::Stage> = RefCell::new(campfire::Stage::default());
+    /// 让火动起来的定时器。只在篝火真的看得见时跑，见 `fire_pace`。
+    static FIRE_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
 
 /// 点「加入」之后发生的事。
@@ -1086,6 +1102,19 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
         // 窗口看不见就只管托盘，界面同步放慢。窗口开着但没什么在动的时候
         // （没进频道、也没在试麦 —— 登录页）同样放慢：电平条、说话指示都没有。
         let hidden = !app.window().is_visible() || app.window().is_minimized();
+
+        // 篝火该动就把火的定时器开起来（停是它自己停的，见 spawn_fire）。
+        // 这里最慢半秒看一次，所以窗口恢复、游戏切走之后，火最多愣半秒才动。
+        if !hidden && fire_pace(&app).is_some() {
+            FIRE_TIMER.with(|slot| {
+                if let Some(timer) = slot.borrow().as_ref() {
+                    if !timer.running() {
+                        timer.restart();
+                    }
+                }
+            });
+        }
+
         let idle = voice.is_none() && mic_check.is_none();
         let interval = if hidden || idle {
             BACKGROUND_POLL
@@ -1209,6 +1238,25 @@ fn update_speaking(app: &App, client: &Client, speaking: &[u32]) {
             row.speaking = now;
             rows.set_row_data(i, row);
         }
+    }
+
+    // 篝火那边同样只改变了的。自己那块石头看的是「在不在发声」，界面自己管。
+    let mut waiting_talking = false;
+    for (model, is_waiting) in [(app.get_seats(), false), (app.get_waiting(), true)] {
+        for i in 0..model.row_count() {
+            let Some(mut seat) = model.row_data(i) else {
+                continue;
+            };
+            let now = seat.present && speaking.contains(&(seat.id as u32)) && seat.id as u32 != me;
+            waiting_talking |= is_waiting && now;
+            if seat.speaking != now {
+                seat.speaking = now;
+                model.set_row_data(i, seat);
+            }
+        }
+    }
+    if app.get_waiting_talking() != waiting_talking {
+        app.set_waiting_talking(waiting_talking);
     }
 }
 
@@ -1460,8 +1508,295 @@ fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         .collect();
     app.set_bans(ModelRc::new(VecModel::from(bans)));
 
+    // 篝火上的人。先把要用的从名单里抄出来，放开名单的锁再去拿 state 的。
+    let my_channel = roster.my_channel();
+    let me = roster.me;
+    let channel_name = roster
+        .channels
+        .get(&my_channel)
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
+    let here: Vec<Seat> = roster
+        .users_in(my_channel)
+        .into_iter()
+        .map(|user| Seat {
+            present: true,
+            id: user.session_id as i32,
+            name: user.name.clone().into(),
+            glyph: campfire::glyph(&user.name).into(),
+            seed: campfire::stone_seed(&user.public_key) as i32,
+            stone: Default::default(),
+            stone_talking: Default::default(),
+            muted: user.self_muted || user.server_muted,
+            deafened: user.self_deafened,
+            speaking: false,
+            is_me: user.session_id == me,
+            volume: settings.user_volume(&volume_key(&user.public_key)) as i32,
+            role: user.role,
+            can_kick: roster.can_kick(user.session_id),
+            can_ban: roster.can_ban(user.session_id),
+            can_set_role: roster.can_set_role(user.session_id),
+        })
+        .collect();
+    drop(roster);
+
     app.set_rows(ModelRc::new(VecModel::from(rows)));
     app.set_chat(ModelRc::new(VecModel::from(chat)));
+    app.set_channel_name(channel_name.into());
+    refresh_campfire(app, state, my_channel, me, here);
+}
+
+/// 把频道里的人排到篝火的座位上。
+///
+/// 跟名单不同，**不整个重建模型**，只改变了的那几块石头：整个换掉的话
+/// 每次有人改个静音，所有石头都要销毁重建，说话的光晕动画也跟着断。
+fn refresh_campfire(app: &App, state: &Arc<Mutex<State>>, channel: u32, me: u32, here: Vec<Seat>) {
+    let ids: Vec<u32> = here.iter().map(|s| s.id as u32).collect();
+    let (seated, waiting): (Vec<Option<u32>>, Vec<u32>) = {
+        let mut locked = state.lock().expect("state poisoned");
+        locked.seats.update(channel, me, &ids);
+        let seated = (0..campfire::SEATS)
+            .map(|n| {
+                ids.iter()
+                    .copied()
+                    .find(|&id| locked.seats.seat_of(id) == Some(n))
+            })
+            .collect();
+        (seated, locked.seats.waiting().to_vec())
+    };
+
+    // 谁在说话要等下一次同步（50 ms 一次）才知道。这之前先沿用模型里原来的，
+    // 不然每次刷新石头都会灭一下。
+    let was_speaking = |id: i32| {
+        [app.get_seats(), app.get_waiting()]
+            .iter()
+            .any(|m| m.iter().any(|s| s.present && s.id == id && s.speaking))
+    };
+    let find = |id: u32| {
+        here.iter()
+            .find(|s| s.id as u32 == id)
+            .cloned()
+            .map(|mut s| {
+                s.speaking = was_speaking(s.id);
+                s
+            })
+    };
+    let size = CAMPFIRE.with(|stage| {
+        let mut stage = stage.borrow_mut();
+        if stage.set_channel(channel) {
+            app.set_campfire_backdrop(stage.still());
+        }
+        stage.size()
+    });
+    let seats: Vec<Seat> = seated
+        .into_iter()
+        .enumerate()
+        .map(|(n, id)| {
+            let mut seat = id.and_then(find).unwrap_or_default();
+            if seat.present {
+                (seat.stone, seat.stone_talking) =
+                    campfire::stone_images(seat.seed as u32, n, size);
+            }
+            seat
+        })
+        .collect();
+    let waiting: Vec<Seat> = waiting.into_iter().filter_map(find).collect();
+
+    app.set_waiting_talking(waiting.iter().any(|s| s.speaking));
+    let current = app.get_seats();
+    if !update_in_place(&current, seats.clone()) {
+        app.set_seats(ModelRc::new(VecModel::from(seats)));
+    }
+    let current = app.get_waiting();
+    if !update_in_place(&current, waiting.clone()) {
+        app.set_waiting(ModelRc::new(VecModel::from(waiting)));
+    }
+}
+
+/// 篝火画面的大小变了：底图和石头都按新尺寸重画（一格的逻辑大小不变，格数变了）。
+fn resize_campfire(app: &App, width: f32, height: f32) {
+    let backdrop = CAMPFIRE.with(|stage| {
+        let mut stage = stage.borrow_mut();
+        stage.set_size((width, height)).then(|| stage.still())
+    });
+    let Some(backdrop) = backdrop else {
+        return;
+    };
+    app.set_campfire_backdrop(backdrop);
+    let seats = app.get_seats();
+    for n in 0..seats.row_count() {
+        let Some(mut seat) = seats.row_data(n) else {
+            continue;
+        };
+        if seat.present {
+            (seat.stone, seat.stone_talking) =
+                campfire::stone_images(seat.seed as u32, n, (width, height));
+            seats.set_row_data(n, seat);
+        }
+    }
+}
+
+/// 火现在该多久动一下；`None` 是别动。
+///
+/// - 篝火不在眼前（收在托盘里、最小化、切到文字聊天、窄窗口时看着频道树）：不动
+/// - 系统关了动画：不动
+/// - 窗口在前台：[`FIRE_FRAME`]
+/// - 不在前台，但前台是个铺满同一块屏幕的全屏程序（就是在打游戏）：不动。
+///   这是最常见的情况 —— 篝火开着没最小化、被游戏整个盖住，画了也没人看得见
+/// - 不在前台、也没被全屏盖住（比如放在副屏上）：慢下来，[`FIRE_FRAME_IDLE`]
+fn fire_pace(app: &App) -> Option<std::time::Duration> {
+    if !app.get_campfire_shown()
+        || !app.window().is_visible()
+        || app.window().is_minimized()
+        || !system_animations_on()
+    {
+        return None;
+    }
+    match foreground(app) {
+        Foreground::Us => Some(FIRE_FRAME),
+        Foreground::FullscreenOther => None,
+        Foreground::Other => Some(FIRE_FRAME_IDLE),
+    }
+}
+
+enum Foreground {
+    Us,
+    /// 别的程序，而且铺满了我们所在的那块屏幕。
+    FullscreenOther,
+    Other,
+}
+
+#[cfg(windows)]
+fn foreground(app: &App) -> Foreground {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect,
+    };
+
+    let handle = app.window().window_handle();
+    let Ok(handle) = handle.window_handle() else {
+        return Foreground::Us;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return Foreground::Us;
+    };
+    let ours = win32.hwnd.get() as *mut core::ffi::c_void;
+    // SAFETY: 全是只读的查询；句柄来自窗口系统本身，出参都是我们自己的栈变量、大小对得上。
+    unsafe {
+        let front = GetForegroundWindow();
+        if front.is_null() || front == ours {
+            return Foreground::Us;
+        }
+        // 点了桌面的时候前台是桌面本身，它也铺满整块屏幕，但不是在打游戏
+        let mut class = [0u16; 16];
+        let len = GetClassNameW(front, class.as_mut_ptr(), class.len() as i32) as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        if class == "Progman" || class == "WorkerW" {
+            return Foreground::Other;
+        }
+        let monitor = MonitorFromWindow(ours, MONITOR_DEFAULTTONEAREST);
+        if monitor != MonitorFromWindow(front, MONITOR_DEFAULTTONEAREST) {
+            return Foreground::Other;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let mut rect: RECT = std::mem::zeroed();
+        if GetMonitorInfoW(monitor, &mut info) == 0 || GetWindowRect(front, &mut rect) == 0 {
+            return Foreground::Other;
+        }
+        let screen = info.rcMonitor;
+        let covers = rect.left <= screen.left
+            && rect.top <= screen.top
+            && rect.right >= screen.right
+            && rect.bottom >= screen.bottom;
+        if covers {
+            Foreground::FullscreenOther
+        } else {
+            Foreground::Other
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn foreground(_app: &App) -> Foreground {
+    Foreground::Us
+}
+
+/// Windows 设置里「显示动画」关了没有（辅助功能 → 视觉效果 → 动画效果）。
+///
+/// 关了的人要么是晃眼、要么是机器吃力，火就不动了，只画一帧。
+#[cfg(windows)]
+fn system_animations_on() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+    };
+    let mut on: i32 = 1;
+    // SAFETY: 这个查询往 pvParam 写一个 BOOL，给的正是一个 BOOL 大小的变量。
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut on as *mut i32).cast(),
+            0,
+        )
+    };
+    ok == 0 || on != 0
+}
+
+#[cfg(not(windows))]
+fn system_animations_on() -> bool {
+    true
+}
+
+/// 火的定时器。一开始是停着的，由状态同步那边（`spawn_status_poll`）按需开起来；
+/// 该停、该变快变慢，它每一帧自己看（`fire_pace`）。
+fn spawn_fire(weak: slint::Weak<App>) {
+    let timer = slint::Timer::default();
+    let mut last = std::time::Instant::now();
+    timer.start(slint::TimerMode::Repeated, FIRE_FRAME, move || {
+        let Some(app) = weak.upgrade() else { return };
+        let now = std::time::Instant::now();
+        // 定时器停过一阵再开，别让火一下子「快进」好几秒
+        let dt = now
+            .duration_since(last)
+            .min(FIRE_FRAME_IDLE * 2)
+            .as_secs_f32();
+        last = now;
+        let pace = fire_pace(&app);
+        FIRE_TIMER.with(|slot| {
+            if let Some(timer) = slot.borrow().as_ref() {
+                match pace {
+                    None => timer.stop(),
+                    Some(pace) if timer.interval() != pace => timer.set_interval(pace),
+                    Some(_) => {}
+                }
+            }
+        });
+        if pace.is_none() {
+            return;
+        }
+        let frame = CAMPFIRE.with(|stage| stage.borrow_mut().advance(dt));
+        app.set_campfire_backdrop(frame);
+    });
+    timer.stop();
+    FIRE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
+/// 行数一样就逐行改（只改变了的），返回 true；行数变了返回 false，由调用方整个换掉。
+fn update_in_place<T: Clone + PartialEq + 'static>(model: &ModelRc<T>, rows: Vec<T>) -> bool {
+    if model.row_count() != rows.len() {
+        return false;
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if model.row_data(i).as_ref() != Some(&row) {
+            model.set_row_data(i, row);
+        }
+    }
+    true
 }
 
 fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
@@ -1469,6 +1804,15 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
     // 回调的签名各不相同（有的带参数有的不带），宏反而要绕。
     fn current(state: &Arc<Mutex<State>>) -> Option<Client> {
         state.lock().expect("state poisoned").client.clone()
+    }
+
+    {
+        let weak = app.as_weak();
+        app.on_campfire_resized(move |width, height| {
+            if let Some(app) = weak.upgrade() {
+                resize_campfire(&app, width, height);
+            }
+        });
     }
 
     {
@@ -1530,6 +1874,18 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
                         rows.set_row_data(i, row);
                     }
                     break;
+                }
+            }
+            // 篝火上点开的那张卡片也在拖这个音量，同样只改那一块石头。
+            for model in [app.get_seats(), app.get_waiting()] {
+                for i in 0..model.row_count() {
+                    let Some(mut seat) = model.row_data(i) else {
+                        continue;
+                    };
+                    if seat.present && seat.id == session as i32 && seat.volume != percent as i32 {
+                        seat.volume = percent as i32;
+                        model.set_row_data(i, seat);
+                    }
                 }
             }
         });
@@ -1675,6 +2031,7 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
 fn tear_down() {
     PTT_TIMER.with(|slot| slot.borrow_mut().take());
     VOICE_TIMER.with(|slot| slot.borrow_mut().take());
+    FIRE_TIMER.with(|slot| slot.borrow_mut().take());
     REBIND.with(|slot| slot.borrow_mut().take());
     TRAY.with(|slot| slot.borrow_mut().take());
 }
