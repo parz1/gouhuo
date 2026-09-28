@@ -15,3 +15,6 @@
 # 客户端的身份和设置（正常在 %APPDATA%\gouhuo，但数据目录指到别处时会落这儿）
 identity.key
 settings.txt
+
+# docker compose 的 .env：里面是服务器地址，不进仓库
+/.env

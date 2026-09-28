@@ -105,17 +105,31 @@ cargo run --release -p server --bin gouhuo-server
 
 ### 用 Docker 部署
 
-放到一台 Linux 服务器上，最省事的是 Docker：
+放到一台 Linux 服务器上，最省事的是 Docker。服务器上不用放代码，也不用编译，
+只要 [`compose.yaml`](compose.yaml) 一个文件：
 
 ```bash
-GOUHUO_HOST=你的公网IP docker compose up -d --build
+mkdir gouhuo && cd gouhuo
+curl -fsSLO https://raw.githubusercontent.com/parz1/gouhuo/main/compose.yaml
+echo "GOUHUO_HOST=你的公网IP" > .env
+docker compose up -d
 docker compose logs gouhuo   # 邀请链接和管理员链接在这里
 ```
 
+**升级**：新版本发布之后，在同一个目录里
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+重启要一两秒，频道里的人会断一下。想钉住某个版本，在 `.env` 里加 `GOUHUO_VERSION=0.1.0`。
+
 - **防火墙 / 安全组要放行 20800 的 TCP 和 UDP**。漏了 UDP 的症状是能进频道、听不到声音
 - `GOUHUO_HOST` 必须手动设 —— 容器里只探测得到内网地址
-- 数据在命名卷 `gouhuo-data` 里，**里面有 TLS 私钥**，丢了所有旧邀请链接都作废。
-  别用 `docker compose down -v`
+- 数据在卷 `gouhuo-data` 里，升级不会动它。**里面有 TLS 私钥**，丢了所有旧邀请链接
+  都作废。别用 `docker compose down -v`；备份：
+  `docker run --rm -v gouhuo-data:/d alpine tar c -C /d . > gouhuo-backup.tar`
+- 从源码编：在仓库里 `docker compose up -d --build`
 - [`compose.yaml`](compose.yaml) 用的是 host 网络，只在 Linux 上有效；Docker Desktop
   上改用里面注释掉的 `ports`
 
@@ -147,7 +161,9 @@ cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 
 出来的是 `target\installer\gouhuo-setup-<版本>.exe`。推一个 `v*` 标签，CI 会做同样的事，
 再建一个草稿 Release 把安装包和服务端挂上去，见
-[`.github/workflows/release.yml`](.github/workflows/release.yml)。
+[`.github/workflows/release.yml`](.github/workflows/release.yml)。同时推
+`ghcr.io/parz1/gouhuo-server:<版本>` 镜像；在网页上点「发布」时 `latest` 才指过去
+（[`docker-latest.yml`](.github/workflows/docker-latest.yml)），草稿阶段 Docker 用户不会被升级。
 
 ---
 

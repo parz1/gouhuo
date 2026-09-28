@@ -61,3 +61,40 @@ jobs:
             --notes "安装：下载 gouhuo-setup-$version.exe 双击。没签名，Windows 会拦一下，点「更多信息」→「仍要运行」。" `
             "target\installer\gouhuo-setup-$version.exe" `
             "target\gouhuo-server-$version-windows-x64.exe"
+
+  # 服务端镜像，推到 ghcr.io/<owner>/gouhuo-server:<版本号>。
+  #
+  # **只推带版本号的，不动 latest。** 跟草稿 Release 一个道理：没点「发布」之前，
+  # 跟着 latest 的服务器不该被升级。latest 在 docker-latest.yml 里、点发布时才挪。
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 标签要跟 Cargo.toml 的版本一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(awk '/^\[/{p=($0=="[workspace.package]")} p&&/^version *=/{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)
+          [ "$tag" = "$version" ] || { echo "标签是 $tag，Cargo.toml 里是 $version"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/gouhuo-server:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

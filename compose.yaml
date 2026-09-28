@@ -1,5 +1,16 @@
+# 服务器上只需要这一个文件，加一个同目录的 .env：
+#
+#   GOUHUO_HOST=1.2.3.4
+#
+# 起服务 / 升级到最新版都是同一句：
+#
+#   docker compose pull && docker compose up -d
+#
+# 想钉在某个版本上，在 .env 里加 GOUHUO_VERSION=0.1.0。
 services:
   gouhuo:
+    image: ghcr.io/parz1/gouhuo-server:${GOUHUO_VERSION:-latest}
+    # 在仓库里 `docker compose up -d --build` 就是从源码编，不拉镜像。
     build: .
     restart: unless-stopped
     # host 网络：UDP 的对端地址是从收到的包里学的，少一层 Docker NAT 就少一处
@@ -12,11 +23,13 @@ services:
     init: true
     environment:
       # 写进邀请链接的地址。容器里自动探测只能探到内网 IP，必须手动设。
-      GOUHUO_HOST: ${GOUHUO_HOST:?设成服务器公网 IP，例如 GOUHUO_HOST=1.2.3.4}
+      GOUHUO_HOST: ${GOUHUO_HOST:?在 .env 里写 GOUHUO_HOST=服务器公网 IP}
       # GOUHUO_PORT: "20800"
       # GOUHUO_MAX_USERS: "20"
     volumes:
       - gouhuo-data:/data
 
 volumes:
+  # 写死名字，不随所在目录变 —— 备份命令、文档里才能写同一个名字。
   gouhuo-data:
+    name: gouhuo-data
