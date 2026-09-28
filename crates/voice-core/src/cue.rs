@@ -176,8 +176,10 @@ pub fn decode_wav(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
                     .chunks_exact(2 * channels)
                     .map(|frame| {
                         let sum: f32 = frame
-                            .chunks_exact(2)
-                            .map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|&s| i16::from_le_bytes(s) as f32 / 32768.0)
                             .sum();
                         sum / channels as f32
                     })

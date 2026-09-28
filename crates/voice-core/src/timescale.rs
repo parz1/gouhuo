@@ -65,7 +65,9 @@ pub fn accelerate(input: &[f32]) -> Option<Vec<f32>> {
 /// 先在 12 kHz 上粗搜，再回到 48 kHz 在粗搜结果附近细搜。
 fn find_period(input: &[f32]) -> Option<(usize, f32)> {
     let low: Vec<f32> = input
-        .chunks_exact(DECIMATE)
+        .as_chunks::<DECIMATE>()
+        .0
+        .iter()
         .map(|c| c.iter().sum::<f32>() / DECIMATE as f32)
         .collect();
     let coarse = correlations(
