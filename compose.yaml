@@ -1,0 +1,22 @@
+services:
+  gouhuo:
+    build: .
+    restart: unless-stopped
+    # host 网络：UDP 的对端地址是从收到的包里学的，少一层 Docker NAT 就少一处
+    # 改写源地址的可能。只在 Linux 上有效 —— Docker Desktop 上换成下面的 ports。
+    network_mode: host
+    # ports:
+    #   - "20800:20800/tcp"
+    #   - "20800:20800/udp"
+    # 服务端自己不处理 SIGTERM；没有 init 的话 docker stop 要干等 10 秒再强杀。
+    init: true
+    environment:
+      # 写进邀请链接的地址。容器里自动探测只能探到内网 IP，必须手动设。
+      GOUHUO_HOST: ${GOUHUO_HOST:?设成服务器公网 IP，例如 GOUHUO_HOST=1.2.3.4}
+      # GOUHUO_PORT: "20800"
+      # GOUHUO_MAX_USERS: "20"
+    volumes:
+      - gouhuo-data:/data
+
+volumes:
+  gouhuo-data:

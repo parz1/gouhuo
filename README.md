@@ -103,6 +103,24 @@ cargo run --release -p server --bin gouhuo-server
 | `GOUHUO_INVITE` | 首次启动随机生成；设成空串表示不要邀请码 |
 | `GOUHUO_MAX_USERS` | `20` |
 
+### 用 Docker 部署
+
+放到一台 Linux 服务器上，最省事的是 Docker：
+
+```bash
+GOUHUO_HOST=你的公网IP docker compose up -d --build
+docker compose logs gouhuo   # 邀请链接和管理员链接在这里
+```
+
+- **防火墙 / 安全组要放行 20800 的 TCP 和 UDP**。漏了 UDP 的症状是能进频道、听不到声音
+- `GOUHUO_HOST` 必须手动设 —— 容器里只探测得到内网地址
+- 数据在命名卷 `gouhuo-data` 里，**里面有 TLS 私钥**，丢了所有旧邀请链接都作废。
+  别用 `docker compose down -v`
+- [`compose.yaml`](compose.yaml) 用的是 host 网络，只在 Linux 上有效；Docker Desktop
+  上改用里面注释掉的 `ports`
+
+Railway 这类只转发 HTTP/TCP 的平台跑不了：语音走 UDP，而「UDP 不通时退回 TCP」还没做。
+
 ### 管理员
 
 第一次启动时，邀请链接下面还会多打一条**管理员链接**。自己用它连进去就成了
