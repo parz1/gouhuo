@@ -122,6 +122,7 @@ fn run() -> io::Result<()> {
     let tls_config = Arc::new(server_config(&cert).map_err(io::Error::other)?);
     let hub = Arc::new(Hub::with_store(server, voice, store));
 
+    let host_is_set = std::env::var_os("GOUHUO_HOST").is_some();
     let host = std::env::var("GOUHUO_HOST").unwrap_or_else(|_| local_address());
     let invite = Invite {
         host: host.clone(),
@@ -139,6 +140,7 @@ fn run() -> io::Result<()> {
         admin_invite.as_ref(),
         cert_is_new,
         code_is_new,
+        host_is_set,
         &data_dir,
         restored_channels,
     )?;
@@ -197,6 +199,7 @@ fn print_banner(
     admin_invite: Option<&Invite>,
     cert_is_new: bool,
     code_is_new: bool,
+    host_is_set: bool,
     data_dir: &Path,
     restored_channels: usize,
 ) -> io::Result<()> {
@@ -231,7 +234,9 @@ fn print_banner(
     } else if code_is_new {
         println!("  邀请码是首次启动随机生成的，存在 invite-code.txt 里。");
     }
-    if invite.host == "127.0.0.1" {
+    // 自己设了地址就别再劝人去设了 —— Docker 部署时日志里看到这句会以为没设对。
+    if host_is_set {
+    } else if invite.host == "127.0.0.1" {
         println!("  ⚠ 没探测到局域网地址，链接里写的是本机回环地址。");
         println!("    让外面的人连进来，要设 GOUHUO_HOST 成你的公网 IP 或域名。");
     } else {

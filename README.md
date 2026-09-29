@@ -105,27 +105,43 @@ cargo run --release -p server --bin gouhuo-server
 
 ### 用 Docker 部署
 
-放到一台 Linux 服务器上，最省事的是 Docker。服务器上不用放代码，也不用编译，
-只要 [`compose.yaml`](compose.yaml) 一个文件，设置写在旁边的 `.env` 里：
+放到一台 Linux 服务器上，最省事的是 Docker。服务器上不用放代码，也不用编译。
+找个目录，一条命令：
 
 ```bash
-mkdir gouhuo && cd gouhuo
+mkdir -p ~/gouhuo && cd ~/gouhuo
+curl -fsSL https://raw.githubusercontent.com/parz1/gouhuo/main/install.sh | sh
+```
+
+它会下载 [`compose.yaml`](compose.yaml)、探测公网 IP 写进 `.env`、拉镜像起服务，
+最后把邀请链接和管理员链接打出来。有域名就带上（推荐，理由见下面）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/parz1/gouhuo/main/install.sh | GOUHUO_HOST=voice.example.com sh
+```
+
+脚本不替你装 Docker、不动防火墙，缺了会告诉你怎么做。见 [`install.sh`](install.sh)。
+
+**升级**：新版本发布之后，在同一个目录里再跑一次同一条命令。`.env` 原样留着。
+
+<details>
+<summary>不想用脚本：手动三步</summary>
+
+```bash
 curl -fsSLO https://raw.githubusercontent.com/parz1/gouhuo/main/compose.yaml
 echo "GOUHUO_HOST=你的公网IP或域名" > .env
-docker compose up -d
-docker compose logs gouhuo   # 邀请链接和管理员链接在这里
+docker compose up -d && docker compose logs gouhuo   # 邀请链接在这里
 ```
 
-**升级**：新版本发布之后，在同一个目录里
+升级：`docker compose pull && docker compose up -d`。
 
-```bash
-docker compose pull && docker compose up -d
-```
+</details>
 
 重启要一两秒，频道里的人会断一下。想钉住某个版本，在 `.env` 里加 `GOUHUO_VERSION=0.1.0`。
 
 - **防火墙 / 安全组要放行 20800 的 TCP 和 UDP**。漏了 UDP 的症状是能进频道、听不到声音
-- `GOUHUO_HOST` 必须手动设 —— 容器里只探测得到内网地址
+- 地址得在 `.env` 里写明（容器里只探测得到内网地址）。脚本替你写了，但它探到的是
+  出网 IP，机器有多个公网 IP 时可能不是你想要的那个 —— 看一眼打出来的链接
 - **有域名就用域名。** 地址是写死在邀请链接里的，写 IP 的话换机器、换 IP 所有旧链接都作废；
   写域名只要改 DNS。不用申请证书（链接里带的是证书指纹，不看主机名）。
   Cloudflare 要选「仅 DNS」（灰云）—— 代理只转 HTTP，UDP 过不去
