@@ -1,7 +1,7 @@
 name: redline
 
 on:
-  # **不在 push 上跑。** public 仓库的标准 runner 是不计费的（GitHub 文档：
+  # **不在功能分支的 push 上跑。** public 仓库的标准 runner 是不计费的（GitHub 文档：
   # "free ... for public repositories that use standard GitHub-hosted runners"），
   # 所以这不是为了省钱 —— 是为了别让一个单人项目每次 push 都等 8 分钟、
   # 烧一台 Windows VM。
@@ -10,6 +10,14 @@ on:
   # 真正需要它的时候（准备发版、改完一个里程碑、动了跨平台的东西）跑一次就够。
   pull_request:
   workflow_dispatch:
+  # 合进 main 之后跑一次，主要是为了**给 PR 刷新编译缓存**。
+  #
+  # GitHub 的缓存按分支隔离：PR 存的缓存别的 PR 读不到，只有 main 的缓存大家都能读。
+  # 以前 main 上从来不跑，缓存一直停在 9 月 26 日那份 —— 之后每个 PR 都拿着它
+  # 重编大半个工作区（clippy 42s → 5min，test 57s → 5min），再存一份 1.5 GB、
+  # 谁也用不上的缓存。这一轮没人等它，跑多久都不耽误事。
+  push:
+    branches: [main]
 
 # 同一个 PR 再推一次，就把上一轮还没跑完的取消掉 —— 旧提交的结果没人会看。
 concurrency:
@@ -20,6 +28,10 @@ env:
   CARGO_TERM_COLOR: always
   # VS 自带的 cmake 是 4.x，libopus 的 CMakeLists 声明的最低版本太老会被直接拒。
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # 调试信息只留行号：panic 的回溯照样有「文件:行」，但 target 目录和缓存小一大截，
+  # 链接也快（Windows 上链接测试二进制是大头）。只影响 CI，本地构建不变。
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # DCO：每个提交都要有 Signed-off-by。
@@ -85,6 +97,10 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # 只有 main 存缓存。PR 存的别的 PR 读不到，还占着 10 GB 的总额度，
+          # 会把 main 那份挤掉。
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # APM 曾经要 meson + ninja + libclang + MSVC 环境注入，还要一个极短的
       # CARGO_TARGET_DIR 绕 MAX_PATH —— 因为它要从源码编 libwebrtc。
