@@ -106,12 +106,12 @@ cargo run --release -p server --bin gouhuo-server
 ### 用 Docker 部署
 
 放到一台 Linux 服务器上，最省事的是 Docker。服务器上不用放代码，也不用编译，
-只要 [`compose.yaml`](compose.yaml) 一个文件：
+只要 [`compose.yaml`](compose.yaml) 一个文件，设置写在旁边的 `.env` 里：
 
 ```bash
 mkdir gouhuo && cd gouhuo
 curl -fsSLO https://raw.githubusercontent.com/parz1/gouhuo/main/compose.yaml
-echo "GOUHUO_HOST=你的公网IP" > .env
+echo "GOUHUO_HOST=你的公网IP或域名" > .env
 docker compose up -d
 docker compose logs gouhuo   # 邀请链接和管理员链接在这里
 ```
@@ -126,6 +126,12 @@ docker compose pull && docker compose up -d
 
 - **防火墙 / 安全组要放行 20800 的 TCP 和 UDP**。漏了 UDP 的症状是能进频道、听不到声音
 - `GOUHUO_HOST` 必须手动设 —— 容器里只探测得到内网地址
+- **有域名就用域名。** 地址是写死在邀请链接里的，写 IP 的话换机器、换 IP 所有旧链接都作废；
+  写域名只要改 DNS。不用申请证书（链接里带的是证书指纹，不看主机名）。
+  Cloudflare 要选「仅 DNS」（灰云）—— 代理只转 HTTP，UDP 过不去
+- **`compose.yaml` 别改**，所有设置都写进 `.env`（见[上面的表](#起一个服务器)，比如
+  `GOUHUO_PORT=20900`）。改了 `.env` 之后 `docker compose up -d` 生效。改 `.env` 用编辑器，
+  别再 `echo ... > .env` —— 那会把别的设置冲掉
 - 数据在卷 `gouhuo-data` 里，升级不会动它。**里面有 TLS 私钥**，丢了所有旧邀请链接
   都作废。别用 `docker compose down -v`；备份：
   `docker run --rm -v gouhuo-data:/d alpine tar c -C /d . > gouhuo-backup.tar`
