@@ -18,15 +18,16 @@
 mod imp {
     use std::io;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GENERIC_WRITE,
-        HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
@@ -36,6 +37,9 @@ mod imp {
 
     /// 一条消息最长多少字节。邀请链接几十个字符，给足余量，但别让人往里灌。
     const MAX_MESSAGE: usize = 4096;
+
+    /// 管道忙的时候最多等多久。那边建下一个实例是微秒级的事，等满了说明那边卡死了。
+    const PIPE_BUSY_WAIT_MS: u32 = 2000;
 
     /// 占着「我是第一个」这个名额。进程活着就一直占着。
     pub struct Guard(#[allow(dead_code)] HANDLE, #[allow(dead_code)] HANDLE);
@@ -76,21 +80,31 @@ mod imp {
         // 没这个权。先把权限让出去，那边的 SetForegroundWindow 才管用。
         // SAFETY: 纯粹的权限设置，参数是常量。
         unsafe { AllowSetForegroundWindow(u32::MAX) }; // ASFW_ANY
-                                                       // SAFETY: 名字以 0 结尾；其余参数是常量或空指针。
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
+        let handle = loop {
+            // SAFETY: 名字以 0 结尾；其余参数是常量或空指针。
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
+            // 忙 = 那边在跑，只是空着的实例刚被别人接走、下一个还没建好。等它，
+            // 别当成没人在跑。别的错误（多半是管道不存在）才是真没人。
+            // SAFETY: 名字以 0 结尾。
+            if unsafe { GetLastError() } != ERROR_PIPE_BUSY
+                || unsafe { WaitNamedPipeW(name.as_ptr(), PIPE_BUSY_WAIT_MS) } == 0
+            {
+                return false;
+            }
         };
-        if handle == INVALID_HANDLE_VALUE {
-            return false;
-        }
         let bytes = message.as_bytes();
         let mut written = 0u32;
         // SAFETY: handle 刚打开，缓冲区活到调用结束。
@@ -108,43 +122,58 @@ mod imp {
         ok && written as usize == bytes.len()
     }
 
+    fn create_pipe(name: &[u16]) -> HANDLE {
+        // SAFETY: 名字以 0 结尾；只收本机的连接。
+        unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                0,
+                MAX_MESSAGE as u32,
+                0,
+                std::ptr::null(),
+            )
+        }
+    }
+
     /// 起一个线程收别的实例转交过来的消息，每收到一条调一次 `on_message`。
+    ///
+    /// **一接上就先把下一个实例建好，再读这一个。** 要是读完、关掉、回到循环开头
+    /// 才建，中间那一小段管道根本不存在，这时候来的 `forward` 打不开就返回失败 ——
+    /// 连着点两条链接，第二个进程以为没人在跑，照常启动，把第一个顶下线。
     pub fn serve(key: &str, on_message: impl Fn(String) + Send + 'static) -> io::Result<()> {
         let (_, pipe) = names(key);
         let name = wide(&pipe);
+        let first = create_pipe(&name);
+        if first == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // HANDLE 是裸指针，不能直接搬进线程。
+        let first = first as usize;
         std::thread::Builder::new()
             .name("gouhuo-single-instance".into())
-            .spawn(move || loop {
-                // SAFETY: 名字以 0 结尾；只收本机的连接。
-                let handle = unsafe {
-                    CreateNamedPipeW(
-                        name.as_ptr(),
-                        PIPE_ACCESS_INBOUND,
-                        PIPE_TYPE_BYTE
-                            | PIPE_READMODE_BYTE
-                            | PIPE_WAIT
-                            | PIPE_REJECT_REMOTE_CLIENTS,
-                        PIPE_UNLIMITED_INSTANCES,
-                        0,
-                        MAX_MESSAGE as u32,
-                        0,
-                        std::ptr::null(),
-                    )
-                };
-                if handle == INVALID_HANDLE_VALUE {
-                    return;
-                }
-                // SAFETY: handle 是刚建的管道；阻塞等一个客户端连上来。
-                let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
-                    || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
-                if connected {
-                    if let Some(message) = read_all(handle) {
-                        on_message(message);
+            .spawn(move || {
+                let mut handle = first as HANDLE;
+                loop {
+                    // SAFETY: handle 是建好还没连过的管道；阻塞等一个客户端连上来。
+                    let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
+                        || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+                    let next = create_pipe(&name);
+                    if connected {
+                        if let Some(message) = read_all(handle) {
+                            on_message(message);
+                        }
                     }
-                }
-                unsafe {
-                    DisconnectNamedPipe(handle);
-                    CloseHandle(handle);
+                    unsafe {
+                        DisconnectNamedPipe(handle);
+                        CloseHandle(handle);
+                    }
+                    if next == INVALID_HANDLE_VALUE {
+                        return;
+                    }
+                    handle = next;
                 }
             })?;
         Ok(())
@@ -229,16 +258,8 @@ mod tests {
             let _ = tx.send(message);
         })
         .unwrap();
-        // 管道建起来要一点时间
-        let mut delivered = false;
-        for _ in 0..50 {
-            if forward(&key, "gouhuo://j/abc") {
-                delivered = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(delivered, "转交失败");
+        // serve 返回时管道已经建好了，不用等
+        assert!(forward(&key, "gouhuo://j/abc"), "转交失败");
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             "gouhuo://j/abc"
@@ -247,6 +268,26 @@ mod tests {
         // 空消息（没带链接，只是又点了一下图标）也要送到：那边要把窗口叫出来
         assert!(forward(&key, ""));
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "");
+    }
+
+    #[test]
+    fn links_clicked_back_to_back_all_get_through() {
+        let key = format!("burst-{}", std::process::id());
+        let (tx, rx) = mpsc::channel();
+        serve(&key, move |message| {
+            let _ = tx.send(message);
+        })
+        .unwrap();
+        // 一条都不等那边处理完：读完一条到建好下一个管道之间不能有空档
+        for i in 0..20 {
+            assert!(
+                forward(&key, &format!("gouhuo://j/{i}")),
+                "第 {i} 条没转交出去"
+            );
+        }
+        for _ in 0..20 {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
     }
 
     #[test]
