@@ -251,7 +251,7 @@ cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 ```bash
 # 1. 改 Cargo.toml 的 version，cargo check 顺带更新 Cargo.lock，走 PR 合进 main
 # 2. 在更新后的 main 上打标签（必须跟 Cargo.toml 一致，CI 会查）
-git tag -s v0.1.0 -m "篝火 0.1.0"
+git tag -a v0.1.0 -m "篝火 0.1.0"
 git push origin v0.1.0
 ```
 

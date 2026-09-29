@@ -2,7 +2,7 @@ name: release
 
 # 推一个 v* 标签就出一版：编安装包和服务端，建一个**草稿** Release 把它们挂上去。
 #
-#   git tag -s v0.1.0 -m "篝火 0.1.0" && git push origin v0.1.0
+#   git tag -a v0.1.0 -m "篝火 0.1.0" && git push origin v0.1.0
 #
 # 是草稿，不是直接发布：自己下下来装一遍、写好说明，再在网页上点「发布」。
 # 客户端的「检查更新」看的是 /releases/latest，草稿不算 —— 点发布之前没人会被提示。
