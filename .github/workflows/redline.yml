@@ -11,6 +11,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 同一个 PR 再推一次，就把上一轮还没跑完的取消掉 —— 旧提交的结果没人会看。
+concurrency:
+  group: redline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # VS 自带的 cmake 是 4.x，libopus 的 CMakeLists 声明的最低版本太老会被直接拒。
@@ -66,7 +71,13 @@ jobs:
 
   # 确定性的红线：编译、单元测试、带宽和编解码成本。
   # 这些不依赖调度精度，在共享 runner 上也是可信的，所以**门禁在这里**。
+  #
+  # 等 dco 和 license 过了才跑：那两个几秒出结果，这个要编整个工作区好几分钟，
+  # 前面已经红了就没必要再烧一台 Windows VM。手动触发时 dco 是 skipped，
+  # skipped 不算失败，所以用 !failure() 而不是默认的「全部 success」。
   deterministic:
+    needs: [dco, license]
+    if: ${{ !failure() && !cancelled() }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
