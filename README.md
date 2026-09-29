@@ -159,11 +159,7 @@ cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 .\packaging\windows\build.ps1
 ```
 
-出来的是 `target\installer\gouhuo-setup-<版本>.exe`。推一个 `v*` 标签，CI 会做同样的事，
-再建一个草稿 Release 把安装包和服务端挂上去，见
-[`.github/workflows/release.yml`](.github/workflows/release.yml)。同时推
-`ghcr.io/parz1/gouhuo-server:<版本>` 镜像；在网页上点「发布」时 `latest` 才指过去
-（[`docker-latest.yml`](.github/workflows/docker-latest.yml)），草稿阶段 Docker 用户不会被升级。
+出来的是 `target\installer\gouhuo-setup-<版本>.exe`。正式发版不用手动打，见下面[发版](#发版)。
 
 ---
 
@@ -233,6 +229,46 @@ cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 常态，测出来的 p95 反映的是 runner 的负载而不是架构；在那种数字上设门禁只会训练出
 「重跑一次就绿了」的习惯，比不测更糟。真门禁跑在专用机器上，见
 [`.github/workflows/redline.yml`](.github/workflows/redline.yml)。
+
+### 发版
+
+有两个版本号，别混：
+
+| | 在哪 | 管什么 | 什么时候动 |
+|---|---|---|---|
+| 产品版本 | `Cargo.toml` 的 `[workspace.package] version` | 安装包文件名、exe 属性、检查更新、镜像标签 | 每次发版 |
+| 协议版本 | `PROTOCOL_VERSION`（[`control.rs`](crates/protocol/src/control.rs)） | 客户端和服务端连不连得上 | 只在消息格式不兼容时 |
+
+客户端和服务端共用一个产品版本，一起发。1.0 之前这样定号：
+
+- **`0.x.Y`**：修 bug、加功能，**协议和存档格式都兼容**。服务器 `pull` 一下没人受影响
+- **`0.X.0`**：动了 `PROTOCOL_VERSION`，或者 SQLite 表结构变了。服务器一升级旧客户端就连不上，
+  换回旧镜像也可能读不了新存档 —— Release 说明里写清楚「先升客户端」「升级前先备份
+  `gouhuo-data`」
+
+步骤：
+
+```bash
+# 1. 改 Cargo.toml 的 version，cargo check 顺带更新 Cargo.lock，走 PR 合进 main
+# 2. 在更新后的 main 上打标签（必须跟 Cargo.toml 一致，CI 会查）
+git tag -s v0.1.0 -m "篝火 0.1.0"
+git push origin v0.1.0
+```
+
+推标签后 [`release.yml`](.github/workflows/release.yml) 编安装包和 Windows 服务端，建一个
+**草稿** Release 挂上去，同时推 `ghcr.io/parz1/gouhuo-server:<版本>` 镜像。自己下下来装一遍、
+写好说明，再在网页上点「发布」。这时才会：
+
+- 客户端「检查更新」看得到它（草稿不算）
+- `latest` 指过去（[`docker-latest.yml`](.github/workflows/docker-latest.yml)），跟着 `latest`
+  的服务器下次 `pull` 升级
+
+**预发布**：标签和 `Cargo.toml` 都写成 `0.2.0-beta.1` 这种，Release 勾上 pre-release。
+`latest` 不挪，客户端检查更新也会跳过带 `-` 的版本；想试的服务器在 `.env` 里写
+`GOUHUO_VERSION=0.2.0-beta.1`。
+
+第一次推完镜像要去 GitHub → Packages → gouhuo-server → Package settings 把它改成
+**Public**，否则服务器上 pull 会报 `unauthorized`。只要做一次。
 
 ---
 
