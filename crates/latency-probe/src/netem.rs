@@ -305,12 +305,18 @@ mod tests {
             seed: 1,
         };
         let net = spawn(sink.local_addr().unwrap(), cfg).unwrap();
-        let t = Instant::now();
-        net.send(vec![7; 4]);
+        // 取几次里最短的：CI 机器上线程偶尔被晚调度几十毫秒，只量一次会随机红。
+        // 延迟被加了两遍这种真毛病，每一次都会超，最短的也躲不过。
         let mut buf = [0u8; 64];
-        sink.recv_from(&mut buf).expect("packet should arrive");
-        let elapsed = t.elapsed().as_secs_f64() * 1000.0;
-        assert!((30.0..70.0).contains(&elapsed), "delay was {elapsed} ms");
+        let fastest = (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                net.send(vec![7; 4]);
+                sink.recv_from(&mut buf).expect("packet should arrive");
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!((30.0..70.0).contains(&fastest), "delay was {fastest} ms");
         net.shutdown();
     }
 
