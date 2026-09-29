@@ -69,6 +69,8 @@ fn rank(role: Role) -> i32 {
 pub enum Broadcast {
     /// 发给所有已登录的人。
     Everyone(ServerMessage),
+    /// 发给除了这个人之外的所有已登录的人。
+    Others(SessionId, ServerMessage),
     /// 只发给某个频道里的人。
     Channel(ChannelId, ServerMessage),
     /// 只发给一个人。
@@ -507,9 +509,12 @@ impl Server {
         let wire = user.to_wire();
         self.users.insert(session_id, user);
 
-        // 先把新人告诉所有人（含他自己也没关系，客户端按 session_id 去重），
-        // 再单独给他发 Welcome。
-        broadcasts.push(Broadcast::Everyone(UserState { user: Some(wire) }.into()));
+        // 把新人告诉别人。他自己不用：Welcome 里已经有他了，
+        // 再发一遍只会让他刚登录就多收一条没用的 UserState。
+        broadcasts.push(Broadcast::Others(
+            session_id,
+            UserState { user: Some(wire) }.into(),
+        ));
         if is_admin {
             broadcasts.push(Broadcast::One(session_id, self.ban_list()));
         }
@@ -1280,7 +1285,7 @@ mod tests {
         assert_eq!(admitted.welcome.users.len(), 1);
         assert!(matches!(
             admitted.broadcasts.as_slice(),
-            [Broadcast::Everyone(_)]
+            [Broadcast::Others(me, _)] if *me == admitted.session_id
         ));
     }
 

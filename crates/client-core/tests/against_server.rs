@@ -421,6 +421,56 @@ fn you_can_actually_walk_into_a_channel_someone_else_made() {
     }
 }
 
+/// 有人正在建频道的时候进来的人，最后也得看到**全部**频道。
+///
+/// 新人拿到的 Welcome 是登录那一刻的快照，之后的变化只靠广播。服务端曾经是
+/// 先发 Welcome、再把人登记进广播名单，中间那一小段里建的频道新人就永远
+/// 看不到了 —— CI 上偶发「等不到别人建的频道」就是它。窗口很窄，这里靠
+/// 一边狂建一边连几个人把它撞出来。
+#[test]
+fn people_who_arrive_mid_change_still_see_everything() {
+    const COUNT: usize = 60;
+    let server = open_server();
+    let (maker, maker_events) = join(&server, "阿强");
+
+    let builder = {
+        let maker = maker.clone();
+        std::thread::spawn(move || {
+            for i in 0..COUNT {
+                maker.create_channel(&format!("频道{i}"), 0);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let newcomers: Vec<_> = (0..4).map(|i| join(&server, &format!("路人{i}"))).collect();
+    builder.join().unwrap();
+
+    // 建的人自己看到最后一个，说明服务端全建完、广播也全发出去了。
+    wait_for_channel(&maker, &maker_events, &format!("频道{}", COUNT - 1));
+
+    for (client, events) in &newcomers {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let missing: Vec<_> = {
+                let roster = client.roster();
+                (0..COUNT)
+                    .map(|i| format!("频道{i}"))
+                    .filter(|name| !roster.channels.values().any(|c| &c.name == name))
+                    .collect()
+            };
+            if missing.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} 漏了这些频道：{missing:?}",
+                client.roster().name_of(client.session_id())
+            );
+            let _ = events.recv_timeout(Duration::from_millis(100));
+        }
+    }
+}
+
 /// 删掉一个有人在里面的频道，**那个人要被挪回根频道**。
 ///
 /// 留在一个不存在的频道里的话，他的语音会被转发到没人收的地方，

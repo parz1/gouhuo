@@ -223,6 +223,11 @@ impl Hub {
                         peer.send(&msg);
                     }
                 }
+                Broadcast::Others(except, msg) => {
+                    for peer in peers.iter().filter(|p| p.session != except) {
+                        peer.send(&msg);
+                    }
+                }
                 Broadcast::Channel(channel, msg) => {
                     let targets = {
                         let state = self.state.lock().expect("state poisoned");
@@ -353,23 +358,15 @@ pub fn serve_connection(
         upstream,
         downstream,
     };
-    let session = match authenticate(&mut reader, &wire, &hub, &keys, deadline) {
-        Ok(Some(session)) => session,
+    // 走到 `Some` 时人已经在状态里、也已经在 `hub.peers` 里了 ——
+    // 两件事是在同一把 state 锁里做的，见 authenticate 末尾。
+    let peer = match authenticate(&mut reader, &wire, &hub, &keys, deadline) {
+        Ok(Some(peer)) => peer,
         // 被拒或者对面走了：Rejected 已经发过了，这里干净收场。
         Ok(None) => return Ok(()),
         Err(e) => return Err(e),
     };
-
-    let peer = Arc::new(Peer {
-        session,
-        wire: Arc::clone(&wire),
-        last_seen_ms: AtomicU64::new(now_ms() as u64),
-        timed_out: AtomicBool::new(false),
-    });
-    hub.peers
-        .lock()
-        .expect("peers poisoned")
-        .insert(session, Arc::clone(&peer));
+    let session = peer.session;
 
     // ---- 消息循环 ----
     let result = message_loop(&mut reader, &wire, &hub, &peer);
@@ -389,23 +386,25 @@ pub fn serve_connection(
     result
 }
 
-/// Hello -> Challenge -> Authenticate -> Welcome / Rejected。
-///
-/// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
-/// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
 /// 这条连接派生出来的两把语音密钥。
 struct VoiceKeys {
     upstream: transport::VoiceKey,
     downstream: transport::VoiceKey,
 }
 
+/// Hello -> Challenge -> Authenticate -> Welcome / Rejected。
+///
+/// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
+/// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
+///
+/// 返回 `Some` 时这个人已经登记进 `hub.peers`，调用方负责在断开时把他摘掉。
 fn authenticate(
     reader: &mut Reader,
     wire: &Arc<Mutex<Wire>>,
     hub: &Arc<Hub>,
     keys: &VoiceKeys,
     deadline: Instant,
-) -> io::Result<Option<SessionId>> {
+) -> io::Result<Option<Arc<Peer>>> {
     use protocol::control::rejected::Reason;
 
     let Some(hello) = reader.next_message(deadline)? else {
@@ -469,31 +468,55 @@ fn authenticate(
     }
 
     // 到这里才轮到策略。密码学归密码学，策略归 state。
+    // 从这里到 Welcome 写出去，**一直攥着这条连接的写锁**。
+    //
+    // 进状态和进 `hub.peers` 必须在同一把 state 锁里做完：Welcome 是 admit
+    // 那一刻的快照，之后别人改了什么（建频道、换频道、说话）都只靠广播送达，
+    // 而广播按 `hub.peers` 发。两步中间要是有空隙，空隙里的广播就漏给了新人，
+    // 他的名单从此永远缺那一块 —— 集成测试在慢 CI 上偶发等不到别人建的频道，
+    // 就是这个。
+    //
+    // 可一进 `hub.peers`，别的线程就可能往这条连接发广播了，而 Welcome
+    // 必须是第一条。所以先攥住写锁：别人的 `Peer::send` 会在锁上排队，
+    // 等 Welcome 写完才轮到。锁的顺序是 这条连接的 wire → state → peers，
+    // 没有别的地方会攥着 state 或 peers 去等某条连接的 wire，不会死锁。
+    //
+    // 排队进来的广播里可能有 admit 之前就改掉、已经算进快照的东西，
+    // 新人会重复收到一次。那些都是「按 id 覆盖 / 删除」的消息，重复收无害。
+    let mut w = wire.lock().expect("wire poisoned");
     let admitted = {
         let mut state = hub.state.lock().expect("state poisoned");
         let admitted = state.admit(public_key, &auth.invite_code, &auth.desired_name);
         // 用管理员链接进来的，「他是管理员」和「链接作废」都要落盘。
         hub.persist(&mut state);
-        admitted
+        admitted.map(|admitted| {
+            let peer = Arc::new(Peer {
+                session: admitted.session_id,
+                wire: Arc::clone(wire),
+                last_seen_ms: AtomicU64::new(now_ms() as u64),
+                timed_out: AtomicBool::new(false),
+            });
+            let mut peers = hub.peers.lock().expect("peers poisoned");
+            // 顶号：旧会话在状态里已经摘干净了，这里一起从 peers 里摘掉。
+            let displaced = admitted.displaced.and_then(|old| peers.remove(&old));
+            peers.insert(admitted.session_id, Arc::clone(&peer));
+            (admitted, peer, displaced)
+        })
     };
-    let admitted = match admitted {
+    let (admitted, peer, displaced) = match admitted {
         Ok(a) => a,
         Err(denied) => {
-            let mut w = wire.lock().expect("wire poisoned");
             let _ = w.send(&denied.to_wire().into());
             return Ok(None);
         }
     };
 
-    // 顶号：把旧连接踢掉。状态里已经摘干净了，这里只管关 socket。
-    if let Some(old) = admitted.displaced {
-        let old_peer = hub.peers.lock().expect("peers poisoned").remove(&old);
-        if let Some(old_peer) = old_peer {
-            old_peer.kick(
-                goodbye::Reason::Displaced,
-                "同一个身份从别处连进了这个服务器，这边被顶下去了",
-            );
-        }
+    // 顶号：把旧连接踢掉。攥着的是新连接的写锁，踢的是旧连接的，不冲突。
+    if let Some(old_peer) = displaced {
+        old_peer.kick(
+            goodbye::Reason::Displaced,
+            "同一个身份从别处连进了这个服务器，这边被顶下去了",
+        );
     }
 
     // **在 Welcome 发出去之前挂上密钥**：客户端一收到 Welcome 就会开始发语音，
@@ -506,12 +529,13 @@ fn authenticate(
 
     let mut welcome = admitted.welcome;
     welcome.udp_port = hub.voice.local_port() as u32;
-    {
-        let mut w = wire.lock().expect("wire poisoned");
-        w.send(&welcome.into())?;
-    }
+    // 发不出去也不在这里返回错误：人已经进了状态和 peers，得走调用方的
+    // 收尾把他摘掉。接下来的 read 会立刻发现连接断了。
+    let _ = w.send(&welcome.into());
+    // **先放写锁再广播**：广播里有发给他自己的那条，std 的 Mutex 不可重入。
+    drop(w);
     hub.dispatch(admitted.broadcasts);
-    Ok(Some(admitted.session_id))
+    Ok(Some(peer))
 }
 
 fn reject(wire: &Arc<Mutex<Wire>>, reason: protocol::control::rejected::Reason, detail: String) {
