@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![cfg(feature = "web")]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

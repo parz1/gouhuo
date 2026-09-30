@@ -72,6 +72,43 @@ fn main() {
     }
 }
 
+#[cfg(feature = "web")]
+use server::web;
+
+/// 编译时没带加入页（`--no-default-features`）的替身。
+///
+/// 不设 `GOUHUO_WEB_LISTEN` / `GOUHUO_JOIN_URL` 的话这里一个函数都不会被调到；
+/// 设了就明说这个二进制里没有，而不是悄悄不起 —— 那样管理员会对着一个
+/// 打不开的域名查半天防火墙。
+#[cfg(not(feature = "web"))]
+mod web {
+    use std::io;
+    use std::net::SocketAddr;
+
+    pub struct JoinPage;
+
+    fn missing<T>() -> io::Result<T> {
+        Err(io::Error::other(
+            "这个服务端编译时没带加入页。去掉 GOUHUO_WEB_LISTEN 和 GOUHUO_JOIN_URL，\
+             或者换一个带加入页的版本（编译时不要加 --no-default-features）",
+        ))
+    }
+
+    impl JoinPage {
+        pub fn new(_invite: &protocol::Invite, _name: &str) -> io::Result<Self> {
+            missing()
+        }
+    }
+
+    pub fn spawn(_address: SocketAddr, _page: JoinPage) -> io::Result<()> {
+        missing()
+    }
+
+    pub fn browser_invite(_base: &str, _code: Option<&str>) -> io::Result<String> {
+        missing()
+    }
+}
+
 fn run() -> io::Result<()> {
     let port = env_parse("GOUHUO_PORT", DEFAULT_PORT)?;
     let max_users = env_parse("GOUHUO_MAX_USERS", 20usize)?;
@@ -88,7 +125,7 @@ fn run() -> io::Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
     if let Some(url) = &join_url {
-        server::web::browser_invite(url, None)?;
+        web::browser_invite(url, None)?;
         if web_address.is_none() {
             return Err(io::Error::other(
                 "设置 GOUHUO_JOIN_URL 时还需设置 GOUHUO_WEB_LISTEN",
@@ -160,7 +197,7 @@ fn run() -> io::Result<()> {
     });
     if let Some(address) = web_address {
         let name = std::env::var("GOUHUO_NAME").unwrap_or_else(|_| "朋友的篝火".into());
-        server::web::spawn(address, server::web::JoinPage::new(&invite, &name)?)?;
+        web::spawn(address, web::JoinPage::new(&invite, &name)?)?;
     }
     print_banner(
         &invite,
@@ -179,7 +216,7 @@ fn run() -> io::Result<()> {
         println!("  浏览器邀请（仅分享给朋友，含加入码）：");
         println!(
             "      {}",
-            server::web::browser_invite(&url, invite.code.as_deref())?
+            web::browser_invite(&url, invite.code.as_deref())?
         );
         println!();
     }

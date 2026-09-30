@@ -22,6 +22,7 @@ mod control_io;
 pub mod state;
 pub mod store;
 pub mod voice;
+#[cfg(feature = "web")]
 pub mod web;
 
 use std::io;

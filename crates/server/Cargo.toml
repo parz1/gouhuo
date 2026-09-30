@@ -17,6 +17,13 @@ path = "src/lib.rs"
 name = "gouhuo-server"
 path = "src/main.rs"
 
+[features]
+default = ["web"]
+# 浏览器加入页和给客户端读的发现端点（src/web.rs）。默认带着；
+# 运行时还要设 GOUHUO_WEB_LISTEN 才会真的起 —— 不设就一个线程、一个端口都不多。
+# 想要一个彻底不含 HTTP 服务的二进制：--no-default-features。
+web = ["dep:tiny_http"]
+
 [dependencies]
 protocol.workspace = true
 transport.workspace = true
@@ -29,7 +36,8 @@ getrandom.workspace = true
 rusqlite.workspace = true
 # 控制面等待可读/可写事件，不使用会吞数据的 socket 读超时。
 polling = "3"
-tiny_http = "0.12"
+# 浏览器加入页的 HTTP 服务，只有 web feature 用到。
+tiny_http = { version = "0.12", optional = true }
 
 [dev-dependencies]
 protocol.workspace = true
