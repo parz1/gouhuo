@@ -213,6 +213,8 @@ pub struct Stage {
     /// 火苗前后那两层，隔几帧才重画一次。
     layers: Option<scene::Layers>,
     frames: u32,
+    /// 近景构图（首页上没有人围着的那一堆），见 [`scene::Geometry::close_up`]。
+    close_up: bool,
 }
 
 /// 火光、炭、木头上的暗火每几帧重画一次。它们变得慢，10 帧里重画 3 次看不出区别，
@@ -220,6 +222,14 @@ pub struct Stage {
 const LAYERS_EVERY: u32 = 3;
 
 impl Stage {
+    /// 首页上的那一堆火：近景，没有石头。
+    pub fn close_up() -> Self {
+        Self {
+            close_up: true,
+            ..Self::default()
+        }
+    }
+
     pub fn size(&self) -> (f32, f32) {
         self.size
     }
@@ -249,8 +259,13 @@ impl Stage {
     }
 
     fn geometry(&self) -> Option<scene::Geometry> {
-        (self.size.0 > 0.0 && self.size.1 > 0.0 && self.channel.is_some())
-            .then(|| scene::Geometry::new(self.size.0, self.size.1))
+        (self.size.0 > 0.0 && self.size.1 > 0.0 && self.channel.is_some()).then(|| {
+            if self.close_up {
+                scene::Geometry::close_up(self.size.0, self.size.1)
+            } else {
+                scene::Geometry::new(self.size.0, self.size.1)
+            }
+        })
     }
 
     /// 火往前烧 `dt` 秒，画一帧。

@@ -105,6 +105,9 @@ cargo run --release -p server --bin gouhuo-server
 | `GOUHUO_HOST` | 自动探测的局域网地址 |
 | `GOUHUO_INVITE` | 首次启动随机生成；设成空串表示不要邀请码 |
 | `GOUHUO_MAX_USERS` | `20` |
+| `GOUHUO_WEB_LISTEN` | 不启用；设成 `127.0.0.1:20801` 开启浏览器加入页，供 HTTPS 反向代理使用 |
+| `GOUHUO_JOIN_URL` | 对外的 HTTPS 加入页地址；设置后在日志里打印浏览器邀请 |
+| `GOUHUO_NAME` | `朋友的篝火`，加入页显示的服务器名称 |
 
 ### 用 Docker 部署
 
@@ -160,6 +163,63 @@ docker compose up -d && docker compose logs gouhuo   # 邀请链接在这里
 
 Railway 这类只转发 HTTP/TCP 的平台跑不了：语音走 UDP，而「UDP 不通时退回 TCP」还没做。
 
+### 用域名打开 HTTPS 加入页
+
+浏览器访问 `https://voice.example.com/`，点击「用篝火加入」即可通过已有的
+`gouhuo://` 协议唤起 Windows 客户端。没有安装时可下载客户端；浏览器没有唤起时，
+可复制邀请链接并粘贴到篝火。加入页采用动态像素篝火，切到后台或选择减少动态效果时暂停。
+
+域名的 DNS 需要指向服务器。除语音所需的 TCP/UDP 20800 外，还需放行
+**80/tcp、443/tcp**，供 Caddy 申请和自动续期证书。域名不要开启会影响 UDP 的代理。
+80/443 已经有反向代理在使用时，按下方「已有代理」配置，不要再启动一份 Caddy。
+
+一键安装或升级并启用 HTTPS（启用状态会保存在 `.env`，以后升级继续保留）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/parz1/gouhuo/main/install.sh | GOUHUO_HOST=voice.example.com GOUHUO_HTTPS=1 sh
+```
+
+手动部署时，下载仓库的 `compose.yaml`、`compose.https.yaml`、`Caddyfile`，在同目录
+创建 `.env`，写入 `GOUHUO_HOST=voice.example.com`，可加 `GOUHUO_NAME=周末开黑`。运行：
+
+```bash
+docker compose -f compose.yaml -f compose.https.yaml up -d
+# 在源码仓库中验证本次改动：同一命令追加 --build
+# 升级需要同时带上两个文件：
+docker compose -f compose.yaml -f compose.https.yaml pull
+docker compose -f compose.yaml -f compose.https.yaml up -d
+```
+
+这组配置使用 Linux host 网络，HTTP 加入页仅监听 `127.0.0.1:20801`，Caddy 对外提供
+HTTPS。Caddy 的证书保存在独立数据卷里。启动日志会给出浏览器加入页和私人浏览器邀请。
+**新功能需要包含本次改动的服务端镜像**；旧版本镜像没有 HTTP 加入页，可先从源码 `--build`。
+
+**私人服务器**：直接打开域名会要求输入朋友给的加入码；日志中的浏览器邀请形如
+`https://voice.example.com/#code=…`，可以让朋友免输入。加入码位于 URL fragment，
+不会发送给 HTTP 服务，也不会进入代理访问日志；页面读取后会从地址栏移除它。
+这仍是一条私人凭据，不要公开发布。公开页面不提供加入码，更不会提供管理员认领链接。
+服务端的加入验证仍由原有语音协议完成，页面不会宣称填写的码一定有效。
+
+**已有 HTTPS 代理**：在 `.env` 中设置 `GOUHUO_WEB_LISTEN=127.0.0.1:20801`、
+`GOUHUO_JOIN_URL=https://voice.example.com/`，重启语音服务；让现有代理将这个域名的
+HTTP 请求转发到 `http://127.0.0.1:20801`。代理若在另一容器网络中，需要调整监听和
+容器网络，使它能访问加入页。加入页的 HTTP 端口不应直接暴露在公网。
+HTTPS 的网页证书与语音协议的自签名证书独立管理，不改变现有语音邀请或端口。
+
+**不用就不占东西**：加入页默认是关的。只有设了 `GOUHUO_WEB_LISTEN`（上面的
+`compose.https.yaml` 会替你设）才会起，没设的话服务端不多开一个线程、一个端口。
+它给服务端二进制加了约 0.2 MB；开着的时候多 6 个空闲线程、约 0.3 MB 内存，没人访问时不耗 CPU。
+真正占地方的是 Caddy 那个容器，而它只在你用 `compose.https.yaml` 时才有 ——
+已经有反向代理的话不需要它。想要一个彻底不含 HTTP 服务的镜像，从源码编时在 `.env`
+里写 `GOUHUO_FEATURES=--no-default-features`；这样的服务端碰到 `GOUHUO_WEB_LISTEN`
+会直接报错退出，不会悄悄不起。
+
+**在客户端里直接输域名**：加入页旁边还有一份给客户端读的说明
+（`/.well-known/gouhuo`：语音地址、端口、证书指纹、服务器名，**不含加入码**）。
+朋友在篝火里输 `voice.example.com` 就能加入，不用传那一长串邀请链接 ——
+指纹由域名的 HTTPS 证书担保。把日志里的浏览器邀请（带 `#code=…`）整条粘进客户端也行，
+加入码同样不会被发给网页服务。
+
 ### 管理员
 
 第一次启动时，邀请链接下面还会多打一条**管理员链接**。自己用它连进去就成了
@@ -174,7 +234,18 @@ Railway 这类只转发 HTTP/TCP 的平台跑不了：语音走 UDP，而「UDP 
 cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 ```
 
-不带参数启动也行，界面里有粘链接的框。
+不带参数启动停在首页：上面是上次去的服务器，一点（或者回车）就回去；下面是别的
+存着的服务器和「加入新服务器」。加入的那个框认四样东西：
+
+| 输入 | 怎么确认是这台服务器 |
+|---|---|
+| `gouhuo://j/…` 邀请链接 | 证书指纹就在链接里 |
+| `https://voice.example.com/` 加入页地址 | 加入页给出指纹，域名的 HTTPS 证书担保 |
+| `voice.example.com` 域名 | 先找它的加入页；没有就按下一行处理 |
+| `203.0.113.7`、`host:20800` | 没人担保：客户端把服务器的指纹取回来，**你跟服主核对过再点加入**（服务端启动日志里有「证书指纹」一行），之后记住不再问 |
+
+没写端口就是 20800。私人服务器会再问一次加入码。加入成功的服务器记在
+`%APPDATA%\gouhuo\settings.txt` 里（私人服务器的加入码也在里面，别把这个文件发给别人）。
 
 ### 自己打安装包
 

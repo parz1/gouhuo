@@ -19,6 +19,7 @@ pub mod base32;
 pub mod control;
 #[cfg(feature = "crypto")]
 mod crypto;
+mod discovery;
 mod identity;
 mod invite;
 pub mod text;
@@ -26,6 +27,7 @@ mod voice;
 
 #[cfg(feature = "crypto")]
 pub use crypto::*;
+pub use discovery::*;
 pub use identity::*;
 pub use invite::*;
 pub use voice::*;

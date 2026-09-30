@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark">
+  <title>加入 @@NAME@@ · 篝火</title>
+  <link rel="icon" href="/flame.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/join.css">
+  <script type="module" src="/join.mjs"></script>
+  <script type="module" src="/fire.mjs"></script>
+</head>
+<body data-payload="@@PAYLOAD@@" data-private="@@PRIVATE@@">
+  <div class="page">
+    <header><a class="brand" href="/" aria-label="篝火首页"><img src="/flame.svg" alt="" width="32" height="32">篝火</a><a class="quiet" href="https://github.com/parz1/gouhuo/releases/latest" target="_blank" rel="noopener noreferrer">下载客户端</a></header>
+    <main>
+      <section class="hero" aria-labelledby="heading">
+        <div class="hero-copy">
+          <p class="eyebrow">朋友的服务器，熟悉的声音</p>
+          <h1 id="heading">来篝火边坐坐</h1>
+          <div class="server"><span>服务器</span><strong>@@NAME@@</strong></div>
+          <p class="address">@@ADDRESS@@</p>
+          <div class="code-field" id="code-field" @@CODE_HIDDEN@@>
+            <label for="join-code">加入码</label>
+            <input id="join-code" type="password" placeholder="输入朋友给你的加入码" autocomplete="off" spellcheck="false" maxlength="255">
+            <p class="hint">私人服务器需要加入码，向邀请你的朋友获取。</p>
+          </div>
+          <a id="join" class="button primary" aria-disabled="true" tabindex="-1">用篝火加入<span aria-hidden="true">→</span></a>
+          <p id="status" class="status" role="status" aria-live="polite">正在准备邀请…</p>
+        </div>
+        <canvas class="campfire" aria-hidden="true"></canvas>
+      </section>
+      <section class="support" aria-labelledby="support-title">
+        <h2 id="support-title">还没有篝火？</h2>
+        <div class="support-row"><div><h3>先装好，再回来加入</h3><p>Windows 客户端，无需注册账号。</p></div><a class="button secondary" href="https://github.com/parz1/gouhuo/releases/latest" target="_blank" rel="noopener noreferrer">下载客户端</a></div>
+        <div class="support-row"><div><h3>客户端没打开？</h3><p>复制邀请链接，粘贴到篝火的加入框。也可以在篝火里直接输入本页的网址。</p></div><button id="copy" class="button secondary" disabled>复制邀请链接</button></div>
+        <div id="manual" class="manual" hidden><label for="manual-link">手动复制邀请链接</label><input id="manual-link" readonly spellcheck="false"></div>
+      </section>
+      <noscript><p class="notice">请启用 JavaScript 来生成加入邀请，或向朋友索取 gouhuo:// 邀请链接并粘贴到客户端。</p></noscript>
+    </main>
+    <footer><span>篝火 · 开源、自部署的语音聊天</span><span>加入后，在客户端选择语音频道</span></footer>
+  </div>
+</body>
+</html>

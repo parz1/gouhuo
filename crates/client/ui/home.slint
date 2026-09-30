@@ -1,0 +1,569 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// 首页：没在任何服务器里的时候看到的那一屏。
+//
+// 大多数时候打开篝火只为一件事 —— 回到昨天那个服务器。所以上面一大块就是它：
+// 左边是名字和一个按钮，右边是一堆烧着的火（跟频道里那堆是同一种画法，
+// Rust 那边画好送过来，见 src/campfire/）。下面才是别的服务器和「加入新服务器」。
+//
+// 「加入」要经过的几步也都在这一块里原地换，不弹窗、不跳页：
+//
+//   输地址  →  （裸地址）核对指纹  →  （私人服务器）加入码  →  进去了
+//
+// 每一步停在哪儿由 Rust 那边说了算（mode），这里只管把它画出来。
+// 为什么要这几步、各自防的是什么，见 src/join.rs。
+
+import { Theme, Btn, Field } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+/// 首页下面那一排里的一个服务器。
+export struct ServerRow {
+    /// 在存下来的服务器里排第几。点它、移除它的时候原样传回去。
+    id: int,
+    name: string,
+    address: string,
+    /// 上次什么时候来的，拼好的字。
+    used: string,
+}
+
+/// 像素篝火。底图是 Rust 按这个框的大小画的，这里不插值地放大。
+component Fire inherits Rectangle {
+    in property <image> frame;
+    callback resized(length, length);
+    init => { root.resized(self.width, self.height); }
+    changed width => { root.resized(self.width, self.height); }
+    changed height => { root.resized(self.width, self.height); }
+
+    background: #0f1013;
+    clip: true;
+    Image {
+        width: 100%;
+        height: 100%;
+        source: root.frame;
+        image-rendering: pixelated;
+        image-fit: fill;
+        accessible-role: none;
+    }
+}
+
+export component Home inherits Rectangle {
+    // ---- 现在停在哪一步 ----
+    in property <bool> connecting;
+    /// 正在连的时候，具体在干什么（「正在查找加入页…」）。
+    in property <string> stage;
+    /// 0 首页；1 输地址；2 要加入码；3 核对指纹。
+    in-out property <int> mode;
+
+    // ---- 上面那一大块说的是哪个服务器 ----
+    /// 有没有可说的：存过服务器，或者正在加入某一个。没有就直接是输地址的框。
+    in property <bool> has-hero;
+    in property <bool> has-servers;
+    /// 是存下来的第几个；-1 表示是个还没存过的（正在加入、或者刚失败的）。
+    in property <int> hero-id: -1;
+    in property <string> hero-name;
+    in property <string> hero-address;
+    in property <string> hero-used;
+    in property <[ServerRow]> others;
+
+    // ---- 各一步要用的 ----
+    in-out property <string> address;
+    in property <string> address-hint;
+    in property <bool> address-bad;
+    in-out property <string> code;
+    /// 刚才给的加入码服务端不认。
+    in property <bool> code-rejected;
+    in property <string> fingerprint;
+    in property <string> error-headline;
+    in property <string> error-advice;
+    /// 错在证书对不上：给一个「重新验证」的出路。
+    in property <bool> can-reverify;
+
+    in-out property <string> nick;
+    in property <string> my-fingerprint;
+    in property <image> fire;
+
+    callback fire-resized(length, length);
+    callback join-saved(int);
+    callback join-address();
+    callback address-edited(string);
+    callback submit-code();
+    callback trust();
+    callback cancel();
+    callback retry();
+    callback reverify();
+    callback forget(int);
+    callback open-settings();
+
+    /// 窗口多大。**由外面给，不自己量**：这里的布局要按它决定画不画那条火、
+    /// 画多高，自己量自己的高度再去决定自己的高度，是个死循环。
+    in property <length> window-width;
+    in property <length> window-height;
+    /// 窄到左右并排放不下：火挪到上面变成一条。
+    property <bool> narrow: root.window-width < 640px;
+    property <bool> form: !root.connecting && (root.mode == 1 || (root.mode == 0 && !root.has-hero));
+    property <bool> asking-code: !root.connecting && root.mode == 2;
+    property <bool> asking-trust: !root.connecting && root.mode == 3;
+    property <bool> idle: !root.connecting && root.mode == 0 && root.has-hero;
+    property <bool> failed: !root.connecting && root.error-headline != "";
+    /// 这个服务器没有名字，大字写的就是地址。
+    property <bool> untitled: root.hero-address == root.hero-name;
+    /// 点了一次 ×、等第二次确认的那个服务器。-1 表示没有。
+    /// 存着的可能有加入码，手滑移除了就得再找人要。
+    property <int> forget-armed: -1;
+    /// 下面那一排想要多高：标题 + 每个服务器一行 + 「加入新服务器」。
+    property <length> list-height: (root.others.length > 0 ? 30px : 0px)
+        + root.others.length * 50px + 58px;
+
+    // ---- 高度怎么分 ----
+    //
+    // 三样东西抢高度：上面那一大块、（窄窗口时的）那条火、下面那一排。**先保上面那一块**：
+    // 它里面是报错、指纹、输入框和按钮，是用户此刻要看要点的；火和列表拿剩下的，
+    // 不够就缩，再不够就不画（列表自己能滚）。
+    //
+    // 为什么要自己算而不交给布局：那一块里有会折行的字，布局估不准它要多高，
+    // 交给它分的话，窗口一矮，按钮就被下面那一排盖住了。
+    /// 上面那一大块至少要多高。按现在停在哪一步估的，宁可多估。
+    property <length> hero-need: root.failed ? (root.can-reverify ? (root.narrow ? 420px : 390px) : root.narrow ? 320px : 310px)
+        : root.asking-trust ? 310px
+        : root.asking-code ? 270px
+        : root.form ? (root.has-servers ? 220px : 250px)
+        : 200px;
+    /// 分给火和列表的。底栏连分隔线 57px。
+    property <length> spare: Math.max(0px, root.window-height - 57px - root.hero-need);
+    /// 列表先挑：它要多少给多少，但存了一大串的时候最多拿一半多一点，别把火挤没了。
+    property <length> list-claim: !root.has-servers ? 0px
+        : Math.min(root.list-height, Math.max(root.spare * 0.55, 108px));
+    property <length> banner-want: Math.min(root.spare - root.list-claim - 1px, 150px);
+    /// 窄窗口时上面那条火多高。连一小条都放不下就不画。
+    property <length> banner-height: root.narrow && root.banner-want >= 72px ? root.banner-want : 0px;
+    property <length> list-shown: !root.has-servers ? 0px
+        : Math.min(root.list-height, root.spare - root.banner-height - 1px);
+    /// 连一行都露不全的时候干脆不画：半截列表比没有更乱。
+    /// 那时「加入别的服务器」挪到上面的按钮里，见下。
+    property <bool> list-visible: root.has-servers && root.list-shown >= Math.min(root.list-height, 96px);
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        if root.banner-height > 0: Fire {
+            height: root.banner-height;
+            frame: root.fire;
+            resized(w, h) => { root.fire-resized(w, h); }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                padding: root.narrow ? 18px : 30px;
+                spacing: 10px;
+
+                // ---- 一行小字：现在是什么情况 ----
+                Text {
+                    text: root.connecting ? "正在加入"
+                        : root.form ? (root.has-servers ? "加入新服务器" : "第一次来")
+                        : root.asking-code ? "私人服务器"
+                        : root.asking-trust ? "第一次连这台服务器，先核对一下"
+                        : root.failed ? "没能加入"
+                        : "回到上次的篝火";
+                    color: Theme.dim;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+
+                // ---- 大字：哪个服务器 ----
+                if !root.form || !root.has-servers: Text {
+                    text: root.form ? "来篝火边坐坐" : root.hero-name;
+                    color: Theme.text;
+                    font-size: root.narrow ? 22px : 26px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+
+                // 名字下面一行：地址，和上次什么时候来的。没有名字时大字就是地址，别再写一遍。
+                if root.idle && (root.hero-used != "" || !root.untitled): Text {
+                    text: root.untitled ? "上次 " + root.hero-used
+                        : root.hero-used == "" ? root.hero-address
+                        : root.hero-address + " · 上次 " + root.hero-used;
+                    color: Theme.dim;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+
+                if root.connecting: Text {
+                    text: root.stage;
+                    color: Theme.dim;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                // ---- 输地址 ----
+                if root.form: Field {
+                    init => { self.focus(); }
+                    placeholder: "服务器地址或邀请链接";
+                    text <=> root.address;
+                    edited(text) => { root.address-edited(text); }
+                    accepted => { root.join-address(); }
+                }
+                if root.form: Text {
+                    text: root.address-hint != ""
+                        ? root.address-hint
+                        : "域名、IP、https:// 加入页地址，或者 gouhuo:// 邀请链接，都行。";
+                    color: root.address-bad ? Theme.danger : Theme.faint;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                // ---- 加入码 ----
+                if root.asking-code: Field {
+                    init => { self.focus(); }
+                    placeholder: "朋友给你的加入码";
+                    password: true;
+                    text <=> root.code;
+                    accepted => { root.submit-code(); }
+                }
+                if root.asking-code: Text {
+                    text: root.code-rejected
+                        ? "这个加入码不对。核对一下有没有输错，或者找朋友再要一次。"
+                        : "加入码只会在加密连接里发给这台服务器。进去之后记在这台电脑上，下次不用再输。";
+                    color: root.code-rejected ? Theme.danger : Theme.faint;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                // ---- 核对指纹 ----
+                if root.asking-trust: Text {
+                    text: "没有加入页或邀请链接替它担保。这是它现在给出的指纹：";
+                    color: Theme.dim;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                if root.asking-trust: Rectangle {
+                    height: 40px;
+                    border-radius: Theme.radius;
+                    background: Theme.panel;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    Text {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        height: 100%;
+                        text: root.fingerprint;
+                        color: Theme.text;
+                        font-family: "Consolas";
+                        font-size: root.narrow ? 12px : 14px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        accessible-label: "服务器指纹 " + root.fingerprint;
+                    }
+                }
+                if root.asking-trust: Text {
+                    text: "让服主看一眼服务端启动日志里「证书指纹」那一行，一样再继续。"
+                        + "确认之后会记住，以后不再问。";
+                    color: Theme.faint;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                // ---- 报错：占住位置一起显示，别用弹窗 ----
+                // 弹窗一关用户就想不起来刚才说了什么，而这几行恰恰是要照着做的。
+                if root.failed: Rectangle {
+                    background: #2a1d1d;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: #4a2b28;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 5px;
+                        Text {
+                            text: root.error-headline;
+                            color: Theme.danger;
+                            font-size: 14px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.error-advice;
+                            color: Theme.dim;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // ---- 按钮 ----
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 8px;
+                    padding-top: 4px;
+
+                    if root.idle && !root.failed: Btn {
+                        width: 148px;
+                        label: "回到篝火  →";
+                        primary: true;
+                        clicked => { root.join-saved(root.hero-id); }
+                    }
+                    // 窗口矮到下面那一排画不下：去别的服务器的入口挪到这儿。
+                    if root.idle && !root.failed && !root.list-visible: Btn {
+                        width: 112px;
+                        label: "加入别的…";
+                        clicked => { root.mode = 1; }
+                    }
+                    if root.idle && root.failed: Btn {
+                        width: 76px;
+                        label: "重试";
+                        primary: true;
+                        clicked => { root.retry(); }
+                    }
+                    if root.idle && root.failed && root.can-reverify: Btn {
+                        width: 132px;
+                        label: "重新验证服务器";
+                        clicked => { root.reverify(); }
+                    }
+                    if root.idle && root.failed: Btn {
+                        width: 88px;
+                        label: "换个地址";
+                        clicked => { root.mode = 1; }
+                    }
+                    if root.form: Btn {
+                        width: 96px;
+                        label: "加入";
+                        primary: true;
+                        enabled: root.address != "";
+                        clicked => { root.join-address(); }
+                    }
+                    if root.asking-code: Btn {
+                        width: 96px;
+                        label: "加入";
+                        primary: true;
+                        enabled: root.code != "";
+                        clicked => { root.submit-code(); }
+                    }
+                    if root.asking-trust: Btn {
+                        width: 148px;
+                        label: "指纹一致，加入";
+                        primary: true;
+                        clicked => { root.trust(); }
+                    }
+                    if root.connecting || root.asking-code || root.asking-trust || (root.form && root.has-hero): Btn {
+                        width: 76px;
+                        label: "取消";
+                        clicked => { root.cancel(); }
+                    }
+                }
+
+                // 停在「回到篝火」上时，按回车就是点它。
+                if root.idle && !root.failed && root.hero-id >= 0: FocusScope {
+                    height: 0px;
+                    init => { self.focus(); }
+                    key-pressed(event) => {
+                        if (event.text == Key.Return) {
+                            root.join-saved(root.hero-id);
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+
+            if !root.narrow: Fire {
+                width: root.window-width * 0.42;
+                frame: root.fire;
+                resized(w, h) => { root.fire-resized(w, h); }
+            }
+        }
+
+        // ---- 别的服务器，和「加入新服务器」 ----
+        if root.list-visible: Rectangle { height: 1px; background: Theme.line; }
+        if root.list-visible: ScrollView {
+            height: root.list-shown;
+
+            VerticalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                spacing: 2px;
+                alignment: start;
+
+                if root.others.length > 0: HorizontalLayout {
+                    height: 24px;
+                    padding-left: 12px;
+                    Text {
+                        text: "其他篝火";
+                        color: Theme.faint;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                for row in root.others: Rectangle {
+                    height: 48px;
+                    border-radius: 6px;
+                    background: row-touch.has-hover ? Theme.hover : transparent;
+                    animate background { duration: 100ms; }
+
+                    accessible-role: button;
+                    accessible-label: "加入 " + (row.name != "" ? row.name : row.address);
+                    accessible-action-default => { root.join-saved(row.id); }
+
+                    // 整行都能点。× 画在它上面，所以点 × 不会顺手就加入了。
+                    row-touch := TouchArea {
+                        enabled: !root.connecting;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.forget-armed = -1;
+                            root.join-saved(row.id);
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 6px;
+                        spacing: 10px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: row.name != "" ? row.name : row.address;
+                                color: Theme.text;
+                                font-size: 14px;
+                                overflow: elide;
+                            }
+                            if row.name != "": Text {
+                                text: row.address;
+                                color: Theme.faint;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
+
+                        if root.forget-armed != row.id: Text {
+                            text: row.used;
+                            color: Theme.faint;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+
+                        // 移除要点两下：第一下 × 变成「移除」，第二下才真的移除。
+                        Rectangle {
+                            width: root.forget-armed == row.id ? 56px : 28px;
+                            height: 28px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 6px;
+                            background: root.forget-armed == row.id
+                                ? Theme.danger
+                                : (forget-touch.has-hover ? Theme.raised : transparent);
+
+                            accessible-role: button;
+                            accessible-label: root.forget-armed == row.id ? "确认移除" : "移除这个服务器";
+                            accessible-action-default => { forget-touch.clicked(); }
+
+                            Text {
+                                text: root.forget-armed == row.id ? "移除" : "×";
+                                color: root.forget-armed == row.id
+                                    ? #ffffff
+                                    : (forget-touch.has-hover ? Theme.text : Theme.faint);
+                                font-size: root.forget-armed == row.id ? 12px : 15px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                            forget-touch := TouchArea {
+                                enabled: !root.connecting;
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (root.forget-armed == row.id) {
+                                        root.forget-armed = -1;
+                                        root.forget(row.id);
+                                    } else {
+                                        root.forget-armed = row.id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-radius: 6px;
+                    background: new-touch.has-hover ? Theme.hover : transparent;
+                    animate background { duration: 100ms; }
+
+                    accessible-role: button;
+                    accessible-label: "加入新服务器";
+                    accessible-action-default => { new-touch.clicked(); }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        Text {
+                            text: "＋ 加入新服务器";
+                            color: new-touch.has-hover ? Theme.text : Theme.dim;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    new-touch := TouchArea {
+                        enabled: !root.connecting;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.forget-armed = -1;
+                            root.mode = 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 底下：我是谁，我的麦克风好不好使 ----
+        Rectangle { height: 1px; background: Theme.line; }
+        Rectangle {
+            height: 56px;
+            background: Theme.panel;
+
+            HorizontalLayout {
+                padding-left: Theme.pad;
+                padding-right: Theme.pad;
+                spacing: 10px;
+
+                Text {
+                    text: "昵称";
+                    color: Theme.dim;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+                Field {
+                    width: root.narrow ? 140px : 180px;
+                    height: 34px;
+                    y: (parent.height - self.height) / 2;
+                    placeholder: "别人看到的名字";
+                    text <=> root.nick;
+                }
+                if !root.narrow && root.my-fingerprint != "": Text {
+                    text: "身份指纹 " + root.my-fingerprint;
+                    color: Theme.faint;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if root.narrow || root.my-fingerprint == "": Rectangle { horizontal-stretch: 1; }
+                // 连不上的时候最想确认的就是「是不是我麦克风的问题」，
+                // 所以这个入口在首页上就有。
+                Btn {
+                    width: 76px;
+                    y: (parent.height - self.height) / 2;
+                    label: "试麦";
+                    clicked => { root.open-settings(); }
+                }
+            }
+        }
+    }
+}

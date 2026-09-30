@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use protocol::Invite;
 use voice_core::hotkey::Key;
 
 /// 点窗口的 × 时怎么办。
@@ -58,11 +59,40 @@ pub enum TalkMode {
     VoiceActivity,
 }
 
+/// 加入过的一个服务器。首页上「回到上次的篝火」和下面那一排都是它。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedServer {
+    /// 完整的邀请链接：地址、端口、证书指纹，私人服务器还带着加入码。
+    ///
+    /// 不管当初是怎么加入的（粘链接、输域名、输 IP 核对指纹），存下来都是这一种 ——
+    /// 再次进入时就跟点邀请链接一模一样，指纹是固定住的。
+    pub link: String,
+    /// 给人看的名字。加入页告诉我们的；没有就是空的，界面上显示地址。
+    pub name: String,
+    /// 上次加入的时刻，Unix 秒。
+    pub last_used: u64,
+    /// 加入页地址（不含加入码）。服务器换了证书时，可以从这儿重新取指纹。
+    pub page: Option<String>,
+}
+
+impl SavedServer {
+    pub fn invite(&self) -> Option<Invite> {
+        Invite::parse(&self.link).ok()
+    }
+}
+
+/// 最多记多少个服务器。再多首页就成了通讯录，而且这个文件是要能手改的。
+pub const MAX_SERVERS: usize = 20;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub nick: String,
-    /// 上次连的邀请链接。下次打开直接填好 —— 省掉「那条链接我放哪儿了」。
+    /// 上次连的邀请链接，跟 `servers` 里第一个是同一条。
+    ///
+    /// 留着它是为了老版本：换回旧客户端时，它还认这一行。
     pub last_invite: String,
+    /// 加入过的服务器，最近用的在前。
+    pub servers: Vec<SavedServer>,
     pub talk_mode: TalkMode,
     /// 按住说话绑的键。`None` 表示还没绑。
     pub ptt_key: Option<Key>,
@@ -124,6 +154,9 @@ pub fn snap_volume(raw: f32) -> u32 {
 /// 设置文件里单人音量那几行的前缀：`volume.<公钥>=<百分比>`。
 const VOLUME_PREFIX: &str = "volume.";
 
+/// 存下来的服务器那几行的前缀：`server.<序号>.<字段>=<值>`。
+const SERVER_PREFIX: &str = "server.";
+
 /// 电平条和滑块用的分贝范围。
 ///
 /// 下限 -60 dB：再往下是本底噪声，画出来也只是一条贴着左边的线。
@@ -146,6 +179,7 @@ impl Default for Settings {
         Self {
             nick: String::new(),
             last_invite: String::new(),
+            servers: Vec::new(),
             // 默认语音激活。默认按住说话的话，没绑键的新用户会发现
             // 怎么说都没人听见，而且完全不知道为什么。
             talk_mode: TalkMode::VoiceActivity,
@@ -185,6 +219,57 @@ impl Settings {
         }
     }
 
+    /// 加入成功了：记下这个服务器，排到最前面。
+    ///
+    /// **按地址认同一个服务器（不分大小写），不按指纹**：服务器重装换了证书，用户重新核对之后
+    /// 该是把旧的那条换掉，而不是首页上多出一个同名同地址、点了必定连不上的。
+    pub fn remember_server(&mut self, invite: &Invite, name: &str, page: Option<&str>, now: u64) {
+        let Ok(link) = invite.to_url() else { return };
+        let existing = self
+            .servers
+            .iter()
+            .position(|server| {
+                server
+                    .invite()
+                    .is_some_and(|old| same_address(&old, &invite.host, invite.port))
+            })
+            .map(|index| self.servers.remove(index));
+        let name = one_line(name);
+        self.servers.insert(
+            0,
+            SavedServer {
+                link: link.clone(),
+                // 这次没拿到名字（比如点邀请链接进来的）就沿用以前的。
+                name: if name.is_empty() {
+                    existing
+                        .as_ref()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default()
+                } else {
+                    name
+                },
+                last_used: now,
+                page: page
+                    .map(one_line)
+                    .filter(|p| !p.is_empty())
+                    .or(existing.and_then(|s| s.page)),
+            },
+        );
+        self.servers.truncate(MAX_SERVERS);
+        self.last_invite = link;
+    }
+
+    pub fn forget_server(&mut self, index: usize) {
+        if index < self.servers.len() {
+            self.servers.remove(index);
+        }
+        self.last_invite = self
+            .servers
+            .first()
+            .map(|s| s.link.clone())
+            .unwrap_or_default();
+    }
+
     pub fn path() -> io::Result<PathBuf> {
         // 跟身份文件放在一起，搬机器的时候一起走。
         let identity = voice_core::identity::Identity::default_path()?;
@@ -204,6 +289,8 @@ impl Settings {
 
     pub fn parse(text: &str) -> Self {
         let mut settings = Self::default();
+        // 序号 → 那个服务器的几行。序号只用来把同一个服务器的几行凑到一起。
+        let mut servers: BTreeMap<u32, SavedServer> = BTreeMap::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -223,6 +310,28 @@ impl Settings {
                             settings.set_user_volume(who, percent);
                         }
                     }
+                }
+                continue;
+            }
+            if let Some(rest) = key.strip_prefix(SERVER_PREFIX) {
+                let Some((index, field)) = rest.split_once('.') else {
+                    continue;
+                };
+                let Ok(index) = index.parse::<u32>() else {
+                    continue;
+                };
+                let server = servers.entry(index).or_insert_with(|| SavedServer {
+                    link: String::new(),
+                    name: String::new(),
+                    last_used: 0,
+                    page: None,
+                });
+                match field {
+                    "link" => server.link = value.to_string(),
+                    "name" => server.name = value.to_string(),
+                    "used" => server.last_used = value.parse().unwrap_or(0),
+                    "page" => server.page = non_empty(value),
+                    _ => {}
                 }
                 continue;
             }
@@ -268,6 +377,26 @@ impl Settings {
                 // 认不出来的键跳过。将来加了新设置，老版本读到也不会炸。
                 _ => {}
             }
+        }
+
+        // 链接解析不了的那条丢掉：留着它，首页上就有一个点了必定报错的服务器。
+        settings.servers = servers
+            .into_values()
+            .filter(|server| server.invite().is_some())
+            .collect();
+        // 最近用的在前。时间一样的保持文件里的先后（这个排序是稳定的）。
+        settings
+            .servers
+            .sort_by_key(|server| std::cmp::Reverse(server.last_used));
+        settings.servers.truncate(MAX_SERVERS);
+        // 从只记一条链接的老版本升上来：那一条就是第一个存下来的服务器。
+        if settings.servers.is_empty() && Invite::parse(&settings.last_invite).is_ok() {
+            settings.servers.push(SavedServer {
+                link: settings.last_invite.clone(),
+                name: String::new(),
+                last_used: 0,
+                page: None,
+            });
         }
         settings
     }
@@ -317,7 +446,31 @@ impl Settings {
                 CloseAction::Quit => "quit",
             },
             on_off(self.check_updates),
-        ) + &self.serialize_volumes()
+        ) + &self.serialize_servers()
+            + &self.serialize_volumes()
+    }
+
+    fn serialize_servers(&self) -> String {
+        if self.servers.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "# 加入过的服务器，最近用的在前。删掉某个序号的几行就是忘掉那个服务器。\n\
+             # link 里可能带着私人服务器的加入码 —— 别把这个文件发给别人。\n",
+        );
+        for (index, server) in self.servers.iter().enumerate() {
+            let n = index + 1;
+            out.push_str(&format!(
+                "{SERVER_PREFIX}{n}.link={}\n{SERVER_PREFIX}{n}.name={}\n{SERVER_PREFIX}{n}.used={}\n",
+                one_line(&server.link),
+                one_line(&server.name),
+                server.last_used,
+            ));
+            if let Some(page) = &server.page {
+                out.push_str(&format!("{SERVER_PREFIX}{n}.page={}\n", one_line(page)));
+            }
+        }
+        out
     }
 
     fn serialize_volumes(&self) -> String {
@@ -337,6 +490,10 @@ impl Settings {
         }
         out
     }
+}
+
+fn same_address(invite: &Invite, host: &str, port: u16) -> bool {
+    invite.port == port && invite.host.eq_ignore_ascii_case(host)
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -359,10 +516,35 @@ fn one_line(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn invite(host: &str, code: Option<&str>) -> Invite {
+        Invite {
+            host: host.into(),
+            port: 20800,
+            cert: protocol::Fingerprint([0x5a; 16]),
+            code: code.map(str::to_string),
+        }
+    }
+
     fn sample() -> Settings {
         Settings {
             nick: "阿狸".into(),
             last_invite: "gouhuo://j/abc".into(),
+            servers: vec![
+                SavedServer {
+                    link: invite("voice.example.com", Some("winter"))
+                        .to_url()
+                        .unwrap(),
+                    name: "周末开黑".into(),
+                    last_used: 1_790_000_000,
+                    page: Some("https://voice.example.com/".into()),
+                },
+                SavedServer {
+                    link: invite("203.0.113.7", None).to_url().unwrap(),
+                    name: String::new(),
+                    last_used: 1_780_000_000,
+                    page: None,
+                },
+            ],
             talk_mode: TalkMode::PushToTalk,
             ptt_key: Some(Key::Keyboard(0x20)),
             vad_threshold_db: -38.5,
@@ -533,6 +715,110 @@ mod tests {
             settings.user_volumes,
             BTreeMap::from([("EEEE".to_string(), 60)])
         );
+    }
+
+    /// 从只记一条链接的老版本升上来，那一条要出现在首页上。
+    #[test]
+    fn the_old_single_invite_becomes_the_first_saved_server() {
+        let link = invite("voice.example.com", None).to_url().unwrap();
+        let settings = Settings::parse(&format!("nick=阿狸\nlast_invite={link}\n"));
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers[0].link, link);
+        // 一条坏掉的旧链接不该变成一个点了必定报错的服务器
+        assert!(Settings::parse("last_invite=gouhuo://j/abc\n")
+            .servers
+            .is_empty());
+    }
+
+    #[test]
+    fn joining_again_moves_the_server_to_the_front_without_duplicating() {
+        let mut settings = Settings::default();
+        settings.remember_server(&invite("a.example.com", None), "甲", None, 100);
+        settings.remember_server(&invite("b.example.com", None), "乙", None, 200);
+        assert_eq!(settings.servers[0].name, "乙");
+
+        // 这次是点邀请链接进来的，没有名字，还带上了加入码
+        let with_code = invite("A.Example.com", Some("winter"));
+        settings.remember_server(&with_code, "", Some("https://a.example.com/"), 300);
+        assert_eq!(settings.servers.len(), 2, "同一个地址不该存两份");
+        assert_eq!(settings.servers[0].name, "甲", "没拿到新名字就沿用旧的");
+        assert_eq!(settings.servers[0].last_used, 300);
+        assert_eq!(
+            settings.servers[0].invite().unwrap().code.as_deref(),
+            Some("winter")
+        );
+        assert_eq!(settings.last_invite, with_code.to_url().unwrap());
+
+        // 再从别的路子进来，加入页地址还记着
+        settings.remember_server(&invite("a.example.com", Some("winter")), "", None, 400);
+        assert_eq!(
+            settings.servers[0].page.as_deref(),
+            Some("https://a.example.com/")
+        );
+    }
+
+    /// 服务器换了证书、用户重新核对之后：旧的那条被换掉，而不是多出一条。
+    #[test]
+    fn a_new_fingerprint_replaces_the_old_entry() {
+        let mut settings = Settings::default();
+        settings.remember_server(&invite("a.example.com", None), "甲", None, 100);
+        let renewed = Invite {
+            cert: protocol::Fingerprint([0x11; 16]),
+            ..invite("a.example.com", None)
+        };
+        settings.remember_server(&renewed, "", None, 200);
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers[0].invite().unwrap().cert, renewed.cert);
+    }
+
+    #[test]
+    fn forgetting_and_the_cap() {
+        let mut settings = Settings::default();
+        for n in 0..(MAX_SERVERS as u64 + 5) {
+            settings.remember_server(&invite(&format!("s{n}.example.com"), None), "", None, n);
+        }
+        assert_eq!(settings.servers.len(), MAX_SERVERS);
+        let second = settings.servers[1].link.clone();
+        settings.forget_server(0);
+        assert_eq!(settings.last_invite, second);
+        settings.forget_server(999);
+        while !settings.servers.is_empty() {
+            settings.forget_server(0);
+        }
+        assert_eq!(settings.last_invite, "");
+    }
+
+    /// 手改坏了的那几行不该让别的服务器也丢了。
+    #[test]
+    fn damaged_server_lines_are_skipped() {
+        let good = invite("a.example.com", None).to_url().unwrap();
+        let settings = Settings::parse(&format!(
+            "server.1.link=gouhuo://j/坏的\n\
+             server.1.name=坏的\n\
+             server.x.link={good}\n\
+             server.3.link={good}\n\
+             server.3.used=很久以前\n\
+             server.3.未来的字段=1\n\
+             server.4.name=只有名字\n"
+        ));
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers[0].link, good);
+        assert_eq!(settings.servers[0].last_used, 0);
+    }
+
+    /// 服务器名是别人的加入页给的，里面有换行也不能把文件切坏。
+    #[test]
+    fn a_hostile_server_name_cannot_inject_settings() {
+        let mut settings = Settings::default();
+        settings.remember_server(
+            &invite("a.example.com", None),
+            "好名字\nnick=被改了\nserver.9.link=x",
+            None,
+            1,
+        );
+        let parsed = Settings::parse(&settings.serialize());
+        assert_eq!(parsed.nick, "");
+        assert_eq!(parsed.servers.len(), 1);
     }
 
     /// 提示音默认开、念名字默认关；写坏了也退回这两个默认。

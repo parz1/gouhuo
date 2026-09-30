@@ -61,6 +61,20 @@ pub fn client_config(expected: Fingerprint) -> Result<rustls::ClientConfig, rust
         .with_no_client_auth())
 }
 
+/// 只为取回对面证书指纹用的 TLS 配置：什么证书都收。
+///
+/// **握手完读出指纹就该把连接关掉。** 为什么、以及之后怎么办，见
+/// [`pinning::UnpinnedServerCert`]。
+pub fn probe_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    let provider = crypto_provider();
+    let verifier = Arc::new(pinning::UnpinnedServerCert::new(provider.clone()));
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
 /// 服务端用的 TLS 配置。
 pub fn server_config(cert: &ServerCert) -> Result<rustls::ServerConfig, rustls::Error> {
     rustls::ServerConfig::builder_with_provider(crypto_provider())

@@ -757,7 +757,10 @@ fn establish(
     if let Err(e) = conn.complete_io(&mut handshake_sock) {
         let text = e.to_string();
         return Err(if text.contains("指纹对不上") {
-            ConnectError::WrongCertificate(text)
+            // rustls 会在我们自己的报错前面加一句 "unexpected error: "。这段话是要
+            // 原样给用户看的，把那句只有程序员看得懂的前缀去掉。
+            let detail = text.rsplit("unexpected error: ").next().unwrap_or(&text);
+            ConnectError::WrongCertificate(detail.to_string())
         } else {
             ConnectError::Tls(text)
         });
@@ -899,7 +902,7 @@ fn apply(roster: &Mutex<Roster>, message: ServerMessage) -> Vec<Event> {
     }
 }
 
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
+pub(crate) fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
     use std::net::ToSocketAddrs;
 
     let unreachable = |source: std::io::Error| ConnectError::Unreachable {

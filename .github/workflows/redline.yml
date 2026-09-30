@@ -110,7 +110,11 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          # 服务端不带加入页的那种编法（Dockerfile 的 GOUHUO_FEATURES）。平时没人这么编，
+          # 不在这儿看一眼的话，哪天编不过了要等到有人自己打镜像才发现。
+          cargo clippy -p server --no-default-features --all-targets -- -D warnings
       - name: test
         run: |
           cargo test --workspace

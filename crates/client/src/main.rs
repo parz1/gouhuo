@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use client_core::{Client, ConnectError, Ended, Event};
+use client_core::{Client, Ended, Event};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::cue::{chime, Chime};
 use voice_core::identity::Identity;
@@ -60,6 +60,8 @@ const FIRE_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 mod campfire;
+mod discover;
+mod join;
 mod settings;
 mod single_instance;
 mod update;
@@ -200,7 +202,6 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     } else {
         stored.nick.clone().into()
     });
-    app.set_invite_link(stored.last_invite.clone().into());
     app.set_ptt_mode(stored.talk_mode == TalkMode::PushToTalk);
     app.set_ptt_label(
         stored
@@ -219,18 +220,13 @@ fn run(instance_key: &str) -> Result<(), Failure> {
         hotkeys.set_ptt(stored.ptt_key);
     }
 
-    // 命令行上给了链接就填进去，盖过上次存的那条。Windows 把 `gouhuo://`
-    // 的协议处理器就是这么调起来的 —— 这一个参数同时也是「一键加入」的落点。
-    if let Some(link) = link_from_args() {
-        app.set_invite_link(link.into());
-    }
-
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
     let state = Arc::new(Mutex::new(State::default()));
     state.lock().expect("state poisoned").settings = stored;
 
-    wire_join(&app, &identity, &state);
+    wire_home(&app, &identity, &state);
+    refresh_home(&app, &state);
     wire_actions(&app, &state);
     wire_settings(&app, &state, hotkeys.clone());
     wire_scan(&app, &state);
@@ -252,13 +248,32 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     app.show().map_err(Failure::Window)?;
     dark_titlebar(&app);
 
-    // 点链接进来的老用户直接连，这才叫一键加入。
+    // 火的定时器平时由状态同步那边按需开（最慢半秒看一次）。刚打开窗口时
+    // 首页就在眼前，别让火先愣半秒。
+    FIRE_TIMER.with(|slot| {
+        if let Some(timer) = slot.borrow().as_ref() {
+            timer.restart();
+        }
+    });
+
+    // **普通启动停在首页，不自动连。** 首页上最显眼的就是「回到上次的篝火」，
+    // 回车就进；但要不要现在进、进哪一个，是用户说了算 —— 一打开就替他
+    // 把麦克风接进昨天那个频道，不是每次都合适。
     //
-    // **第一次跑的人不自动连**：那时昵称还是 Windows 用户名，
-    // 而且身份刚生成，该让他先看一眼再进去，否则他会顶着 "admin"
-    // 出现在一屋子人面前。
-    if !first_run && !app.get_invite_link().is_empty() {
-        app.invoke_join();
+    // 命令行上给了邀请链接就不一样了：Windows 把 `gouhuo://` 的协议处理器就是这么
+    // 调起来的，点链接这个动作本身就是「我要进去」。老用户直接连，这才叫一键加入。
+    //
+    // **第一次跑的人不自动连**：那时昵称还是 Windows 用户名，而且身份刚生成，
+    // 该让他先看一眼再进去，否则他会顶着 "admin" 出现在一屋子人面前。
+    // 链接替他填好，他改完昵称点「加入」就行。
+    if let Some(link) = link_from_args() {
+        if first_run {
+            app.set_address_input(link.as_str().into());
+            app.set_home_mode(1);
+            app.invoke_address_edited(link.into());
+        } else {
+            app.invoke_join_link(link.into());
+        }
     }
 
     // **不能用 run_event_loop**：它在最后一个窗口隐藏时就返回，收到托盘等于退出。
@@ -360,15 +375,16 @@ fn on_forwarded(app: &App, state: &Arc<Mutex<State>>, message: &str) {
             .settings
             .last_invite
             .clone();
-        if current == link {
+        // 按解析出来的内容比，不按字面比：同一条链接大小写、有没有空白都可能不一样。
+        let here = protocol::Invite::parse(&current);
+        if here.is_ok() && here == protocol::Invite::parse(link) {
             return;
         }
         // 点了另一个服务器的链接：离开这边，去那边。点链接这个动作本身就是
         // 「我要去那儿」，再问一句只是多一步。
         app.invoke_leave();
     }
-    app.set_invite_link(link.into());
-    app.invoke_join();
+    app.invoke_join_link(link.into());
 }
 
 /// 把窗口拉到最前面。转交的那个进程已经用 AllowSetForegroundWindow 把权限让给我们了，
@@ -448,6 +464,28 @@ struct State {
     announcer: Option<Announcer>,
     /// 篝火上谁坐哪块石头。跨刷新保留 —— 坐下了就不挪。
     seats: campfire::SeatMap,
+    /// 第几次「加入」。每开始一次、每取消一次都加一。
+    ///
+    /// 连接是在后台线程上阻塞着做的，取消不了它，只能不理它：结果回来时
+    /// 这个数对不上，就说明用户已经不要了（或者又点了别的），那份结果直接丢掉。
+    join_generation: u64,
+    /// 停下来等用户的那个服务器：等他核对指纹，或者等他填加入码。
+    pending: Option<join::Known>,
+    /// 上一次要加入的是什么。「重试」就是把它原样再来一遍。
+    last_request: Option<join::Request>,
+    /// 首页上面那一大块现在说的是谁。`None` 就是最近用过的那个。
+    ///
+    /// 正在加入、或者刚失败的那个服务器不一定是最近用过的，也可能根本没存过 ——
+    /// 这时候得把它摆在上面，不然「正在加入」「没能加入」说的是谁都不知道。
+    hero: Option<Hero>,
+}
+
+#[derive(Clone)]
+struct Hero {
+    title: String,
+    address: String,
+    /// 柴堆的种子。
+    seed: u32,
 }
 
 thread_local! {
@@ -463,68 +501,495 @@ thread_local! {
     /// 篝火：画面多大、哪个频道的柴堆、火烧到哪儿了。
     /// 大小是界面报上来的，频道是名单刷新时定的；任何一个变了就重画底图。
     static CAMPFIRE: RefCell<campfire::Stage> = RefCell::new(campfire::Stage::default());
+    /// 首页上那堆火：近景，没有人围着。跟频道里那堆各烧各的 ——
+    /// 两边画面大小不一样，共用一个的话每次切换都要重新点火。
+    static HOME_FIRE: RefCell<campfire::Stage> = RefCell::new(campfire::Stage::close_up());
     /// 让火动起来的定时器。只在篝火真的看得见时跑，见 `fire_pace`。
     static FIRE_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
 
-/// 点「加入」之后发生的事。
-fn wire_join(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<State>>) {
-    let weak = app.as_weak();
-    let identity = Rc::clone(identity);
-    let state = Arc::clone(state);
-
-    app.on_join(move || {
-        let Some(app) = weak.upgrade() else { return };
-        if app.get_connecting() {
-            return;
-        }
-        let link = app.get_invite_link().to_string();
-        let nick = {
-            let typed = app.get_nick().to_string();
-            let trimmed = typed.trim().to_string();
-            if trimmed.is_empty() {
-                default_nick()
-            } else {
-                trimmed
-            }
-        };
-
-        app.set_connecting(true);
-        app.set_error_headline("".into());
-        app.set_error_advice("".into());
-
-        // 连接会阻塞（DNS、TCP、TLS 握手，最长 8 秒），**不能在界面线程上做** ——
-        // 否则窗口会白到超时为止，用户以为程序死了。
+/// 首页上的每一个动作：回到存着的服务器、按输的地址加入、填加入码、核对指纹、
+/// 取消、重试、移除。
+///
+/// 它们最后都落到同一个地方（[`begin_join`]）：把「要加入什么」交给后台线程去办，
+/// 办到哪一步、卡在哪儿，再由 [`finish_join`] 搬回界面上。怎么办的见 `join.rs`。
+fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<State>>) {
+    let begin: Rc<dyn Fn(join::Request)> = {
         let weak = app.as_weak();
-        let state = Arc::clone(&state);
-        // 身份只有一份，不能移进后台线程。导出再导入拿一份副本 ——
-        // 这条路径本来就要能跑（换机器就是靠它），顺手也验了一次。
-        let identity_copy = match Identity::import(&identity.export()) {
-            Ok(copy) => copy,
-            Err(_) => {
-                app.set_connecting(false);
+        let identity = Rc::clone(identity);
+        let state = Arc::clone(state);
+        Rc::new(move |request| {
+            if let Some(app) = weak.upgrade() {
+                begin_join(&app, &identity, &state, request);
+            }
+        })
+    };
+
+    {
+        // 点链接启动、别的实例转交过来的链接。
+        let begin = Rc::clone(&begin);
+        app.on_join_link(move |link| {
+            begin(join::Request::Address {
+                text: link.to_string(),
+                fresh: false,
+            });
+        });
+    }
+
+    {
+        let begin = Rc::clone(&begin);
+        let state = Arc::clone(state);
+        app.on_join_saved(move |id| {
+            let saved = state
+                .lock()
+                .expect("state poisoned")
+                .settings
+                .servers
+                .get(id.max(0) as usize)
+                .and_then(join::Known::from_saved);
+            if let Some(known) = saved {
+                begin(join::Request::Known(known));
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_address_edited(move |text| {
+            if let Some(app) = weak.upgrade() {
+                // 还在输的时候，空的不算错 —— 不然光标一进框就是一行红字。
+                if text.trim().is_empty() {
+                    app.set_address_hint("".into());
+                    app.set_address_bad(false);
+                } else {
+                    check_address(&app, &state, &text);
+                }
+            }
+        });
+    }
+
+    {
+        let begin = Rc::clone(&begin);
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_join_address(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let text = app.get_address_input().to_string();
+            // 认不出来的东西不拿去连：原因就写在框下面，改了再点。
+            if check_address(&app, &state, &text) {
+                begin(join::Request::Address { text, fresh: false });
+            }
+        });
+    }
+
+    {
+        let begin = Rc::clone(&begin);
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_submit_code(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let code = app.get_join_code().trim().to_string();
+            let pending = state.lock().expect("state poisoned").pending.clone();
+            let (Some(mut known), false) = (pending, code.is_empty()) else {
                 return;
+            };
+            known.invite.code = Some(code);
+            begin(join::Request::Known(known));
+        });
+    }
+
+    {
+        // 用户核对过指纹了：从这一刻起它就是固定下来的，跟邀请链接里带的一样。
+        let begin = Rc::clone(&begin);
+        let state = Arc::clone(state);
+        app.on_trust_server(move || {
+            let pending = state.lock().expect("state poisoned").pending.clone();
+            if let Some(known) = pending {
+                begin(join::Request::Known(known));
+            }
+        });
+    }
+
+    {
+        let begin = Rc::clone(&begin);
+        let state = Arc::clone(state);
+        app.on_retry_join(move || {
+            let last = state.lock().expect("state poisoned").last_request.clone();
+            if let Some(request) = last {
+                begin(request);
+            }
+        });
+    }
+
+    {
+        // 证书对不上：重新去取这台服务器的指纹。有加入页就问加入页（CA 证书担保，
+        // 不用用户核对）；没有就直接取，取回来照样要用户核对 —— 服务器重装了
+        // 和有人在中间，从这边看是一模一样的。
+        let begin = Rc::clone(&begin);
+        let state = Arc::clone(state);
+        app.on_reverify_server(move || {
+            let last = state.lock().expect("state poisoned").last_request.clone();
+            let text = match last {
+                Some(join::Request::Known(known)) => known.page.unwrap_or_else(|| {
+                    let host = client_core::address::bracketed(&known.invite.host);
+                    if known.invite.port == protocol::DEFAULT_PORT {
+                        host
+                    } else {
+                        format!("{host}:{}", known.invite.port)
+                    }
+                }),
+                Some(join::Request::Address { text, .. }) => text,
+                None => return,
+            };
+            begin(join::Request::Address { text, fresh: true });
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_cancel_join(move || {
+            let Some(app) = weak.upgrade() else { return };
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                // 后台那次连接掐不掉，只能不认它的结果，见 State::join_generation。
+                locked.join_generation += 1;
+                locked.pending = None;
+                locked.hero = None;
+            }
+            app.set_connecting(false);
+            app.set_connect_stage("".into());
+            app.set_home_mode(0);
+            app.set_join_code("".into());
+            app.set_code_rejected(false);
+            clear_join_error(&app);
+            refresh_home(&app, &state);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_forget_server(move |id| {
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.forget_server(id.max(0) as usize);
+                let _ = locked.settings.save();
+            }
+            if let Some(app) = weak.upgrade() {
+                refresh_home(&app, &state);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        app.on_home_fire_resized(move |width, height| {
+            let Some(app) = weak.upgrade() else { return };
+            let frame = HOME_FIRE.with(|stage| {
+                let mut stage = stage.borrow_mut();
+                stage.set_size((width, height)).then(|| stage.still())
+            });
+            if let Some(frame) = frame {
+                app.set_home_fire(frame);
+            }
+        });
+    }
+}
+
+/// 认一下地址框里的东西，把结果写到框下面那行字上。认得出来返回 `true`。
+fn check_address(app: &App, state: &Arc<Mutex<State>>, text: &str) -> bool {
+    let saved = state
+        .lock()
+        .expect("state poisoned")
+        .settings
+        .servers
+        .clone();
+    let described = join::describe(text, &saved);
+    app.set_address_bad(described.is_err());
+    match described {
+        Ok(hint) => {
+            app.set_address_hint(hint.into());
+            true
+        }
+        Err(problem) => {
+            app.set_address_hint(problem.into());
+            false
+        }
+    }
+}
+
+fn clear_join_error(app: &App) {
+    app.set_error_headline("".into());
+    app.set_error_advice("".into());
+    app.set_error_can_reverify(false);
+}
+
+/// 柴堆的种子：按服务器的证书指纹算，所以每个服务器门口是不一样的一堆柴。
+fn fire_seed(invite: &protocol::Invite) -> u32 {
+    let f = invite.cert.0;
+    u32::from_le_bytes([f[0], f[1], f[2], f[3]])
+}
+
+fn hero_of(known: &join::Known) -> Hero {
+    Hero {
+        title: known.title(),
+        address: known.address(),
+        seed: fire_seed(&known.invite),
+    }
+}
+
+/// 开始加入。连接会阻塞（域名解析、HTTPS、TCP、TLS 握手，最长十几秒），
+/// **不能在界面线程上做** —— 否则窗口会白到超时为止，用户以为程序死了。
+fn begin_join(
+    app: &App,
+    identity: &Rc<Identity>,
+    state: &Arc<Mutex<State>>,
+    request: join::Request,
+) {
+    if app.get_connecting() {
+        return;
+    }
+    let nick = {
+        let typed = app.get_nick().to_string();
+        let trimmed = typed.trim().to_string();
+        if trimmed.is_empty() {
+            default_nick()
+        } else {
+            trimmed
+        }
+    };
+    // 身份只有一份，不能移进后台线程。导出再导入拿一份副本 ——
+    // 这条路径本来就要能跑（换机器就是靠它），顺手也验了一次。
+    let Ok(identity) = Identity::import(&identity.export()) else {
+        return;
+    };
+
+    // 上面那一大块先换成「正在加入谁」。输的是地址的话，这时候还不知道名字，
+    // 先显示地址；**绝不显示原文** —— 邀请链接和 `#code=` 里都可能带着加入码。
+    let hero = match &request {
+        join::Request::Known(known) => hero_of(known),
+        join::Request::Address { text, .. } => {
+            use client_core::address::{display_address, parse, Target};
+            let shown = match parse(text, join::allow_loopback_http()) {
+                Ok(Target::Invite(invite)) => display_address(&invite.host, invite.port),
+                Ok(Target::Page(page)) => page.host,
+                Ok(Target::Host(host)) => display_address(&host.host, host.port_or_default()),
+                Err(_) => "…".to_string(),
+            };
+            Hero {
+                title: shown.clone(),
+                address: shown,
+                seed: 0,
+            }
+        }
+    };
+
+    let (generation, saved) = {
+        let mut locked = state.lock().expect("state poisoned");
+        locked.join_generation += 1;
+        locked.pending = None;
+        locked.last_request = Some(request.clone());
+        locked.hero = Some(hero);
+        (locked.join_generation, locked.settings.servers.clone())
+    };
+    app.set_connecting(true);
+    app.set_connect_stage("正在准备…".into());
+    app.set_home_mode(0);
+    app.set_code_rejected(false);
+    clear_join_error(app);
+    refresh_home(app, state);
+
+    let weak = app.as_weak();
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        // 「现在在干什么」搬回界面线程。已经被取消了的那一次就别再往界面上写了。
+        let progress = {
+            let weak = weak.clone();
+            let state = Arc::clone(&state);
+            move |stage: &str, server: Option<&join::Known>| {
+                let stage = stage.to_string();
+                let hero = server.map(hero_of);
+                let state = Arc::clone(&state);
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    {
+                        let mut locked = state.lock().expect("state poisoned");
+                        if locked.join_generation != generation {
+                            return;
+                        }
+                        if let Some(hero) = hero {
+                            locked.hero = Some(hero);
+                        }
+                    }
+                    app.set_connect_stage(stage.into());
+                    refresh_home(&app, &state);
+                });
             }
         };
-
-        std::thread::spawn(move || {
-            let outcome = Client::connect(&link, &identity_copy, &nick);
-            let _ = weak.upgrade_in_event_loop(move |app| match outcome {
-                Ok((client, events)) => {
-                    on_connected(&app, &state, client, events, &nick);
-                }
-                Err(e) => {
-                    show_error(&app, &e);
-                    app.set_connecting(false);
-                }
-            });
+        let outcome = join::run(request, &identity, &nick, &saved, &progress);
+        let _ = weak.upgrade_in_event_loop(move |app| {
+            finish_join(&app, &state, generation, outcome, &nick);
         });
     });
 }
 
-fn show_error(app: &App, e: &ConnectError) {
-    app.set_error_headline(e.headline().into());
-    app.set_error_advice(e.advice().into());
+/// 后台那次加入有结果了：进去了、要用户核对指纹、要加入码，或者没成。
+fn finish_join(
+    app: &App,
+    state: &Arc<Mutex<State>>,
+    generation: u64,
+    outcome: join::Outcome,
+    nick: &str,
+) {
+    if state.lock().expect("state poisoned").join_generation != generation {
+        // 用户已经取消了。要是偏偏连上了，得把它断掉 ——
+        // 不然服务器上会多出一个谁也看不见、还开着麦的「我」。
+        if let join::Outcome::Joined { client, .. } = outcome {
+            client.disconnect();
+        }
+        return;
+    }
+    app.set_connecting(false);
+    app.set_connect_stage("".into());
+
+    match outcome {
+        join::Outcome::Joined {
+            client,
+            events,
+            server,
+        } => on_connected(app, state, client, events, nick, server),
+        join::Outcome::ConfirmFingerprint(server) => {
+            app.set_trust_fingerprint(server.invite.cert.to_grouped_hex().into());
+            app.set_home_mode(3);
+            let mut locked = state.lock().expect("state poisoned");
+            locked.hero = Some(hero_of(&server));
+            locked.pending = Some(server);
+        }
+        join::Outcome::NeedCode { server, rejected } => {
+            app.set_join_code("".into());
+            app.set_code_rejected(rejected);
+            app.set_home_mode(2);
+            let mut locked = state.lock().expect("state poisoned");
+            locked.hero = Some(hero_of(&server));
+            locked.pending = Some(server);
+        }
+        join::Outcome::Failed(failure) => {
+            app.set_error_headline(failure.headline.into());
+            app.set_error_advice(failure.advice.into());
+            app.set_error_can_reverify(failure.certificate_changed);
+            app.set_home_mode(0);
+            let mut locked = state.lock().expect("state poisoned");
+            let seed = locked.hero.as_ref().map(|h| h.seed).unwrap_or(0);
+            locked.hero = Some(Hero {
+                title: failure.title,
+                address: failure.address,
+                seed,
+            });
+        }
+    }
+    refresh_home(app, state);
+}
+
+/// 把存着的服务器摆到首页上：最近用的那个在上面那一大块，别的排在下面。
+///
+/// 每次都整个重建。最多二十行，而且只在加入、离开、移除的时候才调。
+fn refresh_home(app: &App, state: &Arc<Mutex<State>>) {
+    let (servers, hero) = {
+        let locked = state.lock().expect("state poisoned");
+        (locked.settings.servers.clone(), locked.hero.clone())
+    };
+    let now = unix_now();
+    // (在存着的服务器里排第几, 怎么连, 上次什么时候来的)
+    let known: Vec<(i32, join::Known, u64)> = servers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, saved)| {
+            join::Known::from_saved(saved).map(|k| (index as i32, k, saved.last_used))
+        })
+        .collect();
+
+    let (hero_id, title, address, used, seed) = match (&hero, known.first()) {
+        (Some(hero), _) => {
+            // 正在加入的要是正好是存着的某一个，下面那一排里就别再出现一次。
+            let id = known
+                .iter()
+                .find(|(_, k, _)| k.address() == hero.address)
+                .map(|(id, _, _)| *id)
+                .unwrap_or(-1);
+            (
+                id,
+                hero.title.clone(),
+                hero.address.clone(),
+                String::new(),
+                hero.seed,
+            )
+        }
+        (None, Some((id, recent, last_used))) => (
+            *id,
+            recent.title(),
+            recent.address(),
+            ago(now, *last_used),
+            fire_seed(&recent.invite),
+        ),
+        (None, None) => (-1, String::new(), String::new(), String::new(), 0),
+    };
+
+    app.set_has_hero(hero.is_some() || !known.is_empty());
+    app.set_has_servers(!known.is_empty());
+    app.set_hero_id(hero_id);
+    app.set_hero_name(title.into());
+    app.set_hero_address(address.into());
+    app.set_hero_used(used.into());
+
+    let others: Vec<ServerRow> = known
+        .iter()
+        .filter(|(id, _, _)| *id != hero_id)
+        .map(|(id, k, last_used)| ServerRow {
+            id: *id,
+            name: k.name.clone().into(),
+            address: k.address().into(),
+            used: ago(now, *last_used).into(),
+        })
+        .collect();
+    app.set_other_servers(ModelRc::new(VecModel::from(others)));
+
+    // 换了服务器就换一堆柴。
+    let frame = HOME_FIRE.with(|stage| {
+        let mut stage = stage.borrow_mut();
+        stage.set_channel(seed).then(|| stage.still())
+    });
+    if let Some(frame) = frame {
+        app.set_home_fire(frame);
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 「上次什么时候来的」：刚刚 / 今天 21:40 / 昨天 21:40 / 3 天前 / 9月27日。
+///
+/// `then` 是 0 表示不知道（从老版本升上来的那一条），什么都不写。
+fn ago(now: u64, then: u64) -> String {
+    if then == 0 || then > now + 60 {
+        return String::new();
+    }
+    if now.saturating_sub(then) < 90 {
+        return "刚刚".to_string();
+    }
+    let offset = local_offset_seconds();
+    let day = |t: u64| (t as i64 + offset).div_euclid(86_400);
+    let days = day(now) - day(then);
+    match days {
+        0 => format!("今天 {}", clock_time(then as i64 * 1000)),
+        1 => format!("昨天 {}", clock_time(then as i64 * 1000)),
+        2..=6 => format!("{days} 天前"),
+        _ => clock_date(then as i64 * 1000),
+    }
 }
 
 fn on_connected(
@@ -533,6 +998,7 @@ fn on_connected(
     client: Client,
     events: Receiver<Event>,
     nick: &str,
+    server: join::Known,
 ) {
     // 服务端可能改过昵称（重名会加后缀），以它给的为准。
     let actual = {
@@ -546,13 +1012,32 @@ fn on_connected(
     });
 
     {
-        // 连上了才存 —— 存一条连不上的链接只会让下次打开就看到一个错误。
+        // 连上了才存 —— 存一个连不上的服务器只会让下次打开就看到一个错误。
+        // 不管是粘链接、输域名还是输 IP 核对指纹进来的，存下来都是同一种东西
+        // （地址 + 固定的指纹 + 加入码），下次从首页一点就进。
         let mut locked = state.lock().expect("state poisoned");
         locked.client = Some(client.clone());
         locked.settings.nick = app.get_nick().to_string();
-        locked.settings.last_invite = app.get_invite_link().to_string();
+        locked.settings.remember_server(
+            &server.invite,
+            &server.name,
+            server.page.as_deref(),
+            unix_now(),
+        );
         let _ = locked.settings.save();
+        locked.hero = None;
+        locked.pending = None;
     }
+    // 频道树顶上那一行：加入页给的名字，没有就是地址。
+    app.set_server_name(server.title().into());
+    // 首页收拾干净，离开频道回来时是它平常的样子。
+    app.set_home_mode(0);
+    app.set_address_input("".into());
+    app.set_address_hint("".into());
+    app.set_address_bad(false);
+    app.set_join_code("".into());
+    clear_join_error(app);
+    refresh_home(app, state);
     app.set_connecting(false);
     app.set_connected(true);
     app.set_self_muted(false);
@@ -1405,15 +1890,15 @@ fn pump_events(
                     drop(locked);
                     app.set_connected(false);
                     app.set_reconnecting("".into());
+                    // 回到首页。「上次」那几个字要重算 —— 刚离开的这个现在是「刚刚」。
+                    refresh_home(&app, &state);
                     match ended {
-                        // 自己走的不是错误，别在登录页上挂一条报错。
-                        Ended::ByUser => {
-                            app.set_error_headline("".into());
-                            app.set_error_advice("".into());
-                        }
+                        // 自己走的不是错误，别在首页上挂一条报错。
+                        Ended::ByUser => clear_join_error(&app),
                         Ended::Refused { headline, advice } => {
                             app.set_error_headline(headline.into());
                             app.set_error_advice(advice.into());
+                            app.set_error_can_reverify(false);
                             // 收在托盘里的时候被踢了、被封了、被顶号了：把窗口叫出来，
                             // 不然用户以为自己还在频道里，一直对着空气说话。
                             let _ = app.show();
@@ -1734,7 +2219,8 @@ fn resize_campfire(app: &App, width: f32, height: f32) {
 ///   这是最常见的情况 —— 篝火开着没最小化、被游戏整个盖住，画了也没人看得见
 /// - 不在前台、也没被全屏盖住（比如放在副屏上）：慢下来，[`FIRE_FRAME_IDLE`]
 fn fire_pace(app: &App) -> Option<std::time::Duration> {
-    if !app.get_campfire_shown()
+    // 两堆火：频道里的那堆，和首页上的那堆。哪个都不在眼前就不动。
+    if !(app.get_campfire_shown() || app.get_home_shown())
         || !app.window().is_visible()
         || app.window().is_minimized()
         || !system_animations_on()
@@ -1868,8 +2354,13 @@ fn spawn_fire(weak: slint::Weak<App>) {
         if pace.is_none() {
             return;
         }
-        let frame = CAMPFIRE.with(|stage| stage.borrow_mut().advance(dt));
-        app.set_campfire_backdrop(frame);
+        if app.get_home_shown() {
+            let frame = HOME_FIRE.with(|stage| stage.borrow_mut().advance(dt));
+            app.set_home_fire(frame);
+        } else {
+            let frame = CAMPFIRE.with(|stage| stage.borrow_mut().advance(dt));
+            app.set_campfire_backdrop(frame);
+        }
     });
     timer.stop();
     FIRE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
@@ -2101,10 +2592,10 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             }
             state.lock().expect("state poisoned").voice = None;
             if let Some(app) = weak.upgrade() {
-                // 主动离开不是错误，别把上一次的报错留在登录页上。
+                // 主动离开不是错误，别把上一次的报错留在首页上。
                 app.set_connected(false);
-                app.set_error_headline("".into());
-                app.set_error_advice("".into());
+                clear_join_error(&app);
+                refresh_home(&app, &state);
             }
         });
     }

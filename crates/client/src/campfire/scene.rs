@@ -50,6 +50,21 @@ impl Geometry {
             fh: hf * 0.46 * INTENSITY,
         }
     }
+
+    /// 近景：没有人围着坐，画面里只有火（首页上那一堆）。
+    ///
+    /// 频道里的构图要给一圈石头留地方，火只占中间一小块；首页上没有石头，
+    /// 同样的比例火就显得又小又远。所以火塘放大、往下挪一点，别的画法一概不变。
+    pub fn close_up(width: f32, height: f32) -> Self {
+        let mut g = Self::new(width, height);
+        let (wf, hf) = (width / CELL, height / CELL);
+        // 窄窗口时火是顶上扁扁的一条：高度本来就不够，火再贴着底、再大一点才看得出是火。
+        let strip = wf > hf * 2.2;
+        g.fy = hf * if strip { 0.76 } else { 0.66 };
+        g.bw = (wf * 0.15).min(hf * if strip { 0.24 } else { 0.17 });
+        g.fh = hf * if strip { 0.7 } else { 0.62 } * INTENSITY;
+        g
+    }
 }
 
 /// 柴堆里的一根木头。

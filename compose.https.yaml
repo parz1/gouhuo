@@ -1,0 +1,27 @@
+# 可选 HTTPS 加入页（Linux host 网络）。
+# docker compose -f compose.yaml -f compose.https.yaml up -d --build
+# .env 中 GOUHUO_HOST 必须是指向本机的域名，放行 80/tcp、443/tcp。
+services:
+  gouhuo:
+    environment:
+      GOUHUO_WEB_LISTEN: ${GOUHUO_WEB_LISTEN:-127.0.0.1:20801}
+      GOUHUO_JOIN_URL: https://${GOUHUO_HOST}/
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GOUHUO_HOST: ${GOUHUO_HOST:?在 .env 中填写域名}
+      GOUHUO_WEB_LISTEN: ${GOUHUO_WEB_LISTEN:-127.0.0.1:20801}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - gouhuo-caddy-data:/data
+      - gouhuo-caddy-config:/config
+    depends_on:
+      - gouhuo
+
+volumes:
+  gouhuo-caddy-data:
+    name: gouhuo-caddy-data
+  gouhuo-caddy-config:
+    name: gouhuo-caddy-config

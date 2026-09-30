@@ -13,7 +13,12 @@ services:
   gouhuo:
     image: ghcr.io/parz1/gouhuo-server:${GOUHUO_VERSION:-latest}
     # 在仓库里 `docker compose up -d --build` 就是从源码编，不拉镜像。
-    build: .
+    build:
+      context: .
+      args:
+        # 只在从源码编时有用：.env 里写 GOUHUO_FEATURES=--no-default-features，
+        # 编出来的服务端就不含浏览器加入页（见 Dockerfile）。
+        GOUHUO_FEATURES: ${GOUHUO_FEATURES:-}
     restart: unless-stopped
     # host 网络：UDP 的对端地址是从收到的包里学的，少一层 Docker NAT 就少一处
     # 改写源地址的可能。只在 Linux 上有效 —— Docker Desktop 上换成下面的 ports。

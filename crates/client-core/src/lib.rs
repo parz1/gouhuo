@@ -24,10 +24,12 @@
 //! 界面线程既不读也不写 socket，它只是 channel 的另一端。所以界面卡住了
 //! 不会导致掉线，网络卡住了也不会冻住界面 —— 这两件事在语音软件里都会发生。
 
+pub mod address;
 pub mod error;
 pub mod roster;
 
 mod client;
+mod probe;
 mod wire;
 
 pub use client::{
@@ -35,6 +37,7 @@ pub use client::{
     RECONNECT_MAX,
 };
 pub use error::ConnectError;
+pub use probe::probe;
 pub use roster::{ChannelNode, ChatLine, Roster, MAX_CHAT_LINES};
 
 /// 报给服务端的客户端版本。只用来排查问题，不参与任何判断。

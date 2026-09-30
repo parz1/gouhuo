@@ -9,10 +9,18 @@
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
+# 浏览器加入页（crates/server 的 web feature）默认编进去，但**默认不启用**：
+# 不设 GOUHUO_WEB_LISTEN 就不多一个线程、不多一个端口，镜像只大 0.2 MB 左右。
+# 想要一个彻底不含 HTTP 服务的镜像：
+#
+#   docker build --build-arg GOUHUO_FEATURES=--no-default-features .
+#
+# 用 compose 从源码编的话，在 .env 里写 GOUHUO_FEATURES=--no-default-features。
+ARG GOUHUO_FEATURES=""
 # 缓存挂载：改一行代码不用重新下载、重新编译全部依赖。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --profile dist --locked -p server --bin gouhuo-server \
+    cargo build --profile dist --locked -p server --bin gouhuo-server ${GOUHUO_FEATURES} \
     && cp target/dist/gouhuo-server /gouhuo-server
 
 FROM debian:bookworm-slim
