@@ -101,16 +101,48 @@ else
     say "  地址 $host 写进了 .env（不对就改 .env 再跑一次）"
 fi
 
+# ---- 可选 HTTPS 加入页 ------------------------------------------------------
+# 显式启用后记在 .env 中，之后升级继续保留同一组服务。
+saved_https=$(sed -n 's/^GOUHUO_HTTPS=\([01]\)$/\1/p' .env | tail -n 1)
+https="${GOUHUO_HTTPS:-${saved_https:-0}}"
+case "$https" in 0 | 1) ;; *) die "GOUHUO_HTTPS 只能是 0 或 1" ;; esac
+if [ "$https" = 1 ]; then
+    domain=$(sed -n 's/^GOUHUO_HOST=//p' .env | tail -n 1)
+    case "$domain" in
+        '' | *[!a-zA-Z0-9.-]* | *..* | .* | *.) die "HTTPS 加入页需要域名，例如 GOUHUO_HOST=voice.example.com" ;;
+        *[a-zA-Z]*) ;;
+        *) die "HTTPS 加入页请使用域名，不能使用裸 IP" ;;
+    esac
+    for file in compose.https.yaml Caddyfile; do
+        say "  下载 $file"
+        curl -fsSL "$RAW/$file" -o "$file.new" || die "下载 $file 失败"
+        mv "$file.new" "$file"
+    done
+fi
+if grep -q '^GOUHUO_HTTPS=' .env; then
+    sed -i "s/^GOUHUO_HTTPS=.*/GOUHUO_HTTPS=$https/" .env
+elif [ "$https" = 1 ]; then
+    printf 'GOUHUO_HTTPS=1\n' >>.env
+fi
+
+compose() {
+    if [ "$https" = 1 ]; then
+        docker compose -f compose.yaml -f compose.https.yaml "$@"
+    else
+        docker compose -f compose.yaml "$@"
+    fi
+}
+
 say "  拉镜像、起服务"
-docker compose pull -q
-docker compose up -d --remove-orphans
+compose pull -q
+compose up -d --remove-orphans
 
 # ---- 邀请链接 ---------------------------------------------------------------
 
 links=""
 i=0
 while [ $i -lt 30 ]; do
-    links=$(docker compose logs --no-log-prefix gouhuo 2>/dev/null | grep -o 'gouhuo://[^ ]*' || true)
+    links=$(compose logs --no-log-prefix gouhuo 2>/dev/null | grep -o 'gouhuo://[^ ]*' || true)
     [ -n "$links" ] && break
     i=$((i + 1))
     sleep 1
@@ -127,6 +159,17 @@ say "  ✓ 起来了。把这一行发给朋友，粘进篝火就能进来："
 say ""
 say "      $invite"
 say ""
+if [ "$https" = 1 ]; then
+    say "  浏览器加入页：https://$domain/"
+    browser_invite=$(compose logs --no-log-prefix gouhuo 2>/dev/null | sed -n 's/^[[:space:]]*\(https:\/\/[^ ]*#code=[^ ]*\).*/\1/p' | tail -n 1)
+    if [ -n "$browser_invite" ]; then
+        say "  浏览器邀请（含加入码，仅分享给朋友）："
+        say "      $browser_invite"
+    fi
+    say "  HTTPS 还需放行 80/tcp、443/tcp；域名 DNS 要指向这台机器。"
+    say "  等待证书签发；检查：docker compose -f compose.yaml -f compose.https.yaml logs caddy"
+    say ""
+fi
 if [ -n "$admin" ]; then
     say "  管理员链接（只给自己！用它连进去就成了管理员，用过一次作废）："
     say ""

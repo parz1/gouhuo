@@ -29,6 +29,7 @@ getrandom.workspace = true
 rusqlite.workspace = true
 # 控制面等待可读/可写事件，不使用会吞数据的 socket 读超时。
 polling = "3"
+tiny_http = "0.12"
 
 [dev-dependencies]
 protocol.workspace = true

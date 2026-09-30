@@ -277,6 +277,93 @@ fn a_wrong_fingerprint_is_explained_not_just_refused() {
     let advice = error.advice();
     assert!(advice.contains("重装"), "要说清楚最常见的原因：{advice}");
     assert!(advice.contains("别连"), "也要说什么时候该收手：{advice}");
+    assert!(
+        !advice.contains("unexpected error"),
+        "TLS 库自己加的前缀不该给用户看：{advice}"
+    );
+}
+
+/// 只知道 IP 和端口：先把指纹取回来（给用户核对），再用它固定证书连进去。
+/// 取指纹那一下不登录 —— 服务端那边不该多出一个人。
+#[test]
+fn a_bare_address_can_fetch_the_fingerprint_then_join() {
+    let server = open_server();
+    let (host, port) = (server.invite.host.as_str(), server.invite.port);
+
+    let seen = client_core::probe(host, port).expect("取不到指纹");
+    assert_eq!(seen, server.invite.cert, "取回来的不是这台服务器的指纹");
+    assert_eq!(server.hub.user_count(), 0, "取指纹不该算登录");
+
+    let invite = Invite {
+        host: host.to_string(),
+        port,
+        cert: seen,
+        code: None,
+    };
+    let (_client, _events) =
+        Client::connect_to(&invite, &Identity::generate().unwrap(), "阿狸").expect("连不上");
+    assert_eq!(server.hub.user_count(), 1);
+}
+
+/// 私人服务器：地址和指纹谁都能拿到，但没有加入码进不去；
+/// 补上加入码（用户手输的）就能进。加入码只在固定了指纹的连接里发。
+#[test]
+fn a_private_server_needs_the_code_typed_in_after_the_address() {
+    let server = start(Config {
+        require_invite: true,
+        invite_code: Some("winter2026".into()),
+        ..Config::default()
+    });
+    let (host, port) = (server.invite.host.as_str(), server.invite.port);
+    let cert = client_core::probe(host, port).expect("私人服务器的指纹也该取得到");
+
+    let mut invite = Invite {
+        host: host.to_string(),
+        port,
+        cert,
+        code: None,
+    };
+    let error = Client::connect_to(&invite, &Identity::generate().unwrap(), "路人")
+        .err()
+        .expect("没有加入码却进去了");
+    assert!(
+        matches!(
+            error,
+            ConnectError::Rejected {
+                reason: Reason::InviteRequired,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    invite.code = Some("winter2026".into());
+    let (_client, _events) =
+        Client::connect_to(&invite, &Identity::generate().unwrap(), "自己人").expect("连不上");
+    assert_eq!(server.hub.user_count(), 1);
+}
+
+/// 没人听的端口、不是篝火的服务：取指纹要报出原因，不能卡住。
+#[test]
+fn probing_something_that_is_not_gouhuo_fails_cleanly() {
+    let spare = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = spare.local_addr().unwrap().port();
+    drop(spare);
+    assert!(matches!(
+        client_core::probe("127.0.0.1", port),
+        Err(ConnectError::Unreachable { .. })
+    ));
+
+    // 接了连接就关掉的服务
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
+    assert!(matches!(
+        client_core::probe("127.0.0.1", port),
+        Err(ConnectError::Tls(_))
+    ));
 }
 
 /// 改过的链接在碰网络之前就该被拦下。

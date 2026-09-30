@@ -1,0 +1,4 @@
+# HTTP 自动跳转 HTTPS，证书由 Caddy 申请和续期。
+{$GOUHUO_HOST} {
+    reverse_proxy {$GOUHUO_WEB_LISTEN:127.0.0.1:20801}
+}

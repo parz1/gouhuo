@@ -49,3 +49,6 @@ embed-resource = "3"
 # 只给 examples/make_icon.rs 用：从 SVG 生成 exe 图标。跟 Slint 自己用的是同一个版本，
 # 不多编一份。
 resvg = "0.48"
+# src/join.rs 的测试对着真服务端跑「输地址 → 核对指纹 → 加入」这几条路。
+server = { path = "../server" }
+transport.workspace = true

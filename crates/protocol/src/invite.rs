@@ -53,6 +53,9 @@ const HEADER_LEN: usize = 1 + 1 + Fingerprint::LEN + 2 + 1;
 /// 链接形式的前缀。纯文本形式（不带前缀的那串 base32）也一样能解析。
 pub const URL_PREFIX: &str = "gouhuo://j/";
 
+/// 服务端默认监听的端口。用户只输了地址没写端口时，客户端连的就是它。
+pub const DEFAULT_PORT: u16 = 20800;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
     /// 域名或 IP 字面量。原样保存，不做规范化 —— 规范化是连接时的事。

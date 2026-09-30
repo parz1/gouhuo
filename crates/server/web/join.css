@@ -1,0 +1,304 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+:root {
+  color-scheme:dark;
+  font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  background:#16171b;
+  color:#e6e8ec;
+  font-synthesis:none
+}
+* {
+  box-sizing:border-box
+}
+body {
+  margin:0
+}
+a {
+  color:inherit;
+  text-decoration:none
+}
+button,input {
+  font:inherit
+}
+[hidden] {
+  display:none!important
+}
+.page {
+  max-width:1040px;
+  margin:auto;
+  padding:0 40px
+}
+header {
+  height:88px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  border-bottom:1px solid #2e323a
+}
+.brand {
+  display:flex;
+  align-items:center;
+  gap:12px;
+  font-size:24px;
+  font-weight:700
+}
+.quiet {
+  color:#a1a7b1;
+  font-size:14px
+}
+.quiet:hover {
+  color:#e6e8ec
+}
+main {
+  padding-top:54px
+}
+.hero {
+  position:relative;
+  min-height:350px;
+  padding-bottom:38px;
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 40%;
+  align-items:center;
+  gap:20px
+}
+.hero-copy {
+  position:relative;
+  z-index:1
+}
+.eyebrow {
+  font-size:13px;
+  color:#a1a7b1;
+  margin:0 0 14px
+}
+h1 {
+  font-size:38px;
+  line-height:1.35;
+  margin:0 0 26px;
+  letter-spacing:.02em
+}
+.server {
+  display:flex;
+  align-items:baseline;
+  gap:14px;
+  font-size:18px
+}
+.server span {
+  color:#a1a7b1
+}
+.server strong {
+  font-size:22px;
+  overflow-wrap:anywhere
+}
+.address {
+  font-size:16px;
+  color:#a1a7b1;
+  margin:10px 0 24px;
+  overflow-wrap:anywhere
+}
+.campfire {
+  width:100%;
+  height:auto
+}
+.button {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:22px;
+  min-height:44px;
+  border-radius:8px;
+  padding:11px 22px;
+  font-size:14px;
+  font-weight:600;
+  border:1px solid transparent;
+  cursor:pointer
+}
+.primary {
+  background:#5b8def;
+  color:#fff;
+  min-width:228px;
+  min-height:48px;
+  font-size:16px
+}
+.primary:hover {
+  background:#6f9bf2
+}
+.secondary {
+  border-color:#343943;
+  background:#23262d;
+  white-space:nowrap
+}
+.secondary:hover {
+  background:#2a2e36
+}
+.button[aria-disabled=true],button:disabled {
+  opacity:.45;
+  cursor:not-allowed
+}
+.status {
+  font-size:13px;
+  color:#a1a7b1;
+  line-height:1.7;
+  min-height:23px;
+  margin:12px 0 0
+}
+.status.error {
+  color:#f58b82
+}
+.code-field {
+  max-width:360px;
+  margin-bottom:20px
+}
+label {
+  display:block;
+  font-size:14px;
+  margin-bottom:8px
+}
+input {
+  width:100%;
+  min-height:42px;
+  padding:10px 12px;
+  border:1px solid #343943;
+  border-radius:8px;
+  background:#1b1d22;
+  color:#e6e8ec;
+  font-size:14px
+}
+input::placeholder {
+  color:#969da8
+}
+.hint {
+  font-size:12px;
+  color:#a1a7b1;
+  line-height:1.6;
+  margin:8px 0 0
+}
+.support {
+  border-top:1px solid #2e323a;
+  padding:26px 0 22px
+}
+h2 {
+  font-size:17px;
+  font-weight:600;
+  color:#a1a7b1;
+  margin:0 0 8px
+}
+.support-row {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:24px;
+  padding:19px 0
+}
+.support-row+.support-row {
+  border-top:1px solid #2e323a
+}
+h3 {
+  font-size:15px;
+  margin:0 0 7px;
+  font-weight:600
+}
+.support-row p {
+  font-size:13px;
+  margin:0;
+  color:#a1a7b1;
+  line-height:1.65
+}
+.manual {
+  margin-top:12px
+}
+.manual input {
+  font-family:ui-monospace,monospace
+}
+.notice {
+  color:#d9a441;
+  font-size:14px;
+  line-height:1.7
+}
+footer {
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  flex-wrap:wrap;
+  padding:22px 0 30px;
+  border-top:1px solid #2e323a;
+  color:#a1a7b1;
+  font-size:12px
+}
+a:focus-visible,button:focus-visible,input:focus-visible {
+  outline:2px solid #8cb0ff;
+  outline-offset:4px
+}
+/* 像素篝火是 fire.mjs 在小画布上画的，这里只负责不插值地放大。
+   切到后台、系统关了动画时停在一帧上，也是 fire.mjs 管的。 */
+.campfire {
+  display:block;
+  aspect-ratio:1;
+  image-rendering:pixelated
+}
+@media(max-width:640px) {
+  .page {
+    padding:0 24px
+  }
+  header {
+    height:72px
+  }
+  .brand {
+    font-size:21px
+  }
+  main {
+    padding-top:32px
+  }
+  .hero {
+    grid-template-columns:1fr;
+    min-height:0;
+    gap:0;
+    padding-bottom:24px
+  }
+  .campfire {
+    position:absolute;
+    right:0;
+    top:10px;
+    width:135px;
+    opacity:.5;
+    z-index:0
+  }
+  .hero-copy {
+    padding-top:0
+  }
+  h1 {
+    font-size:30px;
+    max-width:230px;
+    margin-bottom:28px
+  }
+  .eyebrow {
+    font-size:12px;
+    max-width:200px
+  }
+  .server {
+    font-size:15px;
+    gap:10px
+  }
+  .server strong {
+    font-size:19px
+  }
+  .address {
+    font-size:14px
+  }
+  .primary {
+    width:100%
+  }
+  .code-field {
+    max-width:none
+  }
+  .support-row {
+    align-items:flex-start;
+    flex-direction:column;
+    gap:14px
+  }
+  .support-row .button {
+    width:100%
+  }
+  footer {
+    font-size:11px;
+    gap:10px
+  }
+}

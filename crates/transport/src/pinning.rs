@@ -69,8 +69,8 @@ impl ServerCertVerifier for PinnedServerCert {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(TlsError::General(format!(
-                "服务器证书指纹对不上。邀请链接里写的是 {}，实际拿到的是 {}。\
-                 要么邀请链接过期了（服务器换过证书），要么有人在中间。",
+                "服务器证书指纹对不上。记下的是 {}，实际拿到的是 {}。\
+                 要么服务器换过证书（邀请链接也就过期了），要么有人在中间。",
                 self.expected, actual
             )))
         }
@@ -92,6 +92,80 @@ impl ServerCertVerifier for PinnedServerCert {
     }
 
     /// 同上。
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// 什么证书都收的校验器。**只用来看一眼对面的指纹，不能拿这条连接干别的。**
+///
+/// # 什么时候会用到
+///
+/// 用户只输了一个 IP（或者一个没有加入页的域名）：没有邀请链接，也就没有
+/// 可以比对的指纹。这时只能像 SSH 第一次连一台机器那样 —— 先把对面的指纹取回来
+/// 给用户看，用户说「对」，再用 [`PinnedServerCert`] 固定住它正式连接。
+///
+/// # 它保证什么、不保证什么
+///
+/// 签名照样真验，所以握手成功说明对面**确实持有这张证书的私钥**。但「这张证书是
+/// 不是用户想连的那台服务器」它一概不知道 —— 中间人完全可以递上自己的证书。
+/// 这个问题只能由用户核对指纹来回答，所以用它建起来的连接上**不许发任何东西**：
+/// 身份、昵称、加入码都要等指纹固定之后的那条连接。见 `client-core` 的 `probe`。
+#[derive(Debug)]
+pub struct UnpinnedServerCert {
+    provider: Arc<CryptoProvider>,
+}
+
+impl UnpinnedServerCert {
+    pub fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+impl ServerCertVerifier for UnpinnedServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    /// **必须真验**，理由同 [`PinnedServerCert`]：不验的话，拿到的指纹可能属于
+    /// 一张对面根本没有私钥的证书。
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
     fn verify_tls13_signature(
         &self,
         message: &[u8],

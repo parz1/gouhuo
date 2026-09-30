@@ -78,8 +78,9 @@ impl ConnectError {
                 format!(
                     "{detail}\n\
                      最常见的原因是服务器重装过、或者数据目录丢了 —— \
-                     那样它会生成新证书，所有老邀请链接都失效，得让管理员重发一条。\
-                     如果管理员说没换过，就别连了。"
+                     那样它会生成新证书，老邀请链接和以前记下的指纹都失效。\
+                     先问管理员是不是换过：换过就重新验证，或者让他重发一条邀请链接；\
+                     他说没换过，就别连了。"
                 )
             }
             ConnectError::Tls(detail) => {
@@ -87,7 +88,7 @@ impl ConnectError {
             }
             ConnectError::Rejected { reason, detail } => match reason {
                 Reason::InviteRequired => {
-                    "找管理员要一条带邀请码的链接。直接给 IP 和端口是进不来的。".into()
+                    "找管理员要加入码，或者一条带邀请码的链接。光有地址是进不来的。".into()
                 }
                 Reason::Full => "等会儿再试。人数上限是服务器自己设的。".into(),
                 Reason::VersionMismatch => {
