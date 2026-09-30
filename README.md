@@ -10,8 +10,9 @@
 几个边界清楚的 crate —— 语音内核独立于界面、协议单独一份、服务端零配置 ——
 看看能不能把接入语音的心智负担降下来。
 
-> **当前版本：0.2.0。** Windows 安装包和 Linux Docker
-> 部署已经可用。0.2.0 使用不兼容的语音加密协议，客户端和服务端需要一起升级。
+> **当前版本：0.2.1。** Windows 安装包和 Linux Docker
+> 部署已经可用。0.2.1 跟 0.2.0 协议兼容，可以分开升级（[这一版有什么](docs/release-0.2.1.md)）；
+> 从 0.1.x 升上来仍要客户端和服务端一起换。
 > 91.9 ms 是协议、设备和 APM 的分项实测合计，完整双机嘴到耳延迟尚未测量。
 > 下一步是小规模开黑验证，见 [0.2.0 升级与验收](docs/release-0.2.0.md)。
 
@@ -205,6 +206,24 @@ HTTPS。Caddy 的证书保存在独立数据卷里。启动日志会给出浏览
 HTTP 请求转发到 `http://127.0.0.1:20801`。代理若在另一容器网络中，需要调整监听和
 容器网络，使它能访问加入页。加入页的 HTTP 端口不应直接暴露在公网。
 HTTPS 的网页证书与语音协议的自签名证书独立管理，不改变现有语音邀请或端口。
+
+nginx 的站点配置大致是这样（证书自己准备，比如 certbot）。它只反代加入页；
+语音的 20800（TCP/UDP）照旧直连，不经过代理：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name voice.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/voice.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/voice.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:20801;
+        proxy_set_header Host $host;
+    }
+}
+```
 
 **不用就不占东西**：加入页默认是关的。只有设了 `GOUHUO_WEB_LISTEN`（上面的
 `compose.https.yaml` 会替你设）才会起，没设的话服务端不多开一个线程、一个端口。
