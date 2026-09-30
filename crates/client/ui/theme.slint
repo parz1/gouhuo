@@ -77,6 +77,8 @@ export component Field inherits Rectangle {
     in-out property <string> text;
     in property <bool> password: false;
     callback accepted();
+    /// 用户每改一下就叫一次，参数是改完之后的内容。
+    callback edited(string);
 
     height: 38px;
     border-radius: Theme.radius;
@@ -108,7 +110,9 @@ export component Field inherits Rectangle {
         font-size: 14px;
         vertical-alignment: center;
         single-line: true;
+        input-type: root.password ? InputType.password : InputType.text;
         accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
     }
 
     forward-focus: input;

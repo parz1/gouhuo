@@ -3,7 +3,8 @@
 import { Theme, Btn, Field, Dot, LevelBar } from "theme.slint";
 import { ScrollView, Slider, ComboBox } from "std-widgets.slint";
 import { Campfire, Seat } from "campfire.slint";
-export { Seat }
+import { Home, ServerRow } from "home.slint";
+export { Seat, ServerRow }
 
 // 频道树和成员名单压成的一行。
 //
@@ -180,10 +181,32 @@ export component App inherits Window {
     // ---- 状态 ----
     in-out property <bool> connected: false;
     in-out property <bool> connecting: false;
-    in-out property <string> invite-link;
     in-out property <string> nick;
     in property <string> error-headline;
     in property <string> error-advice;
+
+    // ---- 首页（没在任何服务器里时）。每个属性是什么意思见 home.slint ----
+    in property <string> connect-stage;
+    in-out property <int> home-mode: 0;
+    in property <bool> has-hero: false;
+    in property <bool> has-servers: false;
+    in property <int> hero-id: -1;
+    in property <string> hero-name;
+    in property <string> hero-address;
+    in property <string> hero-used;
+    in property <[ServerRow]> other-servers;
+    in-out property <string> address-input;
+    in property <string> address-hint;
+    in property <bool> address-bad: false;
+    in-out property <string> join-code;
+    in property <bool> code-rejected: false;
+    in property <string> trust-fingerprint;
+    in property <bool> error-can-reverify: false;
+    /// 首页上那堆火的像素图，Rust 那边按画面大小画好。
+    in property <image> home-fire;
+    callback home-fire-resized(length, length);
+    /// 首页现在是不是摆在眼前。跟 campfire-shown 一样，Rust 看它决定火要不要动。
+    out property <bool> home-shown: !root.connected && !root.show-settings;
 
     in property <string> server-name: "篝火";
     in property <string> my-fingerprint;
@@ -287,7 +310,24 @@ export component App inherits Window {
     // ---- 回调 ----
     callback retry-voice();
     callback show-diagnostics();
-    callback join();
+    /// 按一条邀请链接加入（点链接启动、别的实例转交过来的）。
+    callback join-link(string);
+    /// 加入存下来的第 n 个服务器。
+    callback join-saved(int);
+    /// 按 address-input 里输的东西加入。
+    callback join-address();
+    /// 地址框里的字变了：认一下是什么，更新下面那行提示。
+    callback address-edited(string);
+    /// 用户填好了加入码。
+    callback submit-code();
+    /// 用户核对过指纹了。
+    callback trust-server();
+    /// 不加入了（连到一半、问加入码、核对指纹时都能取消）。
+    callback cancel-join();
+    callback retry-join();
+    /// 证书对不上：重新取一次这台服务器的指纹。
+    callback reverify-server();
+    callback forget-server(int);
     callback leave();
     callback join-channel(int);
     /// 建频道。参数是频道名，界面这边已经 trim 过并挡掉了空串。
@@ -345,97 +385,51 @@ export component App inherits Window {
     callback close-choice(bool, bool);
 
     // =======================================================================
-    // 没连上：一个框，一个按钮
+    // 没连上：首页。回到上次的服务器，或者加入一个新的（见 home.slint）
     // =======================================================================
     if !root.connected && !root.show-settings: VerticalLayout {
-        alignment: center;
-        padding: 48px;
-
-        VerticalLayout {
-            spacing: 18px;
-            max-width: 460px;
-            alignment: center;
-
-            Text {
-                text: "篝火";
-                color: Theme.text;
-                font-size: 30px;
-                font-weight: 600;
-                horizontal-alignment: center;
-            }
-            Text {
-                text: "把朋友发给你的那条链接粘进来";
-                color: Theme.dim;
-                font-size: 14px;
-                horizontal-alignment: center;
-            }
-
-            VerticalLayout {
-                spacing: 10px;
-                link := Field {
-                    placeholder: "gouhuo://j/…";
-                    text <=> root.invite-link;
-                    accepted => { root.join(); }
-                }
-                Field {
-                    placeholder: "你的昵称";
-                    text <=> root.nick;
-                    accepted => { root.join(); }
-                }
-                Btn {
-                    label: root.connecting ? "正在连接…" : "加入";
-                    primary: true;
-                    enabled: !root.connecting && root.invite-link != "";
-                    clicked => { root.join(); }
-                }
-            }
-
-            // 报错要占住位置一起显示，别用弹窗 —— 弹窗一关，用户就想不起来
-            // 刚才说了什么，而这几行恰恰是要照着做的。
-            if root.error-headline != "": Rectangle {
-                background: #2a1d1d;
-                border-radius: Theme.radius;
-                border-width: 1px;
-                border-color: #4a2b28;
-
-                VerticalLayout {
-                    padding: 14px;
-                    spacing: 6px;
-                    Text {
-                        text: root.error-headline;
-                        color: Theme.danger;
-                        font-size: 14px;
-                        font-weight: 600;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: root.error-advice;
-                        color: Theme.dim;
-                        font-size: 13px;
-                        wrap: word-wrap;
-                    }
-                }
-            }
-
-            if root.update-version != "": UpdateBar {
-                version: root.update-version;
-                open => { root.open-update(); }
-                dismiss => { root.update-version = ""; }
-            }
-
-            // 连不上的时候最想确认的就是「是不是我麦克风的问题」，
-            // 所以这个入口必须在登录页上就有。
-            Btn {
-                label: "先试试麦克风";
-                clicked => { root.toggle-settings(); }
-            }
-
-            if root.my-fingerprint != "": Text {
-                text: "你的身份指纹 " + root.my-fingerprint;
-                color: Theme.faint;
-                font-size: 11px;
-                horizontal-alignment: center;
-            }
+        if root.update-version != "": UpdateBar {
+            version: root.update-version;
+            open => { root.open-update(); }
+            dismiss => { root.update-version = ""; }
+        }
+        Home {
+            vertical-stretch: 1;
+            window-width: root.width;
+            window-height: root.height;
+            connecting: root.connecting;
+            stage: root.connect-stage;
+            mode <=> root.home-mode;
+            has-hero: root.has-hero;
+            has-servers: root.has-servers;
+            hero-id: root.hero-id;
+            hero-name: root.hero-name;
+            hero-address: root.hero-address;
+            hero-used: root.hero-used;
+            others: root.other-servers;
+            address <=> root.address-input;
+            address-hint: root.address-hint;
+            address-bad: root.address-bad;
+            code <=> root.join-code;
+            code-rejected: root.code-rejected;
+            fingerprint: root.trust-fingerprint;
+            error-headline: root.error-headline;
+            error-advice: root.error-advice;
+            can-reverify: root.error-can-reverify;
+            nick <=> root.nick;
+            my-fingerprint: root.my-fingerprint;
+            fire: root.home-fire;
+            fire-resized(w, h) => { root.home-fire-resized(w, h); }
+            join-saved(id) => { root.join-saved(id); }
+            join-address => { root.join-address(); }
+            address-edited(text) => { root.address-edited(text); }
+            submit-code => { root.submit-code(); }
+            trust => { root.trust-server(); }
+            cancel => { root.cancel-join(); }
+            retry => { root.retry-join(); }
+            reverify => { root.reverify-server(); }
+            forget(id) => { root.forget-server(id); }
+            open-settings => { root.toggle-settings(); }
         }
     }
 
