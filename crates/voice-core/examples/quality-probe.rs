@@ -32,13 +32,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A new directory prevents accidental overwrites of reference recordings.
     fs::create_dir(dir)?;
     write_wav(&dir.join("raw.wav"), &input)?;
-    let mut csv = String::from("apm,bitrate,loss_percent,codec_kbps,ipv4_kbps,bands,lookahead_samples,codec_segmental_snr_db,apm_rms_dbfs,apm_peak,apm_clipped_samples,received_rms_dbfs,received_peak,received_clipped_samples,dropped_packets,plc_frames,stalls,accelerations\n");
+    let mut csv = String::from("apm,bitrate,loss_percent,codec_kbps,ipv4_kbps,bands,lookahead_samples,codec_segmental_snr_db,apm_rms_dbfs,apm_peak,apm_clipped_samples,received_rms_dbfs,received_peak,received_clipped_samples,dropped_packets,plc_frames,stalls,accelerations,codec_mean_cpu_percent\n");
     for (name, cfg) in [
         ("off", ApmConfig::none()),
         ("aec", ApmConfig::only(ApmModule::EchoCancel)),
         ("full", ApmConfig::default()),
     ] {
-        for bitrate in [24_000, 32_000, 48_000] {
+        for bitrate in [24_000, 32_000, 48_000, 64_000] {
             csv.push_str(&run(&input, dir, name, cfg, bitrate, loss)?);
         }
     }
@@ -107,6 +107,7 @@ fn run(
     let mut payload_bytes = 0usize;
     let mut dropped = 0usize;
     let mut loss_credit = 0u32;
+    let mut codec_time = std::time::Duration::ZERO;
     let mut silence = vec![0.0; FRAME_SAMPLES];
     let mut frame = vec![0.0; FRAME_SAMPLES];
     let mut out = vec![0.0; FRAME_SAMPLES];
@@ -124,14 +125,21 @@ fn run(
             apm.analyze_render(&mut silence)?;
             apm.process_capture(&mut frame)?;
             processed.extend_from_slice(&frame);
-            let packet = encoder.encode(&frame)?.to_vec();
+            let started = std::time::Instant::now();
+            let encoded = encoder.encode(&frame)?;
+            let encode_time = started.elapsed();
+            let packet = encoded.to_vec();
             if i < speech_frames {
                 payload_bytes += packet.len();
                 *bands
                     .entry(format!("{:?}", opus::packet::get_bandwidth(&packet)?))
                     .or_default() += 1;
             }
+            let started = std::time::Instant::now();
             decoder.decode(&packet, &mut out)?;
+            if (20..speech_frames).contains(&i) {
+                codec_time += encode_time + started.elapsed();
+            }
             decoded.extend_from_slice(&out);
             loss_credit += loss;
             if loss_credit >= 100 {
@@ -167,7 +175,13 @@ fn run(
         .map(|(b, n)| format!("{b}:{n}"))
         .collect::<Vec<_>>()
         .join(";");
-    Ok(format!("{name},{bitrate},{loss},{codec_kbps:.3},{:.3},{bands},{lookahead},{snr:.3},{apm_rms:.3},{apm_peak:.6},{apm_clips},{recv_rms:.3},{recv_peak:.6},{recv_clips},{dropped},{},{},{}\n",
+    // 一路编码 + 一路直接解码，跳过前 200 ms，不包含 APM/网络/播放；短输入不报告。
+    let cpu = if speech_frames > 20 {
+        codec_time.as_secs_f64() / ((speech_frames - 20) as f64 * 0.01) * 100.0
+    } else {
+        f64::NAN
+    };
+    Ok(format!("{name},{bitrate},{loss},{codec_kbps:.3},{:.3},{bands},{lookahead},{snr:.3},{apm_rms:.3},{apm_peak:.6},{apm_clips},{recv_rms:.3},{recv_peak:.6},{recv_clips},{dropped},{},{},{},{cpu:.3}\n",
         codec_kbps + 45.6, playback.stats.concealed, playback.jitter().stats.stalls, playback.stats.accelerations))
 }
 

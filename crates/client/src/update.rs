@@ -191,6 +191,8 @@ mod tests {
 
     #[test]
     fn compares_versions() {
+        assert!(is_newer("v0.2.2", "0.2.1"));
+        assert!(!is_newer("v0.2.2", "0.2.2"));
         assert!(is_newer("v0.2.0", "0.1.9"));
         assert!(is_newer("v0.1.10", "0.1.9"), "按数字比，不按字符串比");
         assert!(is_newer("1.0.0", "0.99.99"));
@@ -210,6 +212,13 @@ mod tests {
         assert!(triple(&tag).is_some(), "{tag}");
         // 不存在的仓库：GitHub 回 404，不是跳转
         assert_eq!(latest_tag("parz1/definitely-not-a-repo-7f3a"), None);
+    }
+
+    #[test]
+    #[ignore = "需要联网访问实际发布仓库"]
+    fn asks_our_release_repository() {
+        let tag = latest_tag(REPO).expect("实际发布仓库应返回正式版本标签");
+        assert!(triple(&tag).is_some(), "{tag}");
     }
 
     #[test]

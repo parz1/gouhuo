@@ -579,6 +579,43 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle
     std::thread::Builder::new().name(name.into()).spawn(f)
 }
 
+/// 音节内的短暂停顿和低电平尾音不能按 10 ms 逐帧切掉。
+/// 只延后 VAD 的关闭；闭麦、松开 PTT 和切换模式仍立即生效。
+#[derive(Default)]
+struct TransmitGate {
+    remaining: u32,
+}
+
+impl TransmitGate {
+    fn update(&mut self, mode: TransmitMode, level: f32, pressed: bool, muted: bool) -> bool {
+        if muted {
+            self.remaining = 0;
+            return false;
+        }
+        match mode {
+            TransmitMode::VoiceActivity { threshold_db } => {
+                if pressed || level > threshold_db {
+                    self.remaining = 200 / FRAME_MS;
+                    true
+                } else if self.remaining > 0 {
+                    self.remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            TransmitMode::PushToTalk => {
+                self.remaining = 0;
+                pressed
+            }
+            TransmitMode::Always => {
+                self.remaining = 0;
+                true
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     capture: &mut dyn Capture,
@@ -608,6 +645,7 @@ fn send_loop(
     // 采样时钟：**每采一帧都加**，不管发没发。这样对面能从时间戳上看出
     // 中间静默了多久，而不是以为包丢了。
     let mut was_sending = false;
+    let mut gate = TransmitGate::default();
 
     while !stop.load(Ordering::Relaxed) {
         match capture.read(&mut frame) {
@@ -644,14 +682,12 @@ fn send_loop(
 
         // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
         // 这时候还漏出去一声是很糟糕的那种 bug。
-        let sending = !muted.load(Ordering::Relaxed)
-            && match TransmitMode::decode(mode.load(Ordering::Relaxed)) {
-                TransmitMode::PushToTalk => transmitting.load(Ordering::Relaxed),
-                TransmitMode::VoiceActivity { threshold_db } => {
-                    level > threshold_db || transmitting.load(Ordering::Relaxed)
-                }
-                TransmitMode::Always => true,
-            };
+        let sending = gate.update(
+            TransmitMode::decode(mode.load(Ordering::Relaxed)),
+            level,
+            transmitting.load(Ordering::Relaxed),
+            muted.load(Ordering::Relaxed),
+        );
 
         if !sending {
             if was_sending {
@@ -942,6 +978,26 @@ pub fn intrinsic_latency_ms(jitter_frames: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vad_preserves_quiet_tails_but_mute_and_ptt_release_are_immediate() {
+        let vad = TransmitMode::VoiceActivity {
+            threshold_db: -45.0,
+        };
+        let mut gate = TransmitGate::default();
+        assert!(!gate.update(vad, -60.0, false, false));
+        assert!(gate.update(vad, -25.0, false, false));
+        for _ in 0..200 / FRAME_MS {
+            assert!(gate.update(vad, -60.0, false, false));
+        }
+        assert!(!gate.update(vad, -60.0, false, false));
+        assert!(gate.update(vad, -25.0, false, false));
+        assert!(!gate.update(vad, -25.0, true, true));
+        assert!(!gate.update(vad, -60.0, false, false));
+        assert!(gate.update(vad, -25.0, false, false));
+        assert!(!gate.update(TransmitMode::PushToTalk, -25.0, false, false));
+        assert!(!gate.update(vad, -60.0, false, false));
+    }
 
     #[test]
     fn silence_is_far_below_the_voice_threshold() {

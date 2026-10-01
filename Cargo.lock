@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "client-core",
  "embed-resource",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "client-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "protocol",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "device-probe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "voice-core",
 ]
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "latency-probe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "opus",
  "protocol",
@@ -4132,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "prost",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "getrandom 0.3.4",
  "polling",
@@ -5508,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "protocol",
  "rcgen",
@@ -5724,7 +5724,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
