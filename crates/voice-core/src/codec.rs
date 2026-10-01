@@ -27,14 +27,15 @@ pub const MAX_PACKET: usize = 400;
 
 /// 默认码率。
 ///
-/// 32 kbps 是待真人盲听验收的默认候选。10 ms 帧、IPv4 时固定开销
-/// 为 45.6 kbps，总计约 77.6 kbps；实际 VBR/FEC 开销由 quality-probe 报告。
-pub const DEFAULT_BITRATE: i32 = 32_000;
+/// 64 kbps 用于清晰、自然的人声。48 kHz 采样本身并不能保证编码后的频带；
+/// 旧 32 kbps 配置在 quality-probe 中只选到 12 kHz 的 superwideband。
+/// 10 ms 帧、IPv4 的固定开销为 45.6 kbps，总计约 109.6 kbps；实际值另测。
+pub const DEFAULT_BITRATE: i32 = 64_000;
 
 /// 编码复杂度。
 ///
-/// M1 量过：complexity 5 时编解码 CPU 合计 2.18%。再往上收益很小，
-/// 而 CPU 是红线里最硬的一条 —— 它直接影响游戏帧时间。
+/// 保留 5：64 kbps 下提高到 8 的合成信号测量已超过单核 CPU 预算。
+/// 旧 32 kbps 的性能数字不能沿用，高清配置需单独验收。
 pub const DEFAULT_COMPLEXITY: i32 = 5;
 
 pub struct VoiceEncoder {
@@ -49,10 +50,12 @@ impl VoiceEncoder {
 
     /// 测量工具/高音质调用方可选择码率，其余配置与线上保持一致。
     pub fn with_bitrate(bitrate: i32) -> Result<Self, opus::Error> {
-        let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)?;
+        // APM 已负责降噪/增益。编码层优先保留原声，避免 VoIP 模式再次做
+        // 语音可懂度处理；Auto 让编码器按实际信号选择 SILK/Hybrid/CELT。
+        let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Audio)?;
         encoder.set_bitrate(Bitrate::Bits(bitrate))?;
         encoder.set_complexity(DEFAULT_COMPLEXITY)?;
-        encoder.set_signal(Signal::Voice)?;
+        encoder.set_signal(Signal::Auto)?;
         encoder.set_inband_fec(true)?;
         // 先给个典型值，接收端有反馈之后再喂真的。0 等于关掉 FEC。
         encoder.set_packet_loss_perc(10)?;
@@ -139,6 +142,62 @@ pub fn encoder_lookahead(encoder: &mut VoiceEncoder) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 检查实际包和解码信号：48 kHz 的输入不能悄悄变成电话频带。
+    #[test]
+    fn default_preserves_high_frequency_audio() {
+        let (fullband_frames, high_band) = high_frequency_level(VoiceEncoder::new().unwrap());
+        let mut old = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        old.set_bitrate(Bitrate::Bits(32_000)).unwrap();
+        old.set_complexity(5).unwrap();
+        old.set_signal(Signal::Voice).unwrap();
+        old.set_inband_fec(true).unwrap();
+        old.set_packet_loss_perc(10).unwrap();
+        old.set_dtx(true).unwrap();
+        let (_, old_high_band) = high_frequency_level(VoiceEncoder {
+            encoder: old,
+            packet: vec![0; MAX_PACKET],
+        });
+        assert!(fullband_frames >= 90, "fullband frames: {fullband_frames}");
+        // 至少保留输入高频幅度的 20%，并明显优于旧线上配置。
+        // 这是频带回归判据，不能当作真人音质评分。
+        assert!(
+            high_band > 0.02 && high_band > old_high_band * 1.5,
+            "12 kHz amplitude: new={high_band}, old={old_high_band}"
+        );
+    }
+
+    fn high_frequency_level(mut enc: VoiceEncoder) -> (usize, f32) {
+        let mut dec = VoiceDecoder::new().unwrap();
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        let mut high_band_energy = 0.0;
+        let mut fullband_frames = 0;
+        for k in 0..100 {
+            let frame: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|i| {
+                    let t = (k * FRAME_SAMPLES + i) as f32 / SAMPLE_RATE as f32;
+                    0.15 * (std::f32::consts::TAU * 440.0 * t).sin()
+                        + 0.1 * (std::f32::consts::TAU * 12_000.0 * t).sin()
+                })
+                .collect();
+            let packet = enc.encode(&frame).unwrap();
+            if opus::packet::get_bandwidth(packet).unwrap() == opus::Bandwidth::Fullband {
+                fullband_frames += 1;
+            }
+            dec.decode(packet, &mut out).unwrap();
+            if k >= 20 {
+                // 12 kHz 的正交投影，避开编码器启动阶段；不要求相位一致。
+                let (mut re, mut im) = (0.0, 0.0);
+                for (i, sample) in out.iter().enumerate() {
+                    let phase = std::f32::consts::TAU * 12_000.0 * i as f32 / SAMPLE_RATE as f32;
+                    re += sample * phase.cos();
+                    im += sample * phase.sin();
+                }
+                high_band_energy += (re * re + im * im).sqrt() * 2.0 / FRAME_SAMPLES as f32;
+            }
+        }
+        (fullband_frames, high_band_energy / 80.0)
+    }
 
     fn tone(samples: usize) -> Vec<f32> {
         (0..samples)

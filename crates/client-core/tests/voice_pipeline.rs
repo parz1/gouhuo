@@ -414,7 +414,7 @@ fn voice_activity_follows_the_signal() {
     std::thread::sleep(Duration::from_millis(550));
     let during_speech = voice.stats().packets_sent;
 
-    // 又静下来
+    // 又静下来：允许 200 ms 的尾音保护，然后必须停发。
     std::thread::sleep(Duration::from_millis(600));
     let after = voice.stats().packets_sent;
 
@@ -427,9 +427,11 @@ fn voice_activity_follows_the_signal() {
         "有声音时该开始发包：{during_silence} -> {during_speech}"
     );
     assert!(
-        after < during_speech + 15,
+        after <= during_speech + 25,
         "静下来之后该停：{during_speech} -> {after}"
     );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(voice.stats().packets_sent, after, "尾音保护结束后仍在发包");
 }
 
 /// 丢掉 Pipeline 就该把线程收干净，而且**不能挂住**。
