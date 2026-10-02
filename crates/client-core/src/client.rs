@@ -176,6 +176,7 @@ pub struct VoiceKeys {
 
 /// 一次成功的连接。重连就是换掉这一整个。
 struct Link {
+    shutdown_sock: TcpStream,
     wire: Arc<Mutex<Wire>>,
     session_id: u32,
     udp_port: u16,
@@ -187,14 +188,15 @@ impl Link {
         // 发不出去不用在这里处理：读线程马上就会发现连接断了，
         // 由它统一走善后流程。两个地方都报错只会让界面弹两次。
         if let Ok(mut wire) = self.wire.lock() {
-            let _ = wire.send(message);
+            if wire.send(message).is_err() {
+                self.shutdown();
+            }
         }
     }
 
     fn shutdown(&self) {
-        if let Ok(wire) = self.wire.lock() {
-            let _ = wire.sock.shutdown(std::net::Shutdown::Both);
-        }
+        // Never wait for a stalled TLS writer before interrupting the socket.
+        let _ = self.shutdown_sock.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -218,6 +220,7 @@ struct Shared {
 
     /// 上一次收到服务端任何东西的时刻，相对 `epoch` 的毫秒数。
     last_heard_ms: AtomicU64,
+    server_udp_received: AtomicU64,
     epoch: Instant,
 }
 
@@ -305,6 +308,7 @@ impl Client {
             wake: Condvar::new(),
             wake_lock: Mutex::new(()),
             last_heard_ms: AtomicU64::new(0),
+            server_udp_received: AtomicU64::new(0),
             epoch: Instant::now(),
         });
 
@@ -500,8 +504,19 @@ impl Client {
         );
     }
 
-    /// 主动断开，或者取消正在进行的重连。之后会收到一次
-    /// `Event::Disconnected(Ended::ByUser)`，不会再重连。
+    /// Last server-reported UDP count, including keepalives; not a delivery acknowledgement.
+    pub fn server_udp_received(&self) -> u64 {
+        self.shared.server_udp_received.load(Ordering::Relaxed)
+    }
+
+    /// Rebuild a failing voice session using the existing reconnect policy and credentials.
+    pub fn reconnect_transport(&self) {
+        if !self.shared.closing() {
+            self.shared.link().shutdown();
+        }
+    }
+
+    /// 主动断开或取消重连，之后不会自动重连。
     pub fn disconnect(&self) {
         self.shared.closing.store(true, Ordering::SeqCst);
         {
@@ -561,6 +576,11 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
         match reader.next::<ServerMessage>() {
             Ok(Some(message)) => {
                 shared.heard();
+                if let Some(server_message::Payload::Pong(pong)) = &message.payload {
+                    shared
+                        .server_udp_received
+                        .store(pong.udp_packets_received, Ordering::Relaxed);
+                }
                 if let Some(server_message::Payload::Goodbye(bye)) = &message.payload {
                     let reason = goodbye::Reason::try_from(bye.reason)
                         .unwrap_or(goodbye::Reason::Unspecified);
@@ -674,6 +694,7 @@ fn install(shared: &Shared, link: Link, welcome: &Welcome, wanted: Option<&(u32,
     // **先重置「上次收到」再换上链接**：顺序反过来的话，心跳线程可能正好在
     // 两步之间醒来，看到一个「已经十几秒没动静」的新连接，把它当死连接掐掉。
     shared.heard();
+    shared.server_udp_received.store(0, Ordering::Relaxed);
     *shared.link.lock().expect("link poisoned") = Arc::clone(&link);
 
     if let Some(channel_id) = target {
@@ -739,6 +760,7 @@ fn establish(
 ) -> Result<(Link, Reader, Welcome), ConnectError> {
     let sock = connect_tcp(&invite.host, invite.port)?;
     sock.set_nodelay(true)?;
+    sock.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     // 握手和认证期间要有读超时：对面接了 TCP 却一声不吭（半死的 NAT、
     // 不是篝火的服务），没有超时的话这里会永远等下去 —— 重连循环也跟着卡死。
     // 超时一旦触发这条连接就作废了，所以下面那条「超时会吃数据」的坑碰不到。
@@ -802,6 +824,7 @@ fn establish(
     reader.clear_read_timeout()?;
 
     let link = Link {
+        shutdown_sock: handshake_sock,
         wire,
         session_id: welcome.session_id,
         udp_port: welcome.udp_port as u16,
@@ -1204,5 +1227,49 @@ mod tests {
         let mut roster = Roster::default();
         roster.channels.insert(1, channel(1, "大厅"));
         assert_eq!(find_channel(&roster, 5, "开黑"), None);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    #[test]
+    fn cancelling_does_not_wait_for_the_tls_write_lock() {
+        use server::conn::Hub;
+        use server::state::{Config, Server};
+        use std::net::{TcpListener, UdpSocket};
+        use transport::{server_config, ServerCert};
+        let cert = ServerCert::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let invite = Invite {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            cert: cert.fingerprint(),
+            code: None,
+        };
+        let tls = Arc::new(server_config(&cert).unwrap());
+        let hub = Arc::new(Hub::new(
+            Server::new(Config::default()),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+        ));
+        std::thread::spawn(move || server::accept_loop(listener, tls, hub));
+        let (client, _) = Client::connect(
+            &invite.to_url().unwrap(),
+            &Identity::generate().unwrap(),
+            "shutdown",
+        )
+        .unwrap();
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            client.disconnect();
+            tx.send(()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(500));
+        drop(guard); // Also releases a broken implementation so the test never leaves a stuck thread.
+        worker.join().unwrap();
+        assert!(result.is_ok(), "disconnect waited for the TLS writer lock");
     }
 }

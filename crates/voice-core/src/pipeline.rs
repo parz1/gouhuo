@@ -181,7 +181,7 @@ pub struct VoiceStats {
     pub sequences_exhausted: bool,
     pub udp_failed: bool,
     pub error: Option<String>,
-    /// UDP 那条路通不通（保活有没有回来）。不通就该退回 TCP 传语音。
+    /// UDP 双向保活是否正常；不通时由客户端执行恢复策略。
     pub udp_ok: bool,
     /// 最近一次保活的往返时间，毫秒。
     pub rtt_ms: f64,
@@ -246,6 +246,7 @@ impl Speaker {
 pub struct Pipeline {
     sequences: Arc<protocol::VoiceSequences>,
     stop: Arc<AtomicBool>,
+    transport_stop: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     deafened: Arc<AtomicBool>,
@@ -326,6 +327,7 @@ impl Pipeline {
         let socket = Arc::new(socket);
 
         let stop = Arc::new(AtomicBool::new(false));
+        let transport_stop = Arc::new(AtomicBool::new(false));
         let transmitting = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
@@ -353,7 +355,7 @@ impl Pipeline {
         // ---- 发送 ----
         {
             let socket = Arc::clone(&socket);
-            let stop = Arc::clone(&stop);
+            let stop = Arc::clone(&transport_stop);
             let transmitting = Arc::clone(&transmitting);
             let muted = Arc::clone(&muted);
             let monitoring = Arc::clone(&monitoring);
@@ -386,7 +388,7 @@ impl Pipeline {
         // ---- 接收 ----
         {
             let socket = Arc::clone(&socket);
-            let stop = Arc::clone(&stop);
+            let stop = Arc::clone(&transport_stop);
             let shared = Arc::clone(&shared);
             let key = cfg.downstream_key;
             let server = cfg.server;
@@ -409,7 +411,7 @@ impl Pipeline {
         // ---- 保活 ----
         {
             let socket = Arc::clone(&socket);
-            let stop = Arc::clone(&stop);
+            let stop = Arc::clone(&transport_stop);
             let session_id = cfg.session_id;
             let key = cfg.upstream_key;
             let server = cfg.server;
@@ -423,6 +425,7 @@ impl Pipeline {
         Ok(Self {
             sequences: cfg.sequences,
             stop,
+            transport_stop,
             transmitting,
             muted,
             deafened,
@@ -437,6 +440,33 @@ impl Pipeline {
     /// 按下/松开说话键。
     pub fn set_transmitting(&self, on: bool) {
         self.transmitting.store(on, Ordering::Relaxed);
+    }
+
+    /// Stop capture and UDP immediately, retaining the AEC-aware playback path for a local notice.
+    pub fn quiesce(&self) {
+        self.muted.store(true, Ordering::Relaxed);
+        self.transport_stop.store(true, Ordering::Relaxed);
+        self.shared
+            .speakers
+            .lock()
+            .expect("speakers poisoned")
+            .clear();
+        self.shared
+            .monitor
+            .lock()
+            .expect("monitor poisoned")
+            .clear();
+        self.wake_receiver();
+    }
+
+    fn wake_receiver(&self) {
+        if let Ok(local) = self.socket.local_addr() {
+            let ip = match local {
+                SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            };
+            let _ = crate::net::send_wake(SocketAddr::new(ip, local.port()));
+        }
     }
 
     /// 闭麦。压过说话键和 VAD。
@@ -553,22 +583,8 @@ impl Pipeline {
 impl Drop for Pipeline {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // 接收线程阻塞在 recv 上，光置个标志叫不醒它。给**自己**发一个包 ——
-        // 这个手法在 M1 就用过（见 net::send_wake），那次是为了绕开
-        // SO_RCVTIMEO 会吃数据的坑。
-        //
-        // 注意要发到 127.0.0.1:我们的端口，不是 socket 绑的 0.0.0.0：
-        // 往 0.0.0.0 发包是没有意义的。
-        if let Ok(local) = self.socket.local_addr() {
-            let loopback = SocketAddr::new(
-                match local {
-                    SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
-                    SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
-                },
-                local.port(),
-            );
-            let _ = crate::net::send_wake(loopback);
-        }
+        self.transport_stop.store(true, Ordering::Relaxed);
+        self.wake_receiver();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -650,13 +666,22 @@ fn send_loop(
     while !stop.load(Ordering::Relaxed) {
         match capture.read(&mut frame) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => {
+                if !stop.load(Ordering::Relaxed) {
+                    *shared.error.lock().expect("voice error poisoned") =
+                        Some("麦克风录音已停止，正在尝试恢复。请检查设备连接。".into());
+                }
+                return;
+            }
             Err(error) => {
                 *shared.error.lock().expect("voice error poisoned") = Some(format!(
                     "麦克风无法继续录音：{error}。请检查设备后点重试语音，或在设置里换一个麦克风。"
                 ));
                 return;
             }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
         let timestamp = sequences.advance_samples(FRAME_SAMPLES as u32);
 

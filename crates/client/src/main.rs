@@ -62,6 +62,7 @@ const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(25
 mod campfire;
 mod discover;
 mod join;
+mod recovery;
 mod settings;
 mod single_instance;
 mod update;
@@ -446,6 +447,9 @@ fn dark_titlebar(_app: &App) {}
 #[derive(Default)]
 struct State {
     client: Option<Client>,
+    recovery: recovery::Recovery,
+    recovery_epoch: Option<std::time::Instant>,
+    recovery_history: std::collections::VecDeque<String>,
     /// 语音链路。丢掉它就会把音频线程收干净。
     voice: Option<Arc<Pipeline>>,
     /// 没连服务器时的独立试麦。
@@ -1017,6 +1021,10 @@ fn on_connected(
         // （地址 + 固定的指纹 + 加入码），下次从首页一点就进。
         let mut locked = state.lock().expect("state poisoned");
         locked.client = Some(client.clone());
+        app.set_voice_notice("".into());
+        locked.recovery = recovery::Recovery::default();
+        locked.recovery_epoch = Some(std::time::Instant::now());
+        locked.recovery_history.clear();
         locked.settings.nick = app.get_nick().to_string();
         locked.settings.remember_server(
             &server.invite,
@@ -1040,6 +1048,7 @@ fn on_connected(
     refresh_home(app, state);
     app.set_connecting(false);
     app.set_connected(true);
+    app.set_reconnecting("".into());
     app.set_self_muted(false);
     app.set_self_deafened(false);
     app.set_voice_error("".into());
@@ -1058,6 +1067,7 @@ fn on_connected(
 fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
     // 先把独立试麦停掉：两个都开的话麦克风会被采两遍。
     stop_mic_check(state);
+    state.lock().expect("state poisoned").voice = None;
 
     let (session_id, udp_port, keys) = client.voice_session();
     let Some(addr) = resolve_voice_addr(client.server_host(), udp_port) else {
@@ -1169,6 +1179,9 @@ fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
 /// 重起会让声音断一下（几十毫秒）。这是换设备本来就该有的代价，
 /// 比为了热切换在音频线程里加一套状态机划算得多。
 fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
+    if !app.get_reconnecting().is_empty() {
+        return;
+    }
     let client = state.lock().expect("state poisoned").client.clone();
     let Some(client) = client else {
         // 没连服务器：重起的是独立试麦。
@@ -1318,14 +1331,28 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
             stats.input_db
         ));
     }
+    if let Some(client) = &locked.client {
+        text.push_str(&format!(
+            "服务端最近报告的 UDP 接收数（含保活）：{}\n",
+            client.server_udp_received()
+        ));
+    }
     text.push_str(&format!(
-        "语音提示：{}
+        "语音提示：{} {}
 连接提示：{} {}
 ",
         app.get_voice_error(),
+        app.get_voice_notice(),
         app.get_error_headline(),
         app.get_error_advice()
     ));
+    if !locked.recovery_history.is_empty() {
+        text.push_str("最近连接恢复记录（本次加入后的秒数）：\n");
+        for entry in &locked.recovery_history {
+            text.push_str(entry);
+            text.push('\n');
+        }
+    }
     text
 }
 
@@ -1595,10 +1622,10 @@ fn spawn_ptt_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>, hotkeys: Rc<
         let Some(voice) = current_voice(&state) else {
             return;
         };
-        if app.get_ptt_mode() {
+        if app.get_ptt_mode() && app.get_reconnecting().is_empty() {
             let down = hotkeys.is_down();
             voice.set_transmitting(down);
-            app.set_transmitting(down);
+            app.set_transmitting(down && app.get_voice_notice().is_empty());
         }
     });
     PTT_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
@@ -1693,7 +1720,69 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 }
             }
         });
-        if hidden {
+        // Health checks keep running in the tray. Only visual metering may be skipped.
+        if client.is_some() && app.get_reconnecting().is_empty() {
+            let stats = voice.as_ref().map(|v| v.stats());
+            let device_error = stats.as_ref().is_some_and(|s| s.error.is_some())
+                || (voice.is_none() && !app.get_voice_error().is_empty());
+            let healthy = stats
+                .as_ref()
+                .is_some_and(|s| s.udp_ok && s.error.is_none() && !s.sequences_exhausted);
+            let failed = device_error || stats.as_ref().is_some_and(|s| s.udp_failed);
+            if let Some(stats) = &stats {
+                app.set_udp_ok(stats.udp_ok);
+                app.set_udp_failed(stats.udp_failed);
+                if let Some(error) = &stats.error {
+                    app.set_voice_error(error.clone().into());
+                }
+            }
+            let action = {
+                let mut locked = state.lock().expect("state poisoned");
+                let now = locked
+                    .recovery_epoch
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed();
+                locked.recovery.tick(now, healthy, failed, device_error)
+            };
+            if let Some(action) = &action {
+                let snapshot = stats
+                    .as_ref()
+                    .map(|s| {
+                        format!(
+                            " UDP={} sent={} received={} error={:?}",
+                            s.udp_ok, s.packets_sent, s.packets_received, s.error
+                        )
+                    })
+                    .unwrap_or_default();
+                record_recovery(&state, &format!("{action:?}{snapshot}"));
+            }
+            match action {
+                Some(recovery::Action::Lost) => {
+                    connection_notice(&state, false);
+                    app.set_voice_notice("语音已中断，正在自动恢复；你的话可能无法送达。".into());
+                    app.set_transmitting(false);
+                }
+                Some(recovery::Action::Recovered) => {
+                    connection_notice(&state, true);
+                    app.set_voice_notice("".into());
+                }
+                Some(recovery::Action::RetryVoice) => {
+                    app.set_voice_notice("正在重试语音，恢复后会播放提示音。".into());
+                    drop(voice); // Release the polling snapshot before replacing audio devices.
+                    restart_voice(&app, &state);
+                    return;
+                }
+                Some(recovery::Action::Reconnect) => {
+                    app.set_voice_notice("语音持续异常，正在重新连接服务器。".into());
+                    if let Some(client) = &client {
+                        client.reconnect_transport();
+                    }
+                    return;
+                }
+                None => {}
+            }
+        }
+        if hidden || !app.get_reconnecting().is_empty() {
             return;
         }
 
@@ -1718,7 +1807,12 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
             app.set_udp_ok(stats.udp_ok);
             app.set_input_level(db_to_level(stats.input_db));
             app.set_monitoring(voice.is_monitoring());
-            app.set_transmitting(transmitting_now(&app, &voice, stats.input_db));
+            app.set_transmitting(
+                app.get_voice_notice().is_empty()
+                    && stats.error.is_none()
+                    && stats.udp_ok
+                    && transmitting_now(&app, &voice, stats.input_db),
+            );
             if let Some(client) = client {
                 update_speaking(&app, &client, &stats.speaking);
             }
@@ -1846,70 +1940,114 @@ fn pump_events(
         while let Ok(event) = events.recv() {
             let client = client.clone();
             let state = Arc::clone(&state);
-            let posted = weak.upgrade_in_event_loop(move |app| match event {
-                Event::Reconnecting {
-                    attempt, reason, ..
-                } => {
-                    // 旧链路的会话和密钥都作废了，发出去的声音服务端只会丢掉。
-                    // 停掉它，别让用户以为自己还在被人听见 —— 麦克风指示灯也跟着灭。
-                    state.lock().expect("state poisoned").voice = None;
-                    app.set_udp_ok(false);
-                    app.set_udp_failed(false);
-                    app.set_transmitting(false);
-                    app.set_input_level(0.0);
-                    app.set_reconnecting(
-                        format!("连接断了，正在自动重连（第 {attempt} 次）。\n{reason}").into(),
-                    );
+            let posted = weak.upgrade_in_event_loop(move |app| {
+                if !state
+                    .lock()
+                    .expect("state poisoned")
+                    .client
+                    .as_ref()
+                    .is_some_and(|c| c.is_same(&client))
+                {
+                    return;
                 }
-                Event::Reconnected => {
-                    app.set_reconnecting("".into());
-                    app.set_voice_error("".into());
-                    // 服务端可能又给改了名（重名加后缀），以它为准。
-                    let actual = {
-                        let roster = client.roster();
-                        roster.name_of(roster.me)
-                    };
-                    if !actual.is_empty() {
-                        app.set_nick(actual.into());
+                match event {
+                    Event::Reconnecting {
+                        attempt, reason, ..
+                    } => {
+                        record_recovery(
+                            &state,
+                            &format!("TCP reconnect attempt={attempt}: {reason}"),
+                        );
+                        // 旧链路的会话和密钥都作废了，发出去的声音服务端只会丢掉。
+                        // 停掉它，别让用户以为自己还在被人听见 —— 麦克风指示灯也跟着灭。
+                        let first = {
+                            let mut locked = state.lock().expect("state poisoned");
+                            let now = locked
+                                .recovery_epoch
+                                .get_or_insert_with(std::time::Instant::now)
+                                .elapsed();
+                            locked.recovery.interrupt(now)
+                        };
+                        if let Some(voice) = current_voice(&state) {
+                            voice.quiesce();
+                        }
+                        if first {
+                            connection_notice(&state, false);
+                        }
+                        app.set_udp_ok(false);
+                        app.set_udp_failed(false);
+                        app.set_transmitting(false);
+                        app.set_input_level(0.0);
+                        app.set_reconnecting(
+                            format!("连接断了，正在自动重连（第 {attempt} 次）。\n{reason}").into(),
+                        );
                     }
-                    refresh(&app, &state, &client);
-                    // 会话 id、端口、密钥全换了，语音链路只能按新的重起。
-                    start_voice(&app, &state, &client);
-                }
-                Event::Disconnected(ended) => {
-                    let mut locked = state.lock().expect("state poisoned");
-                    // 旧连接的收尾可能晚到：用户点了离开、马上又连了别的服务器，
-                    // 这时候不能把新连接也一起拆了。
-                    if !locked.client.as_ref().is_some_and(|c| c.is_same(&client)) {
-                        return;
+                    Event::Reconnected => {
+                        record_recovery(&state, "TCP connected; waiting for voice probe");
+                        app.set_reconnecting("".into());
+                        app.set_voice_error("".into());
+                        // 服务端可能又给改了名（重名加后缀），以它为准。
+                        let actual = {
+                            let roster = client.roster();
+                            roster.name_of(roster.me)
+                        };
+                        if !actual.is_empty() {
+                            app.set_nick(actual.into());
+                        }
+                        refresh(&app, &state, &client);
+                        // 会话 id、端口、密钥全换了，语音链路只能按新的重起。
+                        app.set_voice_notice("服务器已连接，正在验证语音…".into());
+                        start_voice(&app, &state, &client);
                     }
-                    locked.client = None;
-                    // 丢掉链路会 join 掉所有音频线程。**必须做** ——
-                    // 留着的话麦克风还开着，而用户已经不在频道里了。
-                    locked.voice = None;
-                    drop(locked);
-                    app.set_connected(false);
-                    app.set_reconnecting("".into());
-                    // 回到首页。「上次」那几个字要重算 —— 刚离开的这个现在是「刚刚」。
-                    refresh_home(&app, &state);
-                    match ended {
-                        // 自己走的不是错误，别在首页上挂一条报错。
-                        Ended::ByUser => clear_join_error(&app),
-                        Ended::Refused { headline, advice } => {
-                            app.set_error_headline(headline.into());
-                            app.set_error_advice(advice.into());
-                            app.set_error_can_reverify(false);
-                            // 收在托盘里的时候被踢了、被封了、被顶号了：把窗口叫出来，
-                            // 不然用户以为自己还在频道里，一直对着空气说话。
-                            let _ = app.show();
-                            app.window().set_minimized(false);
+                    Event::Disconnected(ended) => {
+                        if matches!(&ended, Ended::Refused { .. }) {
+                            connection_notice(&state, false);
+                        }
+                        let mut locked = state.lock().expect("state poisoned");
+                        // 旧连接的收尾可能晚到：用户点了离开、马上又连了别的服务器，
+                        // 这时候不能把新连接也一起拆了。
+                        if !locked.client.as_ref().is_some_and(|c| c.is_same(&client)) {
+                            return;
+                        }
+                        locked.client = None;
+                        // 丢掉链路会 join 掉所有音频线程。**必须做** ——
+                        // 留着的话麦克风还开着，而用户已经不在频道里了。
+                        let retiring = locked.voice.take();
+                        let play_notice = matches!(&ended, Ended::Refused { .. });
+                        drop(locked);
+                        if let Some(voice) = retiring {
+                            voice.quiesce();
+                            if play_notice {
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_millis(400));
+                                    drop(voice);
+                                });
+                            }
+                        }
+                        app.set_voice_notice("".into());
+                        app.set_connected(false);
+                        app.set_reconnecting("".into());
+                        // 回到首页。「上次」那几个字要重算 —— 刚离开的这个现在是「刚刚」。
+                        refresh_home(&app, &state);
+                        match ended {
+                            // 自己走的不是错误，别在首页上挂一条报错。
+                            Ended::ByUser => clear_join_error(&app),
+                            Ended::Refused { headline, advice } => {
+                                app.set_error_headline(headline.into());
+                                app.set_error_advice(advice.into());
+                                app.set_error_can_reverify(false);
+                                // 收在托盘里的时候被踢了、被封了、被顶号了：把窗口叫出来，
+                                // 不然用户以为自己还在频道里，一直对着空气说话。
+                                let _ = app.show();
+                                app.window().set_minimized(false);
+                            }
                         }
                     }
+                    Event::CameIn { name, .. } => announce(&state, Chime::CameIn, &name, false),
+                    Event::WentOut { name, .. } => announce(&state, Chime::WentOut, &name, false),
+                    // 其余的都只是「画面该变了」。
+                    _ => refresh(&app, &state, &client),
                 }
-                Event::CameIn { name, .. } => announce(&state, Chime::CameIn, &name, false),
-                Event::WentOut { name, .. } => announce(&state, Chime::WentOut, &name, false),
-                // 其余的都只是「画面该变了」。
-                _ => refresh(&app, &state, &client),
             });
             if posted.is_err() {
                 // 窗口关了
@@ -1917,6 +2055,34 @@ fn pump_events(
             }
         }
     });
+}
+
+fn record_recovery(state: &Arc<Mutex<State>>, message: &str) {
+    let mut locked = state.lock().expect("state poisoned");
+    let elapsed = locked
+        .recovery_epoch
+        .map(|e| e.elapsed().as_secs())
+        .unwrap_or(0);
+    if locked.recovery_history.len() == 20 {
+        locked.recovery_history.pop_front();
+    }
+    locked
+        .recovery_history
+        .push_back(format!("+{elapsed}s {message}"));
+}
+
+/// One local sound per outage and verified recovery, using the same AEC-aware mixer.
+fn connection_notice(state: &Arc<Mutex<State>>, recovered: bool) {
+    let locked = state.lock().expect("state poisoned");
+    if locked.settings.cue_sounds {
+        if let Some(voice) = &locked.voice {
+            voice.cues().clear();
+            voice.cues().push(
+                &voice_core::cue::connection_chime(recovered),
+                locked.settings.cue_volume as f32 / 100.0,
+            );
+        }
+    }
 }
 
 /// 有人进出我所在的频道：响一声，按设置再念个名字。
@@ -2780,6 +2946,7 @@ fn update_tray(app: &App, client: Option<&Client>) {
         let status = match client {
             _ if !connected => "篝火 · 没连着".to_string(),
             _ if !app.get_reconnecting().is_empty() => "篝火 · 正在重连…".to_string(),
+            _ if !app.get_voice_notice().is_empty() => format!("篝火 · {}", app.get_voice_notice()),
             Some(client) => {
                 let mic = if deafened {
                     "关着耳朵"
