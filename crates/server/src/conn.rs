@@ -222,6 +222,8 @@ impl Hub {
         }
     }
 
+    // 新 Rust 将 fetch_update 改名为 try_update；保留旧名以兼容 Rust 1.80。
+    #[allow(deprecated)]
     pub fn reserve_connection(self: &Arc<Self>) -> Option<Admission> {
         self.pending
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {

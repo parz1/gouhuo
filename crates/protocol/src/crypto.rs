@@ -44,6 +44,8 @@ impl VoiceSequences {
     }
 
     /// 分配一次加密使用的序号；u32 耗尽后永不回绕。
+    // 新 Rust 将 fetch_update 改名为 try_update；保留旧名以兼容 Rust 1.80。
+    #[allow(deprecated)]
     pub fn next(&self, keepalive: bool) -> Option<u32> {
         use std::sync::atomic::Ordering;
         let counter = if keepalive {
