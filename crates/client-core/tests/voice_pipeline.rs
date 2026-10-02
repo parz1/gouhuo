@@ -839,3 +839,138 @@ fn udp_failure_is_visible_and_clears_after_probes_return() {
     }
     assert!(!voice.stats().udp_failed);
 }
+
+#[test]
+fn ended_capture_is_reported_even_when_udp_is_healthy() {
+    let server = start_server();
+    let client = join(&server, "ended");
+    let voice = Pipeline::start(
+        voice_config(&client, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(vec![0.; FRAME_SAMPLES])),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !(voice.stats().udp_ok && voice.stats().error.is_some()) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn quiescing_stops_transport_but_plays_the_local_disconnect_notice() {
+    let server = start_server();
+    let client = join(&server, "notice");
+    let (render, collected) = CollectingRender::new();
+    let voice = Pipeline::start(
+        voice_config(&client, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(vec![0.; FRAME_SAMPLES]).then_silence()),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !voice.stats().udp_ok {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    voice.quiesce();
+    std::thread::sleep(Duration::from_millis(100));
+    let sent = voice.stats().packets_sent;
+    collected.lock().unwrap().clear();
+    voice
+        .cues()
+        .push(&voice_core::cue::connection_chime(false), 1.0);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(voice.stats().packets_sent, sent);
+    assert!(
+        voice.stats().error.is_none(),
+        "intentional capture shutdown is not a device failure"
+    );
+    assert!(collected.lock().unwrap().iter().any(|s| s.abs() > 0.05));
+}
+
+/// A real UDP relay independently blocks each direction while TLS stays connected.
+#[test]
+fn one_way_udp_loss_is_detected_even_if_other_people_are_still_audible() {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    let server = start_server();
+    let alice = join(&server, "one-way");
+    let bob = join(&server, "speaker");
+    let mut config = voice_config(&alice, &server, TransmitMode::Always);
+    let upstream = config.server;
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    config.server = socket.local_addr().unwrap();
+    let mode = Arc::new(AtomicU8::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_mode = mode.clone();
+    let worker_stop = stop.clone();
+    let relay = std::thread::spawn(move || {
+        let mut client = None;
+        let mut buf = [0; 2048];
+        while !worker_stop.load(Ordering::Relaxed) {
+            let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            if from == upstream {
+                if worker_mode.load(Ordering::Relaxed) != 2 {
+                    if let Some(to) = client {
+                        let _ = socket.send_to(&buf[..n], to);
+                    }
+                }
+            } else {
+                client = Some(from);
+                if worker_mode.load(Ordering::Relaxed) != 1 {
+                    let _ = socket.send_to(&buf[..n], upstream);
+                }
+            }
+        }
+    });
+    let voice = Pipeline::start(
+        config,
+        Box::new(SyntheticCapture::new(vec![0.; FRAME_SAMPLES]).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let _speaker = Pipeline::start(
+        voice_config(&bob, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(vec![0.; FRAME_SAMPLES]).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let wait = |condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "UDP relay did not reach expected state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait(&|| voice.stats().udp_ok);
+    let session = alice.session_id();
+    for direction in [1, 2] {
+        let before = voice.stats().packets_received;
+        mode.store(direction, Ordering::Relaxed);
+        wait(&|| voice.stats().udp_failed);
+        assert_eq!(alice.session_id(), session, "TLS session remains connected");
+        if direction == 1 {
+            assert!(
+                voice.stats().packets_received > before + 100,
+                "downstream voice still arrives"
+            );
+        }
+        mode.store(0, Ordering::Relaxed);
+        wait(&|| voice.stats().udp_ok);
+        assert!(!voice.stats().udp_failed);
+    }
+    stop.store(true, Ordering::Relaxed);
+    relay.join().unwrap();
+}

@@ -54,6 +54,21 @@ pub fn chime(kind: Chime) -> Vec<f32> {
     out
 }
 
+/// Three notes distinguish local connection health from another member joining/leaving.
+pub fn connection_chime(recovered: bool) -> Vec<f32> {
+    let notes = if recovered {
+        [440.0, 659.25, 880.0]
+    } else {
+        [660.0, 440.0, 330.0]
+    };
+    let mut out = Vec::new();
+    for frequency in notes {
+        out.extend(tone(frequency, 0.09));
+        out.resize(out.len() + samples_for(0.015), 0.0);
+    }
+    out
+}
+
 /// 提示音的峰值。
 ///
 /// 别人说话一般在 -20 dBFS 上下，0.25 大约 -12 dBFS：听得见，但不会比人声
@@ -115,6 +130,11 @@ impl CueQueue {
         }
         queue.extend(samples.iter().map(|s| s * gain));
         true
+    }
+
+    /// Health notices take priority over queued member announcements.
+    pub fn clear(&self) {
+        self.samples.lock().expect("cue queue poisoned").clear();
     }
 
     /// 把队头的一帧加到 `frame` 上（是加，不是覆盖 —— 别人的声音已经在里面了）。

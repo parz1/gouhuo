@@ -255,6 +255,7 @@ export component App inherits Window {
     // 顶上一条说明加一个取消按钮。退回登录页的话，网络抖一下用户就以为
     // 自己被踢了，而且会下意识去点「加入」—— 那恰恰是不用做的事。
     in property <string> reconnecting;
+    in property <string> voice-notice;
 
     // ---- 设置 ----
     in-out property <bool> show-settings: false;
@@ -1015,6 +1016,14 @@ export component App inherits Window {
 
                 // 语音出错要占住位置一起显示。麦克风没声音的时候，用户第一件
                 // 想知道的就是「为什么」，而弹窗一关就没了。
+                if root.voice-notice != "" && root.reconnecting == "": Rectangle {
+                    background: #2a251a;
+                    HorizontalLayout {
+                        padding: 12px;
+                        Text { text: root.voice-notice; color: Theme.warn; wrap: word-wrap; horizontal-stretch: 1; }
+                        Btn { label: "立即重试"; clicked => { root.retry-voice(); } }
+                    }
+                }
                 if root.voice-error != "" && root.reconnecting == "": Rectangle {
                     background: #2a1d1d;
                     VerticalLayout {
@@ -1033,7 +1042,7 @@ export component App inherits Window {
                     VerticalLayout {
                         padding: 12px;
                         Text {
-                            text: "语音网络没有连通。请让服主检查语音端口的 UDP 防火墙和端口转发；文字连接正常也不代表语音能通。";
+                            text: "语音网络未连通，正在自动恢复。若持续失败，请检查本地网络、VPN，以及服务器 UDP 端口。";
                             color: Theme.warn;
                             font-size: 12px;
                             wrap: word-wrap;

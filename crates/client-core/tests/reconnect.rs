@@ -412,3 +412,42 @@ fn a_quiet_connection_is_not_dropped() {
         other => panic!("一条什么都没发生的连接自己出事了：{other:?}"),
     }
 }
+
+/// Voice-only failure can explicitly refresh the session without losing channel or mute state.
+#[test]
+fn requested_reconnect_restores_channel_and_self_state() {
+    let server = open_server();
+    let (client, events) = Client::connect_with(
+        &server.invite.to_url().unwrap(),
+        &Identity::generate().unwrap(),
+        "repair",
+        fast(),
+    )
+    .unwrap();
+    client.create_channel("repair-room", 0);
+    eventually("channel", || {
+        channel_named(&client, "repair-room").is_some()
+    });
+    let room = channel_named(&client, "repair-room").unwrap();
+    client.join_channel(room);
+    client.set_self_state(true, true);
+    eventually("state", || {
+        let r = client.roster();
+        let u = r.users.get(&r.me).unwrap();
+        u.channel_id == room && u.self_muted && u.self_deafened
+    });
+    let session = client.session_id();
+    client.reconnect_transport();
+    wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    wait_for(&events, |e| matches!(e, Event::Reconnected));
+    assert_ne!(session, client.session_id());
+    eventually("restored", || {
+        let r = client.roster();
+        let u = r.users.get(&r.me).unwrap();
+        u.channel_id == room && u.self_muted && u.self_deafened
+    });
+    client.disconnect();
+    wait_for(&events, |e| matches!(e, Event::Disconnected(Ended::ByUser)));
+    client.reconnect_transport();
+    assert!(events.recv_timeout(Duration::from_millis(300)).is_err());
+}
