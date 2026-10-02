@@ -82,7 +82,7 @@ pub const VOICE_CORE_RSS_MB: f64 = 100.0;
 /// 用不到的部分，真正进二进制的通常是几 MB，但 30 MB 这条线在加进 APM 之后
 /// 风险不小。60 MB 对比 Discord 的安装包仍然很轻。
 ///
-/// 界面接上之后实测见 [`MEASURED_CLIENT_EXE_MB`]，音频那半边还没进去。
+/// 十进制 MB（1 MB = 1,000,000 字节），完整安装包实测见 [`MEASURED_INSTALLER_MB`]。
 pub const INSTALLER_MB: f64 = 60.0;
 
 /// 客户端界面进程的常驻内存，MB。
@@ -122,6 +122,10 @@ pub const GATE_E2E_MS: f64 = 100.0;
 
 /// 通话中 CPU 的回归闸，单核占比 %。实测 2.84（编解码 2.18 + APM 0.66）。
 pub const GATE_CPU_PCT: f64 = 4.0;
+
+/// 完整安装包的回归闸，十进制 MB。0.2.2 发布包 8.023011 MB，留约 25% 余量。
+/// packaging/windows/check-size.ps1 读取此常量，release 打包超限即失败。
+pub const GATE_INSTALLER_MB: f64 = 10.0;
 
 // ===========================================================================
 // M2 实测的分段，供各探针拿去算账
@@ -255,6 +259,10 @@ pub const MEASURED_UI_COLD_START_MS: f64 = 92.0;
 /// （+0.2 MB，换来不再依赖 VCRUNTIME140.dll），到 15.01。
 pub const MEASURED_CLIENT_EXE_MB: f64 = 15.01;
 
+/// 0.2.2 正式 Release 的完整 Inno Setup 安装包：8,023,011 字节。
+/// 十进制 MB，包含客户端、打包器与静态运行库；本地重打包可能略有差异。
+pub const MEASURED_INSTALLER_MB: f64 = 8.023011;
+
 /// 实测的服务端可执行文件大小，MB（dist profile，strip 过）。
 ///
 /// 「单二进制、自部署零依赖」就是这个数。**不含音频那半边** ——
@@ -280,6 +288,14 @@ pub const MEASURED_SERVER_EXE_MB: f64 = 3.25;
 
 const _: () = assert!(GATE_E2E_MS < E2E_MS, "端到端的闸不该比产品线还松");
 const _: () = assert!(GATE_CPU_PCT < CPU_PCT, "CPU 的闸不该比产品线还松");
+const _: () = assert!(
+    GATE_INSTALLER_MB < INSTALLER_MB,
+    "安装包的闸不该比产品线还松"
+);
+const _: () = assert!(
+    MEASURED_INSTALLER_MB < GATE_INSTALLER_MB,
+    "安装包实测已经顶到闸了：重新测量后才能调整闸"
+);
 
 const _: () = assert!(
     MEASURED_PROTOCOL_MS < GATE_PROTOCOL_MS,

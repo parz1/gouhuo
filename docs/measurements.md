@@ -522,12 +522,19 @@ release 版，本机服务端，频道里两个**不说话**的机器人（`talk
 
 
 
-### 安装包体积记录（2026-09-30）
+### 安装包体积记录（2026-10-02 更新）
 
 | 版本 | 产物 | 字节数 | 十进制 MB | 来源 |
 |---|---|---:|---:|---|
 | 0.1.1 | gouhuo-setup-0.1.1.exe | 7,913,929 | 7.91 | GitHub 已发布 Release asset |
 | 0.2.0 | gouhuo-setup-0.2.0.exe | 7,942,844 | 7.94 | 本地 dist 构建 + Inno Setup，尚未发布 |
+| 0.2.2 | gouhuo-setup-0.2.2.exe | 8,023,011 | 8.023011 | GitHub 正式 Release asset |
+| 0.2.2 | gouhuo-setup-0.2.2.exe | 8,039,324 | 8.039324 | 2026-10-02 本地重打包，验证体积门禁 |
 
-两者均低于安装包 60 MB 产品线。本地包构建成功不代表实际安装、升级或真实游戏
+以上均低于安装包 60 MB 产品线。完整包实测记录在 `redline::MEASURED_INSTALLER_MB`；
+`GATE_INSTALLER_MB` 定为 10 MB，相对当前发布包留约 25% 余量。
+`packaging/windows/build.ps1` 打包后调用 `check-size.ps1`，从 redline.rs 读取阈值，
+按十进制 MB 检查实际文件字节数，达到回归闸或产品线时失败。
+release CI 使用同一打包脚本；PR CI 验证严格边界、空包和无效配置。
+本地包构建成功不代表实际安装、升级或真实游戏
 性能验收已经完成，后者见 [0.2.0 升级与验收](release-0.2.0.md)。

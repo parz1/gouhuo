@@ -107,6 +107,9 @@ jobs:
       # 换成纯 Rust 的 sonora 之后这一整段都没了，见 docs/apm-backend.md。
       # 现在唯一的原生依赖是 libopus，而 cmake 在 windows runner 上本来就有。
 
+      - name: 安装包体积门禁边界测试
+        shell: pwsh
+        run: .\packaging\windows\test-size.ps1
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
