@@ -54,5 +54,4 @@ if (-not (Test-Path $exe)) { throw "没有 $exe —— 去掉 -SkipBuild 再跑�
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
 
 $setup = Join-Path $root "target\installer\gouhuo-setup-$version.exe"
-$mb = (Get-Item $setup).Length / 1MB
-Write-Host ("{0}  {1:N2} MB" -f $setup, $mb)
+& (Join-Path $PSScriptRoot 'check-size.ps1') -InstallerPath $setup
