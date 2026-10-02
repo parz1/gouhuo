@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { ScrollView } from "std-widgets.slint";
+import { Field } from "../theme.slint";
+import { ChatRow } from "types.slint";
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component ChatPane inherits Rectangle {
+    in property <[ChatRow]> lines;
+    in-out property <string> draft;
+    callback send();
+    VerticalLayout {
+        spacing: 0;
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 10px;
+                alignment: start;
+                if root.lines.length == 0: Text { text: "发个链接、报个坐标。频道文字在离开后清除。"; color: CallTokens.dim; font-size: 12px; wrap: word-wrap; }
+                for line in root.lines: VerticalLayout {
+                    spacing: 3px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: line.sender; min-width: 0; overflow: elide; color: line.is-me ? CallTokens.warm : CallTokens.text; font-size: 13px; font-weight: 600; }
+                        Text { text: line.time; color: CallTokens.dim; font-size: 11px; }
+                    }
+                    Text { text: line.body; color: CallTokens.text; font-size: 14px; wrap: word-wrap; }
+                }
+            }
+        }
+        HorizontalLayout {
+            height: 58px;
+            padding: 10px;
+            spacing: 8px;
+            Field { placeholder: "说点什么"; text <=> root.draft; horizontal-stretch: 1; min-width: 0; accepted => { if (root.draft != "") { root.send(); } } }
+            CallButton { width: 64px; label: "发送"; selected: true; enabled: root.draft != ""; clicked => { root.send(); } }
+        }
+    }
+}

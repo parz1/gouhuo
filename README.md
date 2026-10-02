@@ -10,8 +10,8 @@
 几个边界清楚的 crate —— 语音内核独立于界面、协议单独一份、服务端零配置 ——
 看看能不能把接入语音的心智负担降下来。
 
-> **当前版本：0.2.1。** Windows 安装包和 Linux Docker
-> 部署已经可用。0.2.1 跟 0.2.0 协议兼容，可以分开升级（[这一版有什么](docs/release-0.2.1.md)）；
+> **版本：0.3.0。** 通话页与语音运行层重建，保持与 0.2.1 / 0.2.2 的协议和存档兼容。
+> Windows 下载与公开状态见 [v0.3.0 Release](https://github.com/parz1/gouhuo/releases/tag/v0.3.0)，变化与实测范围见 [版本说明](docs/release-0.3.0.md) 和 [验证记录](docs/release-0.3.0-validation.md)。
 > 从 0.1.x 升上来仍要客户端和服务端一起换。
 > 91.9 ms 是协议、设备和 APM 的分项实测合计，完整双机嘴到耳延迟尚未测量。
 > 下一步是小规模开黑验证，见 [0.2.0 升级与验收](docs/release-0.2.0.md)。
@@ -288,7 +288,8 @@ crates/
   transport/       TLS 怎么建、UDP 密钥从哪来。两端共用
   server/          服务端。state = 纯状态机，conn = TLS/线程/分帧，voice = UDP 转发
   client-core/     客户端逻辑，不含界面：连接、认证、状态镜像
-  client/          Slint 界面。只负责画和转发点击
+  client-runtime/  不含 GUI 的语音生命周期、意愿/事实快照、恢复策略与状态投影
+  client/          Slint 界面与桌面适配器；不拥有语音线程
   latency-probe/   协议链路延迟的测量工具
   device-probe/    WASAPI 设备延迟 + APM 逐块计价
 docs/
@@ -313,6 +314,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python scripts/check-spdx.py     # 每个文件头的 SPDX 要跟所属 crate 的许可一致
 ```
+
+Linux 上可以开发和测试不依赖声卡的语音内核、客户端逻辑和协议延迟探针：
+
+```bash
+cargo check -p voice-core -p client-core -p client-runtime --all-targets
+cargo clippy -p voice-core -p client-core -p client-runtime -p latency-probe --all-targets -- -D warnings
+cargo test -p voice-core -p client-core -p client-runtime
+```
+
+Ubuntu CI 会跑这组检查。`client` 界面和 `device-probe` 仍只支持 Windows；
+Linux 上麦克风扫描返回空列表，延迟探针的进程 CPU / 峰值内存显示为不可用。
 
 需要真声卡才能跑的测试（试麦、设备扫描、声学回声）都标了 `#[ignore]`，
 用 `-- --ignored` 显式跑。
@@ -356,10 +368,10 @@ cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 
 客户端和服务端共用一个产品版本，一起发。1.0 之前这样定号：
 
-- **`0.x.Y`**：修 bug、加功能，**协议和存档格式都兼容**。客户端无需同步升级；服务器 `pull` 后重启仍会短暂断线
-- **`0.X.0`**：动了 `PROTOCOL_VERSION`，或者 SQLite 表结构变了。服务器一升级旧客户端就连不上，
-  换回旧镜像也可能读不了新存档 —— Release 说明里写清楚「先升客户端」「升级前先备份
-  `gouhuo-data`」
+- **`0.x.Y`**：修复与小功能升级，通常保持协议和存档兼容。
+- **`0.X.0`**：较大的架构或体验升级；产品版本号本身不表示协议或存档不兼容。
+  是否需要同步升级由 `PROTOCOL_VERSION` 与存档格式决定，具体 Release 说明列明兼容性、迁移与回退步骤。
+  0.3.0 保持 0.2.x 的控制协议和存档格式；服务端重启仍会造成短暂断线。
 
 步骤：
 
@@ -440,7 +452,13 @@ git push origin v0.1.0
 
 客户端目前只有 Windows 实现（WASAPI、DPAPI、Raw Input 热键）。这是先后顺序，
 不是范围：平台相关的代码基本收在 `voice-core`（音频设备、热键、时钟、身份落盘），
-别的平台是往那里加实现。服务端要能跑在 Linux 上（专用服务器基本都是 Linux）。
+语音运行层通过 `AudioBackend` 注入设备实现，桌面 WASAPI/APM 接入位于
+`client/src/platform_audio.rs`。其他平台可以复用 `client-core` 与 `client-runtime`，
+提供自己的音频、热键和系统集成适配器；这不表示其他平台的客户端已交付。
+服务端要能跑在 Linux 上（专用服务器基本都是 Linux）。
+
+通话页重建的结构、运行预览和验收状态见 [实施记录](docs/call-ui-rebuild-implementation.md)。
+通话命令、状态、ViewModel 和 GUI 适配器的职责见 [轻量 UI 架构](docs/client-ui-architecture.md)。
 
 ### 明确不做
 

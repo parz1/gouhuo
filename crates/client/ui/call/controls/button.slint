@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { CallTokens } from "../tokens.slint";
+
+export component CallButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> tint-icon: true;
+    in property <bool> enabled: true;
+    in property <bool> selected: false;
+    in property <bool> danger: false;
+    in property <bool> quiet: false;
+    in property <int> focus-epoch: 0;
+    callback clicked();
+    callback focused();
+    out property <bool> has-focus: keyboard.has-focus;
+    changed focus-epoch => { if (root.enabled) { keyboard.focus(); } }
+    height: 36px;
+    min-width: 0;
+    border-radius: 8px;
+    border-width: keyboard.has-focus ? 2px : 1px;
+    border-color: keyboard.has-focus ? CallTokens.warm : root.selected ? CallTokens.warm : root.quiet ? transparent : CallTokens.line;
+    background: touch.has-hover && root.enabled ? CallTokens.hover : root.quiet ? transparent : CallTokens.raised;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: keyboard;
+    keyboard := FocusScope {
+        enabled: root.enabled;
+        changed has-focus => { if (self.has-focus) { root.focused(); } }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n" || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: root.icon.width > 0 ? 6px : 0px;
+        alignment: center;
+        if root.icon.width > 0: Rectangle {
+            width: 18px;
+            height: 100%;
+            Image {
+                source: root.icon;
+                x: 0;
+                width: 18px;
+                height: 18px;
+                y: (parent.height - self.height) / 2;
+                colorize: !root.tint-icon ? transparent : !root.enabled ? CallTokens.dim : root.danger ? CallTokens.danger : root.selected ? CallTokens.warm : CallTokens.text;
+            }
+        }
+        if root.label != "": Text {
+            text: root.label;
+            min-width: 0;
+            color: !root.enabled ? CallTokens.dim : root.danger ? CallTokens.danger : CallTokens.text;
+            font-family: CallTokens.font;
+            font-size: 13px;
+            overflow: elide;
+            vertical-alignment: center;
+            height: 100%;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { keyboard.focus(); root.clicked(); }
+    }
+}

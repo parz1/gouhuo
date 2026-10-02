@@ -12,7 +12,7 @@
 //! - 满了（自己 + 7 个人）之后来的人排队，不在圈里画，界面上显示「还有 N 人」。
 //!   有人走了，排最前面的那个补进空出来的位子。
 //!
-//! 座位在画面上的位置是界面按比例算的（campfire.slint）；底图和石头的像素画
+//! 座位几何、底图和石头的像素画都在这里计算；Slint 只接收坐标。
 //! 在这里画好交给界面，见 [`scene`] 和 [`stone`]。
 
 use std::cell::RefCell;
@@ -157,6 +157,21 @@ fn seat_angle(seat: usize) -> f32 {
     (112.5 + seat as f32 * 45.0).to_radians()
 }
 
+/// One source for stone centers, label placement and pointer hit areas.
+/// All coordinates are logical pixels; the official art keeps its proportions.
+pub fn seat_geometry(scene: (f32, f32)) -> [(f32, f32, f32, bool); SEATS] {
+    let size = stone_size(scene);
+    std::array::from_fn(|seat| {
+        let angle = seat_angle(seat);
+        (
+            scene.0 * (0.5 + 0.31 * angle.cos()),
+            scene.1 * (0.55 + 0.25 * angle.sin()),
+            size,
+            angle.sin() < -0.05,
+        )
+    })
+}
+
 /// (种子, 座位号, 宽几格, 高几格) → (平时, 说话时)
 type StoneCache = HashMap<(u32, usize, usize, usize), (Image, Image)>;
 
@@ -278,7 +293,7 @@ impl Stage {
             .fire
             .get_or_insert_with(|| scene::Fire::warmed_up(seed, &g));
         fire.step(dt, &g);
-        if self.layers.is_none() || self.frames % LAYERS_EVERY == 0 {
+        if self.layers.is_none() || self.frames.is_multiple_of(LAYERS_EVERY) {
             self.layers = Some(scene::layers(&g, &self.pile, fire.clock));
         }
         self.frames = self.frames.wrapping_add(1);

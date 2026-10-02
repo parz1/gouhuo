@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use protocol::Invite;
 use voice_core::hotkey::Key;
@@ -401,6 +403,8 @@ impl Settings {
         settings
     }
 
+    /// Synchronous persistence for non-GUI callers. The GUI schedules complete
+    /// snapshots through `SettingsWriter` instead of waiting for the filesystem.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::path()?;
         if let Some(dir) = path.parent() {
@@ -510,6 +514,293 @@ fn non_empty(value: &str) -> Option<String> {
 
 fn one_line(value: &str) -> String {
     value.replace(['\n', '\r'], " ").trim().to_string()
+}
+
+struct SettingsWriteState {
+    /// At most one complete snapshot waits behind the write in progress.
+    pending: Option<Settings>,
+    closing: bool,
+    error: Option<String>,
+}
+
+struct SettingsWriteShared {
+    state: Mutex<SettingsWriteState>,
+    ready: Condvar,
+}
+
+/// GUI-safe settings persistence. Handles never own a thread-joining object.
+#[derive(Clone)]
+pub struct SettingsWriterHandle {
+    shared: Arc<SettingsWriteShared>,
+}
+
+impl SettingsWriterHandle {
+    /// Replace the single pending snapshot. Serialization and all disk I/O run
+    /// on the worker, outside this mutex. `false` means shutdown has begun.
+    pub fn schedule(&self, settings: &Settings) -> bool {
+        let snapshot = settings.clone();
+        let mut state = self.shared.state.lock().expect("settings writer poisoned");
+        if state.closing {
+            return false;
+        }
+        state.pending = Some(snapshot);
+        self.shared.ready.notify_one();
+        true
+    }
+
+    /// The most recent failed write; a later successful write clears it.
+    #[allow(dead_code)]
+    pub fn last_error(&self) -> Option<String> {
+        self.shared
+            .state
+            .lock()
+            .expect("settings writer poisoned")
+            .error
+            .clone()
+    }
+
+    /// Accept no further writes; flush the latest already accepted snapshot.
+    /// This only signals the worker and never waits for a write in progress.
+    pub fn shutdown(&self) {
+        let mut state = self.shared.state.lock().expect("settings writer poisoned");
+        state.closing = true;
+        self.shared.ready.notify_one();
+    }
+}
+
+/// One ordered writer avoids a thread per edit and old snapshots overwriting
+/// new preferences. Drain it after the GUI event loop has ended.
+pub struct SettingsWriter {
+    handle: SettingsWriterHandle,
+    stopped: mpsc::Receiver<()>,
+}
+
+impl SettingsWriter {
+    pub fn start() -> io::Result<Self> {
+        Self::spawn(Settings::save)
+    }
+
+    fn spawn(
+        mut write: impl FnMut(&Settings) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        let shared = Arc::new(SettingsWriteShared {
+            state: Mutex::new(SettingsWriteState {
+                pending: None,
+                closing: false,
+                error: None,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let (done, stopped) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("gouhuo-settings-writer".into())
+            .spawn(move || {
+                loop {
+                    let snapshot = {
+                        let mut state = worker_shared
+                            .state
+                            .lock()
+                            .expect("settings writer poisoned");
+                        while state.pending.is_none() && !state.closing {
+                            state = worker_shared
+                                .ready
+                                .wait(state)
+                                .expect("settings writer poisoned");
+                        }
+                        match state.pending.take() {
+                            Some(snapshot) => snapshot,
+                            None => break,
+                        }
+                    };
+                    // Never hold the pending-state mutex while serializing or
+                    // waiting on filesystem/antivirus/device operations.
+                    let error = write(&snapshot).err().map(|error| error.to_string());
+                    if let Some(error) = &error {
+                        eprintln!("保存设置失败：{error}");
+                    }
+                    worker_shared
+                        .state
+                        .lock()
+                        .expect("settings writer poisoned")
+                        .error = error;
+                }
+                let _ = done.send(());
+            })?;
+        Ok(Self {
+            handle: SettingsWriterHandle { shared },
+            stopped,
+        })
+    }
+
+    pub fn handle(&self) -> SettingsWriterHandle {
+        self.handle.clone()
+    }
+
+    pub fn shutdown(&self) {
+        self.handle.shutdown();
+    }
+
+    /// Blocking drain only for an exit coordinator outside the GUI event loop.
+    /// Returns false if disk I/O is still blocked after the supplied bound.
+    pub fn wait_stopped(&self, timeout: Duration) -> bool {
+        self.stopped.recv_timeout(timeout).is_ok()
+    }
+}
+
+impl Drop for SettingsWriter {
+    fn drop(&mut self) {
+        // Covers startup/early-return paths too. The detached worker flushes
+        // accepted data; dropping the owner or a GUI handle never joins it.
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod settings_writer_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn wait(condition: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                Instant::now() < until,
+                "timed out waiting for writer result"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn blocked_disk_does_not_block_schedule_and_shutdown_flushes_latest_in_order() {
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let committed = Arc::clone(&writes);
+        let mut first = true;
+        let writer = SettingsWriter::spawn(move |settings| {
+            if first {
+                first = false;
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            }
+            committed.lock().unwrap().push(settings.clone());
+            Ok(())
+        })
+        .unwrap();
+        let handle = writer.handle();
+        let initial = Settings {
+            nick: "first".into(),
+            ..Settings::default()
+        };
+        assert!(handle.schedule(&initial));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // Keep the disk write blocked. A different frontend thread must still
+        // finish scheduling complete newer preferences before it is released.
+        let (scheduled, completion) = mpsc::channel();
+        let frontend = handle.clone();
+        let latest = Settings {
+            nick: "latest".into(),
+            cue_volume: 37,
+            talk_mode: TalkMode::VoiceActivity,
+            ..Settings::default()
+        };
+        let expected = latest.clone();
+        let submitter = std::thread::spawn(move || {
+            let skipped = Settings {
+                nick: "superseded".into(),
+                ..Settings::default()
+            };
+            assert!(frontend.schedule(&skipped));
+            assert!(frontend.schedule(&latest));
+            scheduled.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("schedule waited for disk I/O");
+        submitter.join().unwrap();
+        writer.shutdown();
+        assert!(!handle.schedule(&Settings {
+            nick: "too late".into(),
+            ..Settings::default()
+        }));
+        release.send(()).unwrap();
+        assert!(writer.wait_stopped(Duration::from_secs(2)));
+        let stored = writes.lock().unwrap();
+        assert_eq!(
+            *stored,
+            vec![initial, expected],
+            "pending snapshots were not coalesced or were written out of order"
+        );
+    }
+
+    #[test]
+    fn releasing_a_gui_handle_never_joins_a_blocked_write() {
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let writer = SettingsWriter::spawn(move |_| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let handle = writer.handle();
+        assert!(handle.schedule(&Settings::default()));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (done, completion) = mpsc::channel();
+        let gui = std::thread::spawn(move || {
+            drop(handle);
+            done.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("GUI handle drop joined the writer");
+        gui.join().unwrap();
+        writer.shutdown();
+        release.send(()).unwrap();
+        assert!(writer.wait_stopped(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn failed_persistence_is_reported_and_a_later_success_clears_it() {
+        let (written, committed) = mpsc::channel();
+        let writer = SettingsWriter::spawn(move |settings| {
+            written.send(settings.nick.clone()).unwrap();
+            if settings.nick == "fail" {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "controlled permission failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        let handle = writer.handle();
+        handle.schedule(&Settings {
+            nick: "fail".into(),
+            ..Settings::default()
+        });
+        assert_eq!(
+            committed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "fail"
+        );
+        wait(|| handle.last_error().is_some());
+        assert!(handle.last_error().unwrap().contains("permission failure"));
+        handle.schedule(&Settings {
+            nick: "success".into(),
+            ..Settings::default()
+        });
+        assert_eq!(
+            committed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "success"
+        );
+        wait(|| handle.last_error().is_none());
+        writer.shutdown();
+        assert!(writer.wait_stopped(Duration::from_secs(2)));
+    }
 }
 
 #[cfg(test)]

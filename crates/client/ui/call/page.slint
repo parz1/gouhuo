@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { Row, ChatRow } from "types.slint";
+import { Seat, SeatGeometry } from "../campfire.slint";
+import { CallTokens } from "tokens.slint";
+import { CallHeader } from "header.slint";
+import { ChannelNavigator } from "navigator.slint";
+import { RecoverySummary } from "recovery-summary.slint";
+import { ChatPane } from "chat-pane.slint";
+import { DiagnosticsPane } from "diagnostics-pane.slint";
+import { SceneHost } from "../scenes/host.slint";
+import { SelfDock } from "self-dock.slint";
+import { CallOverlayHost } from "overlay-host.slint";
+
+export component CallPage inherits Rectangle {
+    in property <bool> preview-enabled: false;
+    callback preview-key(int);
+    in property <string> server-name;
+    in property <string> channel-name;
+    in property <int> channel-count;
+    in property <string> nick;
+    in property <string> my-fingerprint;
+    in property <[Row]> rows;
+    in property <[ChatRow]> chat;
+    in property <[Seat]> seats;
+    in property <[Seat]> waiting;
+    in property <[SeatGeometry]> scene-geometry;
+    in property <bool> waiting-talking;
+    in property <image> backdrop;
+    in property <bool> can-create-channel;
+    in property <bool> self-muted;
+    in property <bool> self-deafened;
+    in property <bool> ptt-mode;
+    in property <string> ptt-label;
+    in property <bool> rebinding;
+    in property <float> input-level;
+    in property <float> vad-level;
+    in property <bool> input-available;
+    in property <bool> render-available;
+    in property <bool> transmitting;
+    in property <string> self-status;
+    in property <string> recovery-message;
+    in property <bool> udp-ok;
+    in property <bool> udp-failed;
+    in property <string> reconnecting;
+    in property <string> voice-error;
+    in property <string> voice-notice;
+    in property <string> diagnostics;
+    in property <Row> member-data;
+    in-out property <int> member-id: -1;
+    in-out property <bool> tree-open;
+    in-out property <bool> chat-open;
+    in-out property <bool> diagnostics-open;
+    in-out property <string> draft;
+    in-out property <int> chat-seen;
+    in-out property <string> update-version;
+    out property <bool> narrow: self.width < 640px;
+    out property <bool> compact-dock: self.width < 736px;
+    out property <bool> scene-shown: !root.chat-open && !root.diagnostics-open && !(root.narrow && root.tree-open);
+    callback campfire-resized(length, length);
+    callback open-member(int);
+    callback join-channel(int);
+    callback create-channel(string);
+    callback delete-channel(int);
+    callback rename-channel(int, string);
+    callback set-user-volume(int, float);
+    callback save-user-volumes();
+    callback kick-user(int);
+    callback ban-user(int);
+    callback set-role(int, int);
+    callback toggle-mute();
+    callback toggle-deafen();
+    callback toggle-settings();
+    callback set-ptt-mode(bool);
+    callback rebind-ptt();
+    callback cancel-rebind();
+    callback retry-voice();
+    callback show-diagnostics();
+    callback send-text();
+    callback open-update();
+    callback leave();
+    property <int> overlay: 0;
+    property <int> menu-origin: 0;
+    property <int> restore-member: -1;
+    property <int> dock-focus: 0;
+    property <int> mode-focus: 0;
+    property <int> identity-focus: 0;
+    property <int> navigation-focus: 0;
+    property <int> chat-focus: 0;
+    property <int> more-focus: 0;
+    // Recovery can leave less room than the member controls need. Borrow the
+    // header/recovery area only then; the one SelfDock remains outside the host.
+    property <bool> expanded-overlay: content.height < 160px;
+    changed member-id => { if (root.member-id >= 0) { root.overlay = 1; } else if (root.overlay == 1) { root.overlay = 0; root.dock-focus += 1; } }
+    function close-overlay(restore: bool) {
+        let closed-kind = root.overlay;
+        if (root.overlay == 1) { root.save-user-volumes(); }
+        root.overlay = 0;
+        if (restore && root.member-id >= 0) { root.restore-member = root.member-id; }
+        root.member-id = -1;
+        if (restore && closed-kind == 3) { root.mode-focus += 1; }
+        if (restore && closed-kind == 4) { root.identity-focus += 1; }
+        if (restore && closed-kind == 2) { root.more-focus += 1; }
+    }
+    function member(id: int, origin: int) {
+        root.close-overlay(false);
+        root.restore-member = -1;
+        root.menu-origin = origin;
+        root.open-member(id);
+        root.overlay = 1;
+    }
+    function close-navigation() { root.tree-open = false; root.navigation-focus += 1; }
+    background: CallTokens.bg;
+    forward-focus: page-keys;
+    page-keys := FocusScope {
+        init => { if (root.preview-enabled) { self.focus(); } }
+        key-pressed(event) => {
+            if (root.preview-enabled) {
+                if (event.text == Key.F1) { root.preview-key(1); return accept; }
+                if (event.text == Key.F2) { root.preview-key(2); return accept; }
+                if (event.text == Key.F3) { root.preview-key(3); return accept; }
+                if (event.text == Key.F4) { root.preview-key(4); return accept; }
+            }
+            if (event.text == Key.Escape) {
+                if (root.overlay != 0) { root.close-overlay(true); return accept; }
+                if (root.rebinding) { root.cancel-rebind(); return accept; }
+                if (root.diagnostics-open) { root.diagnostics-open = false; root.more-focus += 1; return accept; }
+                if (root.narrow && root.tree-open) { root.close-navigation(); return accept; }
+                if (root.chat-open) { root.chat-open = false; root.chat-focus += 1; return accept; }
+            }
+            return reject;
+        }
+        VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            spacing: 0;
+            HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0;
+                if !root.narrow: FocusScope {
+                    width: 208px;
+                    enabled: root.overlay == 0;
+                    ChannelNavigator {
+                        preview-enabled: root.preview-enabled; server: root.server-name; rows: root.rows; can-create: root.can-create-channel; sending: root.transmitting; stale: root.reconnecting != "";
+                        restore-member: root.menu-origin == 1 ? root.restore-member : -1;
+                        join-channel(id) => { root.join-channel(id); }
+                        open-member(id) => { root.member(id, 1); }
+                        create-channel(name) => { root.create-channel(name); }
+                        delete-channel(id) => { root.delete-channel(id); }
+                        rename-channel(id, name) => { root.rename-channel(id, name); }
+                    }
+                }
+                if !root.narrow: Rectangle { width: 1px; background: CallTokens.line; }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    min-width: 0;
+                    spacing: 0;
+                    CallHeader {
+                        server: root.server-name; channel: root.channel-name; count: root.channel-count; narrow: root.narrow; navigation: root.tree-open; chat: root.chat-open; unread: root.chat.length > root.chat-seen;
+                        navigation-focus: root.navigation-focus; chat-focus: root.chat-focus; more-focus: root.more-focus;
+                        toggle-navigation => { root.close-overlay(false); if (root.tree-open) { root.close-navigation(); } else { root.tree-open = true; } }
+                        toggle-chat => { root.close-overlay(false); root.tree-open = false; root.diagnostics-open = false; root.chat-open = !root.chat-open; root.chat-seen = root.chat.length; }
+                        more => { root.close-overlay(false); root.overlay = 2; }
+                        leave => { root.leave(); }
+                    }
+                    Rectangle { height: 1px; background: CallTokens.line; }
+                    if root.recovery-message != "": RecoverySummary {
+                        message: root.recovery-message; reconnecting: root.reconnecting != "";
+                        retry => { root.retry-voice(); }
+                        cancel => { root.leave(); }
+                        details => { root.close-overlay(false); root.overlay = 5; }
+                    }
+                    content := Rectangle {
+                        vertical-stretch: 1;
+                        min-height: 0;
+                        clip: true;
+                        FocusScope {
+                            enabled: root.overlay == 0;
+                            if root.narrow && root.tree-open: ChannelNavigator {
+                                preview-enabled: root.preview-enabled; server: root.server-name; rows: root.rows; can-create: root.can-create-channel; sending: root.transmitting; stale: root.reconnecting != "";
+                                restore-member: root.menu-origin == 1 ? root.restore-member : -1;
+                                join-channel(id) => { root.join-channel(id); root.close-navigation(); }
+                                open-member(id) => { root.member(id, 1); }
+                                create-channel(name) => { root.create-channel(name); }
+                                delete-channel(id) => { root.delete-channel(id); }
+                                rename-channel(id, name) => { root.rename-channel(id, name); }
+                            }
+                            if !(root.narrow && root.tree-open) && root.diagnostics-open: DiagnosticsPane { report: root.diagnostics; refresh => { root.show-diagnostics(); } close => { root.diagnostics-open = false; root.more-focus += 1; } }
+                            if !(root.narrow && root.tree-open) && !root.diagnostics-open && root.chat-open: ChatPane { lines: root.chat; draft <=> root.draft; send => { root.send-text(); } }
+                            if root.scene-shown: SceneHost { seats: root.seats; waiting: root.waiting; geometry: root.scene-geometry; waiting-talking: root.waiting-talking; transmitting: root.transmitting; stale: root.reconnecting != ""; backdrop: root.backdrop; restore-member: root.menu-origin == 2 ? root.restore-member : -1; resized(w, h) => { root.campfire-resized(w, h); } open-member(id) => { root.member(id, 2); } }
+                        }
+                    }
+                }
+            }
+            dock := SelfDock {
+                nick: root.nick; identity-image: root.seats.length > 0 ? root.seats[0].stone : @image-url("../icons/flame.svg"); input-available: root.input-available; input-level: root.input-level; vad-level: root.vad-level; ptt-mode: root.ptt-mode; ptt-label: root.ptt-label; rebinding: root.rebinding; status: root.self-status; transmitting: root.transmitting; muted: root.self-muted; deafened: root.self-deafened; focus-epoch: root.dock-focus; mode-focus: root.mode-focus; identity-focus: root.identity-focus;
+                identity-details => { root.close-overlay(false); root.overlay = 4; }
+                mode-menu => { root.close-overlay(false); root.overlay = 3; }
+                rebind => { root.close-overlay(false); root.rebind-ptt(); }
+                cancel-rebind => { root.cancel-rebind(); }
+                toggle-mute => { root.close-overlay(false); root.toggle-mute(); }
+                toggle-deafen => { root.close-overlay(false); root.toggle-deafen(); }
+                settings => { root.close-overlay(false); root.toggle-settings(); }
+                focused => { if (root.overlay == 1) { root.close-overlay(false); } }
+            }
+        }
+        if root.overlay != 0: CallOverlayHost {
+            // Normal popups keep their exact former content bounds. Small
+            // recovery layouts can cover the header, ending at the dock edge.
+            x: content.absolute-position.x - page-keys.absolute-position.x;
+            y: root.expanded-overlay ? 0px : content.absolute-position.y - page-keys.absolute-position.y;
+            width: content.width;
+            height: root.expanded-overlay ? dock.absolute-position.y - page-keys.absolute-position.y : content.height;
+            kind: root.overlay; member: root.member-data; nick: root.nick; fingerprint: root.my-fingerprint; recovery: root.recovery-message; ptt: root.ptt-mode; key-label: root.ptt-label; update-version: root.update-version;
+            close => { root.close-overlay(true); }
+            volume(v) => { root.set-user-volume(root.member-id, v); }
+            save => { root.save-user-volumes(); }
+            role(r) => { root.set-role(root.member-id, r); }
+            kick => { root.kick-user(root.member-id); }
+            ban => { root.ban-user(root.member-id); }
+            diagnostics => { root.close-overlay(false); root.tree-open = false; root.diagnostics-open = true; root.show-diagnostics(); }
+            settings => { root.close-overlay(false); root.toggle-settings(); }
+            mode(ptt) => { root.set-ptt-mode(ptt); }
+            rebind => { root.rebind-ptt(); }
+            open-update => { root.open-update(); }
+            dismiss-update => { root.update-version = ""; root.close-overlay(false); }
+        }
+    }
+}

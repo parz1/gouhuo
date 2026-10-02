@@ -4,7 +4,8 @@
 >
 > 原始报告存档在 [`m1-baseline.txt`](m1-baseline.txt)、
 > [`m2-baseline.txt`](m2-baseline.txt)、[`m5-baseline.txt`](m5-baseline.txt) 和
-> [`m6-footprint.txt`](m6-footprint.txt) —— 下面每个数字都出自那几份。
+> [`m6-footprint.txt`](m6-footprint.txt) —— 历史 M1 / M2 / M5 / M6 数字来自这些报告。
+> 后续安装包与候选版本观测在文末单独列出来源。
 >
 > 复现命令见 README 的「开发」一节。
 
@@ -16,6 +17,7 @@
 - [M5：自适应抖动缓冲](#m5-结论自适应抖动缓冲)
 - [M6：客户端的内存和后台开销](#m6客户端的内存和后台开销)
 - [篝火动画的开销](#篝火动画的开销)
+- [0.3.0 候选实测](#030-候选实测2026-10-03)
 
 ---
 
@@ -538,3 +540,56 @@ release 版，本机服务端，频道里两个**不说话**的机器人（`talk
 release CI 使用同一打包脚本；PR CI 验证严格边界、空包和无效配置。
 本地包构建成功不代表实际安装、升级或真实游戏
 性能验收已经完成，后者见 [0.2.0 升级与验收](release-0.2.0.md)。
+
+## 0.3.0 候选实测（2026-10-03）
+
+Windows x64、Rust / Cargo 1.96，使用锁定依赖的 `dist` 构建与 Inno Setup。
+以下构建与原生数字均为 SelfDock 最新细化之前的上轮 `source-final` 历史记录。
+该轮客户端 PE 0.3.0，17,947,648 字节；服务端 3,694,080 字节；完整安装包 PE 0.3.0，
+**8,181,974 字节（8.181974 十进制 MB）**，严格小于 10 MB 回归闸与 60 MB 产品线。
+该轮 dist 构建 174.33s（约 2m53s）、安装包约 4.88s 均退出 0；历史产物 SHA-256、构建证据与实际验收范围见
+[0.3.0 验证记录](release-0.3.0-validation.md#发布产物)。打包通过不表示安装 / 覆盖升级通过。
+更早候选 8,177,722 字节（8.177722 MB）曾被该轮重打取代；两轮均为历史，不与本轮资产混用。
+`redline::MEASURED_INSTALLER_MB` 保留历史正式 0.2.2 的 8.023011，本次不改历史常量或阈值。
+
+历史原生实例 A PID 25272 / B PID 39204 匹配上轮 dist `3A58C3…7A3B1`，加入本地同一大厅，名单 / 输入电平 / PTT V 等待正常。
+该轮 UI trace：A startup 420.84ms、App::new 205.17ms、call enter 32.87ms、draw callback wall span 13.91ms；
+B 分别为 362.63 / 230.30 / 35.18 / 14.24ms。请求至 `AfterRendering` 在 present 之前，
+绘制回调跨度是墙钟时间，不是 CPU 使用率；这些都不含 GPU 完成、屏幕显示或声学延迟。
+两个客户端和其他用户 app 并存，不能作公平基线比较。之前 A / B 入页 40.00 / 45.28ms、
+并发 Cargo 下 startup 1522.40 / 2387.49ms 留作历史；本地来源未确认的 0.2.2 首页采样也不是同场景基线。
+本次不宣称启动、内存、语音延迟或游戏性能改善。
+上述历史产物与当时 176 文件清单已核验；旧安装包为 `EADDF2…2E55`，不能用作本轮新源码标识。
+该轮 Windows 全工作区检查及 dist / 打包通过；内核和 Linux 测量 fixture 本轮未变，原 Linux 重复 / 完整验证仍覆盖同一内核源码。
+
+上一阶段 SelfDock 收紧上下留白并垂直对齐头像；语音激活入口左侧标题、右侧箭头，PTT 键移入等待状态行，
+输入区整理标题、状态和左起电平条。`dock-refine-matrix.log` 的 80 张逻辑断点 / DPI 软件快照与 pointer / keyboard 断言通过，
+未使用音频、网络或设置。客户端定点测试 73 passed / 0 failed / 3 ignored（2.06s）、严格 all-targets Clippy（32.54s）和格式通过。
+该阶段清单为 176 文件，SHA-256 `98AB0191D82DC3CAE3EF5421F6765999A18CC0A32D0FA5C95AB47BD38541CC57`，
+仅 `self-dock.slint` 和 `call_ui_preview.rs` 相对上轮变化，内核与 Linux 结果的源码范围不变。
+原生离线 fixture 编译 1.27s、PID 7160，在 760×520 / 400×360 观察留白与基线，并完成模式入口鼠标 / 键盘与焦点返回；
+这项 fixture 不是真实音频测量。该阶段 `dock-refine-dist.log` 的 dist 构建 3m05s，安装包 4.93s 均成功；
+客户端 PE 0.3.0、17,956,352 字节，服务端仍为 3,694,080 字节，完整安装包 PE 0.3.0、
+**8,182,967 字节（8.182967 十进制 MB）**，严格小于 10 MB 回归闸与 60 MB 产品线。
+该阶段客户端 SHA-256 `BFB08D184E174130F400C7072251AE4BFA7A97B9B547DD76923DB19B7EC06B91`，
+安装包 `949576A3A4B914ED6A3013CA1BF196D7C69B6E9259CE5040953DC478B04C54AC`；
+`dock-refine-artifacts.json` 保留该阶段，`artifacts-source-final.json` 保留更早记录；当前 `artifacts-final.json` 已改为下面的 Header 候选。
+构建后 176 文件清单重检一致，DLL 依赖无外部 CRT；打包仍不表示实际安装 / 覆盖升级通过。
+
+该阶段原生 A PID 1000 / B PID 16784 运行哈希均匹配当时客户端，实际加入本地 21943、大厅 2 人；
+A 语音激活 / 等待说话，B 按住说话 / V / 等待 V，输入区存在，A 宽窗口新底栏直接观察正常。
+A startup / call enter / tagged draw wall span 为 389.07 / 35.79 / 14.25ms，B 为 555.59 / 39.64 / 15.34ms。
+这些仍是 before-present 或单独初始化墙钟跨度，同机双端与其他 app 并存，不作为公平基线或性能改善证据。
+实际原生截图见 [native-dock-refined-760x520.png](design/rebuild/native-dock-refined-760x520.png)。
+离线 fixture PID 7160 正常关闭，旧 PID 25272 / 39204 已退出；A1000 / B16784 在 Header 验收时正常关闭并实际保存昵称、模式、按键和提示音设置。
+此项布局验证不构成性能改善、实际 VAD 发送或声学延迟结论。当前保持本地候选，未安装、未提交或公开发布。
+
+本轮仅 `header.slint` 相对 SelfDock 阶段变化：宽操作区 232→172px、横向留白 10→12px，纵向仍 10px，离开与底栏设置右边界统一为 12px。
+`header-spacing-matrix.log` 完整 80 张软件快照与 pointer / keyboard 断言通过；dev 编译 27.86s，原生 fixture 编译 24.71s、PID 45156。
+原生 760×520 / 400×360 直接观察右边界对齐，宽 More 指针打开 → Escape 返回 More 焦点；证据为 `header-spacing-native.txt`，没有本轮 73 项 / Clippy / 工作区重跑。
+新清单 `header-spacing-source-files.sha256` 共 176 文件，SHA-256 `80D26D6A6E0ECDF00828A56094240DEDE2A035B5FAB21BFC873FBC1FF96660DB`，构建后重检一致；内核 / runtime / Linux 测量代码未变。
+`header-spacing-dist.log` 客户端构建 3m04s，installer 4.54s 均成功；客户端 PE 0.3.0、17,956,352 字节，SHA-256 `D656B7FE238FE7F4107A81E39D08CDED674A0FD1AEFEED6EBE8D175CA30A2A78`。
+完整安装包 PE 0.3.0、**8,182,762 字节（8.182762 十进制 MB）**，SHA-256 `07D817D3A6E5ACD4CFA20AA4534E3A46B6FB8E83CF0544306614A0A318E1B98B`，严格小于 10 MB / 60 MB；服务端字节与哈希未变。
+`header-spacing-artifacts.json` 与更新的 `artifacts-final.json` 记录当前产物，dumpbin 无外部 CRT；打包不表示实际安装通过。
+最新 A PID 28592 / B PID 6716 复制运行哈希均匹配当前客户端，fresh AccessKit 均为本地 21943、大厅 2 人，A VAD / 等待说话、B PTT V / 等待 V；最终仅这两个客户端与隔离服务端 PID 41416 保留，离线 fixture 45156 已正常退出。
+真实宽窗口见 [native-header-spacing-760x520.png](design/rebuild/native-header-spacing-760x520.png)，SHA-256 `3F75E23BA4C4A0616FA28BCCA0E519B011BA1F07ECE843F4A4E6A19034ED16FD`，两端证据为 `header-spacing-runtime-views.json`；没有新增性能 trace、VAD 发送或声学测量结论。

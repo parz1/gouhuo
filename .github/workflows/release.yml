@@ -47,7 +47,7 @@ jobs:
         run: .\packaging\windows\build.ps1
 
       - name: 编服务端
-        run: cargo build --profile dist -p server --bin gouhuo-server
+        run: cargo build --locked --profile dist -p server --bin gouhuo-server
 
       - name: 建草稿 Release
         shell: pwsh

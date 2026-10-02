@@ -41,7 +41,7 @@ if (-not $iscc) { throw "找不到 Inno Setup 6 的 ISCC.exe。装一下：winge
 if (-not $SkipBuild) {
     # cargo 的进度写在 stderr 上；PowerShell 5.1 在 Stop 模式下会把它当成错误。
     $ErrorActionPreference = "Continue"
-    cargo build --profile dist -p client
+    cargo build --locked --profile dist -p client
     $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 }

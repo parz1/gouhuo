@@ -3,9 +3,9 @@
 
 //! 篝火客户端。
 //!
-//! 这个文件只做一件事：把 `client-core` 的状态搬到界面上，把界面的点击搬回去。
-//! **所有规则都不在这里** —— 能不能进、谁在哪个频道、消息怎么归属，
-//! 全在 `client-core` 和服务端，那些地方都有测试。
+//! 桌面组合根：连接事件更新 CallState，按钮提交 CallCommand，
+//! CallViewModel 投影状态，SlintAdapter 同步控件。窗口、设备选择、
+//! 身份和设置存储仍在桌面端；通话规则在 client-core / client-runtime。
 //!
 //! # 界面线程不碰网络
 //!
@@ -19,12 +19,18 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
+use call::SlintAdapter;
 use client_core::{Client, Ended, Event};
+use client_runtime::call::{
+    AudioViewModel, CallCommand, CallController, CallState, CallViewModel, CommandResult,
+};
+use client_runtime::self_state::ConnectionState;
+use client_runtime::{recovery, Devices, RuntimeHandle, RuntimeStage, StartVoice, VoiceRuntime};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::cue::{chime, Chime};
 use voice_core::identity::Identity;
-use voice_core::miccheck::{scan_microphones, MicCheck};
-use voice_core::pipeline::{default_jitter, Pipeline, PipelineConfig, TransmitMode};
+use voice_core::miccheck::scan_microphones_cancellable;
+use voice_core::pipeline::TransmitMode;
 use voice_core::tts::{speakable_name, Announcer};
 
 /// 多久去问一次语音链路的状态。
@@ -59,15 +65,20 @@ const FIRE_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 /// 窗口不在前台时（比如放在副屏上）火慢下来：4 帧，看得出在烧就够了。
 const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
+mod call;
 mod campfire;
 mod discover;
 mod join;
-mod recovery;
+mod platform_audio;
 mod settings;
 mod single_instance;
+mod ui_timing;
 mod update;
 
-use settings::{db_to_level, level_to_db, snap_volume, CloseAction, Settings, TalkMode};
+use settings::{
+    db_to_level, level_to_db, snap_volume, CloseAction, Settings, SettingsWriter,
+    SettingsWriterHandle, TalkMode,
+};
 use voice_core::hotkey::{Hotkeys, Key};
 
 slint::include_modules!();
@@ -165,6 +176,7 @@ fn show_fatal(message: &str) {
 const SIMULATE_WINDOW_FAILURE: &str = "GOUHUO_SIMULATE_WINDOW_FAILURE";
 
 fn run(instance_key: &str) -> Result<(), Failure> {
+    ui_timing::mark_frame(ui_timing::FramePhase::Startup);
     if std::env::var_os(SIMULATE_WINDOW_FAILURE).is_some()
         && std::env::var_os(FALLBACK_MARKER).is_none()
     {
@@ -172,7 +184,8 @@ fn run(instance_key: &str) -> Result<(), Failure> {
             "模拟的窗口失败".into(),
         )));
     }
-    let app = App::new().map_err(Failure::Window)?;
+    let app = ui_timing::measure("App::new", App::new).map_err(Failure::Window)?;
+    ui_timing::install_frame_probe(app.window());
 
     // 身份是本地的一对密钥，没有账号密码。第一次跑会生成一个。
     let (identity, first_run) = match load_identity() {
@@ -203,7 +216,6 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     } else {
         stored.nick.clone().into()
     });
-    app.set_ptt_mode(stored.talk_mode == TalkMode::PushToTalk);
     app.set_ptt_label(
         stored
             .ptt_key
@@ -223,9 +235,29 @@ fn run(instance_key: &str) -> Result<(), Failure> {
 
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
-    let state = Arc::new(Mutex::new(State::default()));
-    state.lock().expect("state poisoned").settings = stored;
+    let runtime = match VoiceRuntime::new(Arc::new(platform_audio::DesktopAudio)) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            show_fatal(&format!("语音运行线程无法启动：{error}"));
+            return Ok(());
+        }
+    };
+    runtime.handle().set_mode(transmit_mode(&stored));
+    let settings_writer = match SettingsWriter::start() {
+        Ok(writer) => writer,
+        Err(error) => {
+            show_fatal(&format!("设置保存线程无法启动：{error}"));
+            return Ok(());
+        }
+    };
+    let state = Arc::new(Mutex::new(State {
+        runtime: Some(runtime.handle()),
+        settings_writer: Some(settings_writer.handle()),
+        settings: stored,
+        ..State::default()
+    }));
 
+    sync_audio(&app, &state);
     wire_home(&app, &identity, &state);
     refresh_home(&app, &state);
     wire_actions(&app, &state);
@@ -281,6 +313,19 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     // 真正的退出走 quit_app。
     let result = slint::run_event_loop_until_quit();
     tear_down();
+    // Also persist drafts from a slider whose release event was interrupted
+    // by closing the window. Scheduling still performs no filesystem I/O.
+    state.lock().expect("state poisoned").persist_settings();
+    runtime.handle().shutdown();
+    settings_writer.shutdown();
+    // The event loop has ended; device cleanup can now be drained without
+    // freezing a visible window. RuntimeHandle itself never joins threads.
+    if !runtime.wait_stopped(std::time::Duration::from_secs(3)) {
+        eprintln!("音频设备仍在回收，退出等待已结束。");
+    }
+    if !settings_writer.wait_stopped(std::time::Duration::from_secs(3)) {
+        eprintln!("设置写入仍未完成，退出等待已结束。");
+    }
     result.map_err(Failure::EventLoop)?;
     Ok(())
 }
@@ -293,7 +338,7 @@ fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
         app.on_set_check_updates(move |on| {
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.check_updates = on;
-            let _ = locked.settings.save();
+            locked.persist_settings();
             if let Some(app) = weak.upgrade() {
                 app.set_check_updates(on);
             }
@@ -366,10 +411,15 @@ fn on_forwarded(app: &App, state: &Arc<Mutex<State>>, message: &str) {
 
     // 只认邀请链接，跟命令行参数一个规矩。
     let link = message.trim();
-    if !link.starts_with(protocol::URL_PREFIX) || app.get_connecting() {
+    if !link.starts_with(protocol::URL_PREFIX)
+        || call_connection(state) == ConnectionState::Connecting
+    {
         return;
     }
-    if app.get_connected() {
+    if matches!(
+        call_connection(state),
+        ConnectionState::Connected | ConnectionState::Reconnecting
+    ) {
         let current = state
             .lock()
             .expect("state poisoned")
@@ -447,22 +497,20 @@ fn dark_titlebar(_app: &App) {}
 #[derive(Default)]
 struct State {
     client: Option<Client>,
-    recovery: recovery::Recovery,
+    call: CallState,
+    recovery: client_runtime::health::CallHealth,
     recovery_epoch: Option<std::time::Instant>,
     recovery_history: std::collections::VecDeque<String>,
-    /// 语音链路。丢掉它就会把音频线程收干净。
-    voice: Option<Arc<Pipeline>>,
-    /// 没连服务器时的独立试麦。
-    ///
-    /// 跟 `voice` **永远不会同时存在** —— 两个都要开同一副耳机，
-    /// 虽然共享模式下不会打架，但麦克风会被采两遍，电平也会对不上。
-    mic_check: Option<Arc<MicCheck>>,
+    /// Commands/snapshots only. The portable runtime owns and retires audio.
+    runtime: Option<RuntimeHandle>,
     settings: Settings,
-    /// 采集流的把手：实际打开的设备叫什么。
-    capture: Option<voice_core::wasapi::CaptureDiagnostics>,
+    settings_writer: Option<SettingsWriterHandle>,
     /// 下拉框里第 n 项对应哪个设备 id。第 0 项是「系统默认」，所以是 None。
     capture_ids: Vec<Option<String>>,
     render_ids: Vec<Option<String>>,
+    device_generation: u64,
+    scan_generation: u64,
+    scan_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 念名字的后台线程。**第一次要念的时候才起** —— 大多数人不开这个功能，
     /// 不该为它常驻一个线程和一个语音合成引擎。
     announcer: Option<Announcer>,
@@ -482,6 +530,15 @@ struct State {
     /// 正在加入、或者刚失败的那个服务器不一定是最近用过的，也可能根本没存过 ——
     /// 这时候得把它摆在上面，不然「正在加入」「没能加入」说的是谁都不知道。
     hero: Option<Hero>,
+}
+
+impl State {
+    /// Queue a complete preference snapshot; disk I/O belongs to the writer.
+    fn persist_settings(&self) {
+        if let Some(writer) = &self.settings_writer {
+            writer.schedule(&self.settings);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -508,6 +565,8 @@ thread_local! {
     /// 首页上那堆火：近景，没有人围着。跟频道里那堆各烧各的 ——
     /// 两边画面大小不一样，共用一个的话每次切换都要重新点火。
     static HOME_FIRE: RefCell<campfire::Stage> = RefCell::new(campfire::Stage::close_up());
+    /// Width and height notifications are merged into one event-loop update.
+    static SCENE_RESIZE: RefCell<Option<(f32, f32)>> = const { RefCell::new(None) };
     /// 让火动起来的定时器。只在篝火真的看得见时跑，见 `fire_pace`。
     static FIRE_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
@@ -661,8 +720,9 @@ fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<State>>) {
                 locked.join_generation += 1;
                 locked.pending = None;
                 locked.hero = None;
+                locked.call.offline();
             }
-            app.set_connecting(false);
+            sync_audio(&app, &state);
             app.set_connect_stage("".into());
             app.set_home_mode(0);
             app.set_join_code("".into());
@@ -679,7 +739,7 @@ fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<State>>) {
             {
                 let mut locked = state.lock().expect("state poisoned");
                 locked.settings.forget_server(id.max(0) as usize);
-                let _ = locked.settings.save();
+                locked.persist_settings();
             }
             if let Some(app) = weak.upgrade() {
                 refresh_home(&app, &state);
@@ -752,7 +812,7 @@ fn begin_join(
     state: &Arc<Mutex<State>>,
     request: join::Request,
 ) {
-    if app.get_connecting() {
+    if call_connection(state) == ConnectionState::Connecting {
         return;
     }
     let nick = {
@@ -796,9 +856,10 @@ fn begin_join(
         locked.pending = None;
         locked.last_request = Some(request.clone());
         locked.hero = Some(hero);
+        locked.call.begin_join();
         (locked.join_generation, locked.settings.servers.clone())
     };
-    app.set_connecting(true);
+    sync_audio(app, state);
     app.set_connect_stage("正在准备…".into());
     app.set_home_mode(0);
     app.set_code_rejected(false);
@@ -854,7 +915,8 @@ fn finish_join(
         }
         return;
     }
-    app.set_connecting(false);
+    state.lock().expect("state poisoned").call.offline();
+    sync_audio(app, state);
     app.set_connect_stage("".into());
 
     match outcome {
@@ -1004,6 +1066,9 @@ fn on_connected(
     nick: &str,
     server: join::Known,
 ) {
+    let presented_at = std::time::Instant::now();
+    ui_timing::mark_frame(ui_timing::FramePhase::CallEnter);
+    app.invoke_reset_call_view();
     // 服务端可能改过昵称（重名会加后缀），以它给的为准。
     let actual = {
         let roster = client.roster();
@@ -1021,8 +1086,9 @@ fn on_connected(
         // （地址 + 固定的指纹 + 加入码），下次从首页一点就进。
         let mut locked = state.lock().expect("state poisoned");
         locked.client = Some(client.clone());
-        app.set_voice_notice("".into());
-        locked.recovery = recovery::Recovery::default();
+        locked.call.connected();
+        locked.call.set_notice("");
+        locked.recovery = client_runtime::health::CallHealth::default();
         locked.recovery_epoch = Some(std::time::Instant::now());
         locked.recovery_history.clear();
         locked.settings.nick = app.get_nick().to_string();
@@ -1032,7 +1098,7 @@ fn on_connected(
             server.page.as_deref(),
             unix_now(),
         );
-        let _ = locked.settings.save();
+        locked.persist_settings();
         locked.hero = None;
         locked.pending = None;
     }
@@ -1046,17 +1112,17 @@ fn on_connected(
     app.set_join_code("".into());
     clear_join_error(app);
     refresh_home(app, state);
-    app.set_connecting(false);
-    app.set_connected(true);
-    app.set_reconnecting("".into());
-    app.set_self_muted(false);
-    app.set_self_deafened(false);
-    app.set_voice_error("".into());
-    app.set_udp_ok(false);
-    app.set_udp_failed(false);
+    app.set_member_id(-1);
+    if let Some(runtime) = current_runtime(state) {
+        runtime.set_self_state(false, false);
+        runtime.set_transmitting(false);
+        runtime.set_monitoring(false);
+        runtime.clear_volumes();
+    }
     refresh(app, state, &client);
 
     start_voice(app, state, &client);
+    ui_timing::record("join result -> call state", presented_at.elapsed());
     pump_events(app.as_weak(), Arc::clone(state), client, events);
 }
 
@@ -1065,59 +1131,33 @@ fn on_connected(
 /// 设备打不开不该让人掉线 —— 文字和名单照样能用，只是没声音。所以这里
 /// 失败只是把原因显示出来，不动连接。
 fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
-    // 先把独立试麦停掉：两个都开的话麦克风会被采两遍。
-    stop_mic_check(state);
-    state.lock().expect("state poisoned").voice = None;
-
-    let (session_id, udp_port, keys) = client.voice_session();
-    let Some(addr) = resolve_voice_addr(client.server_host(), udp_port) else {
-        app.set_voice_error("服务器没给出语音端口".into());
+    // A scan owns a microphone until its background function returns. Starting
+    // a call cancels it and its completion resumes the latest session.
+    if cancel_scan(state) {
+        return;
+    }
+    let Some(runtime) = current_runtime(state) else {
         return;
     };
-
-    let mode = transmit_mode(&state.lock().expect("state poisoned").settings);
-    let cfg = PipelineConfig {
+    let (session_id, udp_port, keys) = client.voice_session();
+    let settings = state.lock().expect("state poisoned").settings.clone();
+    runtime.set_mode(transmit_mode(&settings));
+    // Replacements preserve local intent. Volumes are staged before admission
+    // so a candidate cannot send with stale/default controls.
+    apply_volumes(state, client);
+    runtime.start_voice(StartVoice {
+        host: client.server_host().to_string(),
+        udp_port,
         session_id,
-        server: addr,
         sequences: Arc::clone(&keys.sequences),
         upstream_key: *keys.upstream.as_bytes(),
         downstream_key: *keys.downstream.as_bytes(),
-        jitter: default_jitter(),
-        mode,
-    };
-
-    let (capture_id, render_id) = {
-        let locked = state.lock().expect("state poisoned");
-        (
-            locked.settings.capture_device.clone(),
-            locked.settings.render_device.clone(),
-        )
-    };
-    let capture = voice_core::wasapi::WasapiCapture::new(capture_id);
-    let diagnostics = capture.diagnostics();
-
-    match Pipeline::start(
-        cfg,
-        Box::new(capture),
-        Box::new(voice_core::wasapi::WasapiRender::new(render_id)),
-        audio_processor(),
-    ) {
-        Ok(pipeline) => {
-            // 新链路默认开麦开耳朵。界面上闭着的要原样带过去 —— 换设备、断线重连
-            // 都会走到这里，闭着麦换了个耳机就变成开麦，是会出事的那种 bug。
-            let deafened = app.get_self_deafened();
-            pipeline.set_deafened(deafened);
-            pipeline.set_muted(app.get_self_muted() || deafened);
-            {
-                let mut locked = state.lock().expect("state poisoned");
-                locked.voice = Some(Arc::new(pipeline));
-                locked.capture = Some(diagnostics);
-            }
-            // 新链路里所有人都是 100%。换设备、断线重连都会走到这里。
-            apply_volumes(state, client);
-        }
-        Err(e) => app.set_voice_error(format!("{e}").into()),
-    }
+        devices: Devices {
+            capture: settings.capture_device,
+            render: settings.render_device,
+        },
+    });
+    sync_audio(app, state);
 }
 
 /// 把设备列表灌进下拉框，并记下「第 n 项是哪个 id」。
@@ -1126,52 +1166,75 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
 /// 而且它是唯一在换了耳机之后还能跟着走的选项。
 fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
     use voice_core::wasapi::{list_endpoints, Direction};
-
-    for (direction, is_capture) in [(Direction::Capture, true), (Direction::Render, false)] {
-        let endpoints = list_endpoints(direction).unwrap_or_default();
-        let mut labels: Vec<SharedString> = vec!["系统默认".into()];
-        let mut ids: Vec<Option<String>> = vec![None];
-        for endpoint in endpoints {
-            // 标出虚拟声卡。玩家机器上这类设备极多，而「没声音」十有八九
-            // 就是选中了一个没在路由的虚拟麦。
-            let suffix = if endpoint.is_hardware {
-                ""
-            } else {
-                "（虚拟）"
-            };
-            labels.push(format!("{}{suffix}", endpoint.name).into());
-            ids.push(Some(endpoint.id));
-        }
-
-        let saved = {
-            let locked = state.lock().expect("state poisoned");
-            if is_capture {
-                locked.settings.capture_device.clone()
-            } else {
-                locked.settings.render_device.clone()
-            }
-        };
-        let index = ids
-            .iter()
-            .position(|id| *id == saved)
-            // 存下来的设备没了（拔了耳机、换了机器）就退回「系统默认」，
-            // 跟 open_or_default 的行为一致。
-            .unwrap_or(0) as i32;
-
-        let model = ModelRc::new(VecModel::from(labels));
+    let generation = {
         let mut locked = state.lock().expect("state poisoned");
-        if is_capture {
-            locked.capture_ids = ids;
-            drop(locked);
-            app.set_capture_devices(model);
-            app.set_capture_index(index);
-        } else {
-            locked.render_ids = ids;
-            drop(locked);
-            app.set_render_devices(model);
-            app.set_render_index(index);
+        locked.device_generation = locked.device_generation.wrapping_add(1);
+        if locked.capture_ids.is_empty() {
+            locked.capture_ids.push(None);
+            locked.render_ids.push(None);
+            app.set_capture_devices(ModelRc::new(VecModel::from(vec!["系统默认".into()])));
+            app.set_render_devices(ModelRc::new(VecModel::from(vec!["系统默认".into()])));
         }
-    }
+        locked.device_generation
+    };
+    let weak = app.as_weak();
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        let at = std::time::Instant::now();
+        let lists: Vec<_> = [Direction::Capture, Direction::Render]
+            .into_iter()
+            .map(|direction| {
+                let mut labels = vec![String::from("系统默认")];
+                let mut ids = vec![None];
+                for endpoint in list_endpoints(direction).unwrap_or_default() {
+                    labels.push(format!(
+                        "{}{}",
+                        endpoint.name,
+                        if endpoint.is_hardware {
+                            ""
+                        } else {
+                            "（虚拟）"
+                        }
+                    ));
+                    ids.push(Some(endpoint.id));
+                }
+                (labels, ids)
+            })
+            .collect();
+        ui_timing::record("device enumeration (background)", at.elapsed());
+        let _ = weak.upgrade_in_event_loop(move |app| {
+            let mut locked = state.lock().expect("state poisoned");
+            if generation != locked.device_generation {
+                return;
+            }
+            let mut models = Vec::new();
+            for (is_capture, (labels, ids)) in [true, false].into_iter().zip(lists) {
+                let saved = if is_capture {
+                    &locked.settings.capture_device
+                } else {
+                    &locked.settings.render_device
+                };
+                let index = ids.iter().position(|id| id == saved).unwrap_or(0) as i32;
+                let labels: Vec<SharedString> = labels.into_iter().map(Into::into).collect();
+                models.push((is_capture, index, ModelRc::new(VecModel::from(labels))));
+                if is_capture {
+                    locked.capture_ids = ids;
+                } else {
+                    locked.render_ids = ids;
+                }
+            }
+            drop(locked);
+            for (is_capture, index, model) in models {
+                if is_capture {
+                    app.set_capture_devices(model);
+                    app.set_capture_index(index);
+                } else {
+                    app.set_render_devices(model);
+                    app.set_render_index(index);
+                }
+            }
+        });
+    });
 }
 
 /// 换设备。链路要重起 —— WASAPI 的流是绑在设备上的，换不了。
@@ -1179,50 +1242,16 @@ fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
 /// 重起会让声音断一下（几十毫秒）。这是换设备本来就该有的代价，
 /// 比为了热切换在音频线程里加一套状态机划算得多。
 fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
-    if !app.get_reconnecting().is_empty() {
+    if call_connection(state) == ConnectionState::Reconnecting {
         return;
     }
-    let client = state.lock().expect("state poisoned").client.clone();
-    let Some(client) = client else {
-        // 没连服务器：重起的是独立试麦。
-        let was_monitoring = {
-            let locked = state.lock().expect("state poisoned");
-            locked
-                .mic_check
-                .as_ref()
-                .map(|m| m.is_monitoring())
-                .unwrap_or(false)
-        };
-        stop_mic_check(state);
-        app.set_capture_in_use("".into());
+    if cancel_scan(state) {
+        return;
+    }
+    if let Some(client) = current(state) {
+        start_voice(app, state, &client);
+    } else {
         start_mic_check(app, state);
-        if was_monitoring {
-            if let Some(mic) = state.lock().expect("state poisoned").mic_check.clone() {
-                mic.set_monitoring(true);
-            }
-        }
-        return;
-    };
-
-    let was_monitoring = current_voice(state)
-        .map(|v| v.is_monitoring())
-        .unwrap_or(false);
-    {
-        let mut locked = state.lock().expect("state poisoned");
-        // 先丢掉旧的再起新的：同一个设备不能开两路，而且旧链路的线程
-        // 还占着那个设备。
-        locked.voice = None;
-        locked.capture = None;
-    }
-    app.set_voice_error("".into());
-    app.set_udp_ok(false);
-    app.set_udp_failed(false);
-    app.set_capture_in_use("".into());
-    start_voice(app, state, &client);
-    if was_monitoring {
-        if let Some(voice) = current_voice(state) {
-            voice.set_monitoring(true);
-        }
     }
 }
 
@@ -1240,22 +1269,63 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
     let weak = app.as_weak();
     app.on_scan_microphones(move || {
         let Some(app) = weak.upgrade() else { return };
-        if app.get_scanning() {
+        // A scan is an offline device operation. It must not compete with a
+        // live call; changing a call's microphone uses the runtime instead.
+        if app.get_scanning() || current(&state).is_some() {
             return;
         }
+        stop_mic_check(&state);
+        let draining = current_runtime(&state).map(|runtime| {
+            let id = runtime.snapshot().request_id;
+            (runtime, id)
+        });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.scan_generation = locked.scan_generation.wrapping_add(1);
+            locked.scan_cancel = Some(Arc::clone(&cancel));
+            locked.scan_generation
+        };
         app.set_scanning(true);
         app.set_scan_results(ModelRc::new(VecModel::from(Vec::<ScanRow>::new())));
-
-        // 检测要挨个打开设备，跟正在跑的试麦抢同一个麦克风。先停掉。
-        let was_checking = state.lock().expect("state poisoned").mic_check.is_some();
-        stop_mic_check(&state);
-
         let weak = app.as_weak();
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
-            let results = scan_microphones(SCAN_PER_DEVICE);
+            let ready = draining.is_none_or(|(runtime, id)| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return false;
+                    }
+                    let snapshot = runtime.snapshot();
+                    if snapshot.request_id != id {
+                        return false;
+                    }
+                    if snapshot.stage == RuntimeStage::Idle {
+                        return true;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            });
+            let results = if ready {
+                scan_microphones_cancellable(SCAN_PER_DEVICE, Arc::clone(&cancel))
+            } else {
+                Vec::new()
+            };
+            // The scanner has dropped its capture on its own thread before
+            // posting completion. Only now may the newest requested audio start.
             let _ = weak.upgrade_in_event_loop(move |app| {
-                let rows: Vec<ScanRow> = results
+                {
+                    let mut locked = state.lock().expect("state poisoned");
+                    if generation != locked.scan_generation {
+                        return;
+                    }
+                    locked.scan_cancel = None;
+                }
+                let rows = results
                     .iter()
                     .map(|result| ScanRow {
                         name: format!(
@@ -1272,10 +1342,14 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
                         ok: result.hears_something(),
                         id: result.id.clone().into(),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
                 app.set_scan_results(ModelRc::new(VecModel::from(rows)));
                 app.set_scanning(false);
-                if was_checking {
+                if let Some(client) = current(&state) {
+                    if call_connection(&state) == ConnectionState::Connected {
+                        start_voice(&app, &state, &client);
+                    }
+                } else if app.get_show_settings() {
                     start_mic_check(&app, &state);
                 }
             });
@@ -1310,8 +1384,7 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
         app.get_self_muted(),
         app.get_self_deafened()
     );
-    if let Some(voice) = &locked.voice {
-        let stats = voice.stats();
+    if let Some(stats) = locked.runtime.as_ref().and_then(|r| r.snapshot().voice) {
         text.push_str(&format!(
             "UDP：{} / RTT：{:.1} ms
 发送包：{} / 收到包：{} / 播放等待：{}
@@ -1353,6 +1426,21 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
             text.push('\n');
         }
     }
+    text.push_str("本地 UI 阶段（事件处理耗时，非整帧耗时）：\n");
+    for phase in ui_timing::snapshot() {
+        text.push_str(&phase);
+        text.push('\n');
+    }
+    if let Some(snapshot) = locked.runtime.as_ref().map(RuntimeHandle::snapshot) {
+        text.push_str(&format!("语音后台阶段：{:?}\n", snapshot.timings));
+    }
+    if let Some(error) = locked
+        .settings_writer
+        .as_ref()
+        .and_then(SettingsWriterHandle::last_error)
+    {
+        text.push_str(&format!("设置保存失败：{error}\n"));
+    }
     text
 }
 
@@ -1384,7 +1472,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
         app.on_set_cue_sounds(move |on| {
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.cue_sounds = on;
-            let _ = locked.settings.save();
+            locked.persist_settings();
             if let Some(app) = weak.upgrade() {
                 app.set_cue_sounds(on);
             }
@@ -1397,7 +1485,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
         app.on_set_announce_names(move |on| {
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.announce_names = on;
-            let _ = locked.settings.save();
+            locked.persist_settings();
             if let Some(app) = weak.upgrade() {
                 app.set_announce_names(on);
             }
@@ -1415,7 +1503,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
     {
         let state = Arc::clone(state);
         app.on_save_cue_volume(move || {
-            let _ = state.lock().expect("state poisoned").settings.save();
+            state.lock().expect("state poisoned").persist_settings();
         });
     }
 
@@ -1440,7 +1528,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
                 let mut locked = state.lock().expect("state poisoned");
                 let id = locked.capture_ids.get(index as usize).cloned().flatten();
                 locked.settings.capture_device = id;
-                let _ = locked.settings.save();
+                locked.persist_settings();
             }
             restart_voice(&app, &state);
         });
@@ -1456,7 +1544,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
             {
                 let mut locked = state.lock().expect("state poisoned");
                 locked.settings.capture_device = Some(id.clone());
-                let _ = locked.settings.save();
+                locked.persist_settings();
             }
             // 下拉框跟着走。对不上就保持原样 —— 真正生效的是上面存的 id，
             // 下拉框显示得对不对只是好看不好看的事。
@@ -1482,7 +1570,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
                 let mut locked = state.lock().expect("state poisoned");
                 let id = locked.render_ids.get(index as usize).cloned().flatten();
                 locked.settings.render_device = id;
-                let _ = locked.settings.save();
+                locked.persist_settings();
             }
             restart_voice(&app, &state);
         });
@@ -1493,38 +1581,30 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
         let weak = app.as_weak();
         app.on_toggle_monitor(move || {
             let Some(app) = weak.upgrade() else { return };
-            let (voice, mic) = {
-                let locked = state.lock().expect("state poisoned");
-                (locked.voice.clone(), locked.mic_check.clone())
+            let Some(runtime) = current_runtime(&state) else {
+                return;
             };
-            let on = match (&voice, &mic) {
-                (Some(voice), _) => {
-                    let on = !voice.is_monitoring();
-                    voice.set_monitoring(on);
-                    on
-                }
-                (None, Some(mic)) => {
-                    let on = !mic.is_monitoring();
-                    mic.set_monitoring(on);
-                    on
-                }
-                (None, None) => return,
-            };
-            app.set_monitoring(on);
+            let on = !runtime.is_monitoring();
+            runtime.set_monitoring(on);
+            sync_audio(&app, &state);
         });
     }
 
     {
         let state = Arc::clone(state);
+        let weak = app.as_weak();
         app.on_set_vad(move |level| {
             let mode = {
                 let mut locked = state.lock().expect("state poisoned");
                 locked.settings.vad_threshold_db = level_to_db(level);
-                let _ = locked.settings.save();
+                locked.persist_settings();
                 transmit_mode(&locked.settings)
             };
-            if let Some(voice) = current_voice(&state) {
+            if let Some(voice) = current_runtime(&state) {
                 voice.set_mode(mode);
+            }
+            if let Some(app) = weak.upgrade() {
+                sync_audio(&app, &state);
             }
         });
     }
@@ -1543,6 +1623,7 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
                 // 关掉设置就把设备还回去。常驻几小时的软件不该一直占着麦克风，
                 // 而且麦克风灯一直亮着会让人不安。
                 stop_mic_check(&state);
+                sync_audio(&app, &state);
             }
         });
     }
@@ -1552,7 +1633,6 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
         let weak = app.as_weak();
         app.on_set_ptt_mode(move |ptt| {
             let Some(app) = weak.upgrade() else { return };
-            app.set_ptt_mode(ptt);
             let mode = {
                 let mut locked = state.lock().expect("state poisoned");
                 locked.settings.talk_mode = if ptt {
@@ -1560,13 +1640,14 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
                 } else {
                     TalkMode::VoiceActivity
                 };
-                let _ = locked.settings.save();
+                locked.persist_settings();
                 transmit_mode(&locked.settings)
             };
             // 链路不用重起，下一帧就按新方式走。
-            if let Some(voice) = current_voice(&state) {
+            if let Some(voice) = current_runtime(&state) {
                 voice.set_mode(mode);
             }
+            sync_audio(&app, &state);
         });
     }
 
@@ -1614,18 +1695,13 @@ fn spawn_ptt_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>, hotkeys: Rc<
             app.set_ptt_label(key.label().into());
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.ptt_key = Some(key);
-            let _ = locked.settings.save();
+            locked.persist_settings();
             return;
         }
 
         // 按住说话：把键的状态推给链路。
-        let Some(voice) = current_voice(&state) else {
-            return;
-        };
-        if app.get_ptt_mode() && app.get_reconnecting().is_empty() {
-            let down = hotkeys.is_down();
-            voice.set_transmitting(down);
-            app.set_transmitting(down && app.get_voice_notice().is_empty());
+        if let Some(runtime) = current_runtime(&state) {
+            CallController::set_ptt(&runtime, call_connection(&state), hotkeys.is_down());
         }
     });
     PTT_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
@@ -1641,24 +1717,6 @@ fn transmit_mode(settings: &Settings) -> TransmitMode {
     }
 }
 
-/// 回声消除 / 降噪 / 自动增益。
-fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
-    use voice_core::apm::{Apm, ApmConfig};
-    // APM 起不来不该让语音也用不了。戴耳机的人根本不需要它。
-    match Apm::new(voice_core::audio::SAMPLE_RATE, ApmConfig::default()) {
-        Ok(apm) => Some(Box::new(apm)),
-        Err(_) => None,
-    }
-}
-
-fn resolve_voice_addr(host: &str, udp_port: u16) -> Option<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    if udp_port == 0 {
-        return None;
-    }
-    (host, udp_port).to_socket_addrs().ok()?.next()
-}
-
 /// 定时把音频状态搬到界面上。**整个程序只有一个**，连着和没连着都靠它。
 ///
 /// 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，省掉一次跨线程投递，
@@ -1667,20 +1725,23 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, VOICE_POLL, move || {
         let Some(app) = weak.upgrade() else { return };
-        let (voice, mic_check, client, capture) = {
+        let (runtime, client, ptt_bound, call) = {
             let locked = state.lock().expect("state poisoned");
             (
-                locked.voice.clone(),
-                locked.mic_check.clone(),
+                locked.runtime.clone(),
                 locked.client.clone(),
-                locked.capture.clone(),
+                locked.settings.ptt_key.is_some(),
+                locked.call.clone(),
             )
         };
-        update_tray(&app, client.as_ref());
+        let Some(runtime) = runtime else { return };
+        let snapshot = runtime.snapshot();
+        let reconnecting = call.connection() == ConnectionState::Reconnecting;
+        let mut view = CallViewModel::project_audio(&call, &snapshot, ptt_bound);
+        SlintAdapter::apply_audio(&app, &view);
+        update_tray(&view, client.as_ref());
 
-        // 按住说话的定时器只在真用得着的时候跑。收在托盘里、用按住说话打游戏时
-        // 它照跑 —— 那正是它最要紧的时候。
-        let ptt_needed = app.get_rebinding() || (voice.is_some() && app.get_ptt_mode());
+        let ptt_needed = app.get_rebinding() || (client.is_some() && view.self_state.ptt_mode);
         PTT_TIMER.with(|slot| {
             if let Some(timer) = slot.borrow().as_ref() {
                 if ptt_needed && !timer.running() {
@@ -1690,13 +1751,7 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 }
             }
         });
-
-        // 窗口看不见就只管托盘，界面同步放慢。窗口开着但没什么在动的时候
-        // （没进频道、也没在试麦 —— 登录页）同样放慢：电平条、说话指示都没有。
         let hidden = !app.window().is_visible() || app.window().is_minimized();
-
-        // 篝火该动就把火的定时器开起来（停是它自己停的，见 spawn_fire）。
-        // 这里最慢半秒看一次，所以窗口恢复、游戏切走之后，火最多愣半秒才动。
         if !hidden && fire_pace(&app).is_some() {
             FIRE_TIMER.with(|slot| {
                 if let Some(timer) = slot.borrow().as_ref() {
@@ -1706,8 +1761,7 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 }
             });
         }
-
-        let idle = voice.is_none() && mic_check.is_none();
+        let idle = snapshot.stage == RuntimeStage::Idle;
         let interval = if hidden || idle {
             BACKGROUND_POLL
         } else {
@@ -1720,60 +1774,37 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 }
             }
         });
-        // Health checks keep running in the tray. Only visual metering may be skipped.
-        if client.is_some() && app.get_reconnecting().is_empty() {
-            let stats = voice.as_ref().map(|v| v.stats());
-            let device_error = stats.as_ref().is_some_and(|s| s.error.is_some())
-                || (voice.is_none() && !app.get_voice_error().is_empty());
-            let healthy = stats
-                .as_ref()
-                .is_some_and(|s| s.udp_ok && s.error.is_none() && !s.sequences_exhausted);
-            let failed = device_error || stats.as_ref().is_some_and(|s| s.udp_failed);
-            if let Some(stats) = &stats {
-                app.set_udp_ok(stats.udp_ok);
-                app.set_udp_failed(stats.udp_failed);
-                if let Some(error) = &stats.error {
-                    app.set_voice_error(error.clone().into());
-                }
-            }
-            let action = {
+        // Health policy has no Slint/window dependencies and runs in the tray too.
+        if client.is_some() {
+            let health = {
                 let mut locked = state.lock().expect("state poisoned");
                 let now = locked
                     .recovery_epoch
                     .get_or_insert_with(std::time::Instant::now)
                     .elapsed();
-                locked.recovery.tick(now, healthy, failed, device_error)
+                locked.recovery.tick(now, &snapshot, reconnecting)
             };
-            if let Some(action) = &action {
-                let snapshot = stats
-                    .as_ref()
-                    .map(|s| {
-                        format!(
-                            " UDP={} sent={} received={} error={:?}",
-                            s.udp_ok, s.packets_sent, s.packets_received, s.error
-                        )
-                    })
-                    .unwrap_or_default();
-                record_recovery(&state, &format!("{action:?}{snapshot}"));
+            if let Some(notice) = health.notice {
+                let call = {
+                    let mut locked = state.lock().expect("state poisoned");
+                    locked.call.set_notice(notice);
+                    locked.call.clone()
+                };
+                view = CallViewModel::project_audio(&call, &snapshot, ptt_bound);
+                SlintAdapter::apply_audio(&app, &view);
+                update_tray(&view, client.as_ref());
             }
-            match action {
-                Some(recovery::Action::Lost) => {
-                    connection_notice(&state, false);
-                    app.set_voice_notice("语音已中断，正在自动恢复；你的话可能无法送达。".into());
-                    app.set_transmitting(false);
-                }
-                Some(recovery::Action::Recovered) => {
-                    connection_notice(&state, true);
-                    app.set_voice_notice("".into());
-                }
+            if let Some(action) = &health.action {
+                record_recovery(&state, &format!("{action:?}; stage={:?}", snapshot.stage));
+            }
+            match health.action {
+                Some(recovery::Action::Lost) => connection_notice(&state, false),
+                Some(recovery::Action::Recovered) => connection_notice(&state, true),
                 Some(recovery::Action::RetryVoice) => {
-                    app.set_voice_notice("正在重试语音，恢复后会播放提示音。".into());
-                    drop(voice); // Release the polling snapshot before replacing audio devices.
                     restart_voice(&app, &state);
                     return;
                 }
                 Some(recovery::Action::Reconnect) => {
-                    app.set_voice_notice("语音持续异常，正在重新连接服务器。".into());
                     if let Some(client) = &client {
                         client.reconnect_transport();
                     }
@@ -1782,54 +1813,8 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 None => {}
             }
         }
-        if hidden || !app.get_reconnecting().is_empty() {
-            return;
-        }
-
-        // 实际用的是哪个设备、是不是虚拟声卡。两条路共用同一个把手。
-        if let Some(capture) = capture {
-            if capture.has_opened() {
-                app.set_capture_in_use(capture.device_name().into());
-                app.set_capture_is_virtual(capture.is_virtual());
-            }
-        }
-
-        if let Some(voice) = voice {
-            let stats = voice.stats();
-            app.set_udp_failed(stats.udp_failed);
-            if stats.sequences_exhausted {
-                app.set_voice_error(
-                    "语音加密序号已用尽。请退出服务器后重新加入，以更换密钥。".into(),
-                );
-            } else if let Some(error) = &stats.error {
-                app.set_voice_error(error.clone().into());
-            }
-            app.set_udp_ok(stats.udp_ok);
-            app.set_input_level(db_to_level(stats.input_db));
-            app.set_monitoring(voice.is_monitoring());
-            app.set_transmitting(
-                app.get_voice_notice().is_empty()
-                    && stats.error.is_none()
-                    && stats.udp_ok
-                    && transmitting_now(&app, &voice, stats.input_db),
-            );
-            if let Some(client) = client {
-                update_speaking(&app, &client, &stats.speaking);
-            }
-        } else if let Some(mic) = mic_check {
-            app.set_input_level(db_to_level(mic.input_db()));
-            app.set_monitoring(mic.is_monitoring());
-            // 没连服务器时「在不在发」没有意义，但电平条要靠它变色 ——
-            // 用跟语音激活一样的判据，这样调灵敏度时看到的效果是真的。
-            let threshold = state
-                .lock()
-                .expect("state poisoned")
-                .settings
-                .vad_threshold_db;
-            app.set_transmitting(!app.get_ptt_mode() && mic.input_db() > threshold);
-            if let Some(error) = mic.error() {
-                app.set_voice_error(error.into());
-            }
+        if !hidden {
+            SlintAdapter::apply_activity(&app, &view);
         }
     });
     VOICE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
@@ -1837,97 +1822,44 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
 
 /// 开一次独立试麦（没连服务器的时候用）。
 fn start_mic_check(app: &App, state: &Arc<Mutex<State>>) {
-    if state.lock().expect("state poisoned").voice.is_some() {
-        // 已经连上了，语音链路就在跑，用它的电平。
+    if current(state).is_some() {
         return;
     }
-    let (capture_id, render_id) = {
-        let locked = state.lock().expect("state poisoned");
-        (
-            locked.settings.capture_device.clone(),
-            locked.settings.render_device.clone(),
-        )
-    };
-    let capture = voice_core::wasapi::WasapiCapture::new(capture_id);
-    let diagnostics = capture.diagnostics();
-    app.set_voice_error("".into());
-
-    match MicCheck::start(
-        Box::new(capture),
-        Box::new(voice_core::wasapi::WasapiRender::new(render_id)),
-        audio_processor(),
-    ) {
-        Ok(check) => {
-            let mut locked = state.lock().expect("state poisoned");
-            locked.mic_check = Some(Arc::new(check));
-            locked.capture = Some(diagnostics);
-        }
-        Err(e) => app.set_voice_error(format!("{e}").into()),
+    if state.lock().expect("state poisoned").scan_cancel.is_some() {
+        return;
     }
+    let Some(runtime) = current_runtime(state) else {
+        return;
+    };
+    let settings = state.lock().expect("state poisoned").settings.clone();
+    runtime.start_mic_check(Devices {
+        capture: settings.capture_device,
+        render: settings.render_device,
+    });
+    sync_audio(app, state);
 }
 
 /// 停掉独立试麦。连服务器之前必须停 —— 不然麦克风会被采两遍。
 fn stop_mic_check(state: &Arc<Mutex<State>>) {
-    let mut locked = state.lock().expect("state poisoned");
-    locked.mic_check = None;
-}
-
-/// 现在这一刻在不在往外发。
-///
-/// 自己说话服务端不会转回来，所以这个只能在本地算。它跟链路里那段判断
-/// 是同一套规则 —— 两边写法不一样的话，界面显示「正在发送」而实际没发，
-/// 是最让人摸不着头脑的那种 bug。
-fn transmitting_now(app: &App, voice: &Pipeline, input_db: f32) -> bool {
-    match voice.mode() {
-        TransmitMode::Always => true,
-        TransmitMode::PushToTalk => app.get_transmitting(),
-        TransmitMode::VoiceActivity { threshold_db } => input_db > threshold_db,
+    cancel_scan(state);
+    // Closing Settings during a call keeps the call's runtime alive.
+    if current(state).is_none() {
+        if let Some(runtime) = current_runtime(state) {
+            runtime.stop();
+            runtime.set_monitoring(false);
+        }
     }
 }
 
-/// 只改「谁在说话」那一列，不整个重建列表。
-///
-/// 这件事每秒发生五次，而整个重建会让列表的滚动位置跳回顶上。
-fn update_speaking(app: &App, client: &Client, speaking: &[u32]) {
-    let rows = app.get_rows();
-    let me = client.roster().me;
-    for i in 0..rows.row_count() {
-        let Some(mut row) = rows.row_data(i) else {
-            continue;
-        };
-        if row.is_channel {
-            continue;
-        }
-        // 自己说没说话服务端不会转回来，所以自己那一行永远不亮。
-        // 要亮的话得看本地有没有在发 —— 等按键说话做出来再说。
-        let now = speaking.contains(&(row.id as u32)) && row.id as u32 != me;
-        if row.speaking != now {
-            row.speaking = now;
-            rows.set_row_data(i, row);
-        }
-    }
-
-    // 篝火那边同样只改变了的。自己那块石头看的是「在不在发声」，界面自己管。
-    let mut waiting_talking = false;
-    for (model, is_waiting) in [(app.get_seats(), false), (app.get_waiting(), true)] {
-        for i in 0..model.row_count() {
-            let Some(mut seat) = model.row_data(i) else {
-                continue;
-            };
-            let now = seat.present && speaking.contains(&(seat.id as u32)) && seat.id as u32 != me;
-            waiting_talking |= is_waiting && now;
-            if seat.speaking != now {
-                seat.speaking = now;
-                model.set_row_data(i, seat);
-            }
-        }
-    }
-    if app.get_waiting_talking() != waiting_talking {
-        app.set_waiting_talking(waiting_talking);
+fn cancel_scan(state: &Arc<Mutex<State>>) -> bool {
+    if let Some(cancel) = &state.lock().expect("state poisoned").scan_cancel {
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        true
+    } else {
+        false
     }
 }
 
-/// 把事件从读线程搬到界面线程。
 fn pump_events(
     weak: slint::Weak<App>,
     state: Arc<Mutex<State>>,
@@ -1954,6 +1886,7 @@ fn pump_events(
                     Event::Reconnecting {
                         attempt, reason, ..
                     } => {
+                        ui_timing::mark_frame(ui_timing::FramePhase::Reconnecting);
                         record_recovery(
                             &state,
                             &format!("TCP reconnect attempt={attempt}: {reason}"),
@@ -1966,6 +1899,7 @@ fn pump_events(
                                 .recovery_epoch
                                 .get_or_insert_with(std::time::Instant::now)
                                 .elapsed();
+                            locked.call.reconnecting(attempt, reason);
                             locked.recovery.interrupt(now)
                         };
                         if let Some(voice) = current_voice(&state) {
@@ -1974,18 +1908,16 @@ fn pump_events(
                         if first {
                             connection_notice(&state, false);
                         }
-                        app.set_udp_ok(false);
-                        app.set_udp_failed(false);
-                        app.set_transmitting(false);
-                        app.set_input_level(0.0);
-                        app.set_reconnecting(
-                            format!("连接断了，正在自动重连（第 {attempt} 次）。\n{reason}").into(),
-                        );
+                        sync_audio(&app, &state);
                     }
                     Event::Reconnected => {
+                        ui_timing::mark_frame(ui_timing::FramePhase::Reconnected);
                         record_recovery(&state, "TCP connected; waiting for voice probe");
-                        app.set_reconnecting("".into());
-                        app.set_voice_error("".into());
+                        {
+                            let mut locked = state.lock().expect("state poisoned");
+                            locked.call.connected();
+                            locked.call.set_notice("服务器已连接，正在验证语音…");
+                        }
                         // 服务端可能又给改了名（重名加后缀），以它为准。
                         let actual = {
                             let roster = client.roster();
@@ -1994,9 +1926,12 @@ fn pump_events(
                         if !actual.is_empty() {
                             app.set_nick(actual.into());
                         }
+                        app.set_member_id(-1);
+                        if let Some(runtime) = current_runtime(&state) {
+                            runtime.clear_volumes();
+                        }
                         refresh(&app, &state, &client);
                         // 会话 id、端口、密钥全换了，语音链路只能按新的重起。
-                        app.set_voice_notice("服务器已连接，正在验证语音…".into());
                         start_voice(&app, &state, &client);
                     }
                     Event::Disconnected(ended) => {
@@ -2010,23 +1945,20 @@ fn pump_events(
                             return;
                         }
                         locked.client = None;
-                        // 丢掉链路会 join 掉所有音频线程。**必须做** ——
-                        // 留着的话麦克风还开着，而用户已经不在频道里了。
-                        let retiring = locked.voice.take();
+                        locked.call.offline();
+                        let runtime = locked.runtime.clone();
                         let play_notice = matches!(&ended, Ended::Refused { .. });
                         drop(locked);
-                        if let Some(voice) = retiring {
-                            voice.quiesce();
+                        if let Some(runtime) = runtime {
+                            runtime.quiesce();
                             if play_notice {
-                                std::thread::spawn(move || {
-                                    std::thread::sleep(std::time::Duration::from_millis(400));
-                                    drop(voice);
-                                });
+                                runtime.stop_after(std::time::Duration::from_millis(400));
+                            } else {
+                                runtime.stop();
                             }
                         }
-                        app.set_voice_notice("".into());
-                        app.set_connected(false);
-                        app.set_reconnecting("".into());
+                        app.invoke_reset_call_view();
+                        sync_audio(&app, &state);
                         // 回到首页。「上次」那几个字要重算 —— 刚离开的这个现在是「刚刚」。
                         refresh_home(&app, &state);
                         match ended {
@@ -2075,9 +2007,9 @@ fn record_recovery(state: &Arc<Mutex<State>>, message: &str) {
 fn connection_notice(state: &Arc<Mutex<State>>, recovered: bool) {
     let locked = state.lock().expect("state poisoned");
     if locked.settings.cue_sounds {
-        if let Some(voice) = &locked.voice {
-            voice.cues().clear();
-            voice.cues().push(
+        if let Some(sink) = locked.runtime.as_ref().and_then(RuntimeHandle::cues) {
+            sink.clear();
+            sink.push(
                 &voice_core::cue::connection_chime(recovered),
                 locked.settings.cue_volume as f32 / 100.0,
             );
@@ -2092,10 +2024,11 @@ fn connection_notice(state: &Arc<Mutex<State>>, recovered: bool) {
 /// 两个都没有就不响：没有地方可以放。
 fn announce(state: &Arc<Mutex<State>>, kind: Chime, name: &str, preview: bool) {
     let mut locked = state.lock().expect("state poisoned");
-    let sink = match (&locked.voice, &locked.mic_check) {
-        (Some(voice), _) => voice.cues(),
-        (None, Some(mic)) if preview => mic.cues(),
-        _ => return,
+    if locked.client.is_none() && !preview {
+        return;
+    }
+    let Some(sink) = locked.runtime.as_ref().and_then(RuntimeHandle::cues) else {
+        return;
     };
     let settings = &locked.settings;
     let gain = settings.cue_volume as f32 / 100.0;
@@ -2133,7 +2066,7 @@ fn volume_key(public_key: &[u8]) -> String {
 fn apply_volumes(state: &Arc<Mutex<State>>, client: &Client) {
     let (voice, settings) = {
         let locked = state.lock().expect("state poisoned");
-        let Some(voice) = locked.voice.clone() else {
+        let Some(voice) = locked.runtime.clone() else {
             return;
         };
         (voice, locked.settings.clone())
@@ -2150,140 +2083,33 @@ fn apply_volumes(state: &Arc<Mutex<State>>, client: &Client) {
 
 /// 重画左边的树和右边的聊天。
 ///
-/// 每次事件都整个重建列表，不做增量。20 个人几十条消息，重建的代价
-/// 完全测不出来；而增量更新是「名单和实际对不上」这类 bug 的主要来源。
+/// 每次事件投影完整业务快照；适配器保持模型身份，只通知变化的行。
 fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
-    // 先把要用的设置拷出来再去拿名单的锁。**不同时持有两把** ——
-    // 别的地方有先拿名单再拿 state 的，两把一起拿迟早死锁。
-    let settings = state.lock().expect("state poisoned").settings.clone();
+    // Never nest the State and Roster locks; transport events can take either.
+    let (settings, call, runtime) = {
+        let locked = state.lock().expect("state poisoned");
+        (
+            locked.settings.clone(),
+            locked.call.clone(),
+            locked.runtime.clone(),
+        )
+    };
+    let Some(runtime) = runtime else { return };
     apply_volumes(state, client);
-
-    let roster = client.roster();
-
-    let mut rows: Vec<Row> = Vec::new();
-    for node in roster.tree() {
-        let members = roster.users_in(node.channel.id);
-        rows.push(Row {
-            is_channel: true,
-            id: node.channel.id as i32,
-            name: node.channel.name.clone().into(),
-            depth: node.depth as i32,
-            muted: false,
-            deafened: false,
-            speaking: false,
-            is_me: false,
-            is_current: node.channel.id == roster.my_channel(),
-            count: members.len() as i32,
-            can_delete: roster.can_delete_channel(node.channel.id),
-            volume: 100,
-            role: 0,
-            can_kick: false,
-            can_ban: false,
-            can_set_role: false,
-            can_edit: roster.can_edit_channel(node.channel.id),
-        });
-        for user in members {
-            rows.push(Row {
-                is_channel: false,
-                id: user.session_id as i32,
-                name: user.name.clone().into(),
-                depth: node.depth as i32 + 1,
-                muted: user.self_muted || user.server_muted,
-                deafened: user.self_deafened,
-                // 说话指示要等 UDP 那半边接上
-                speaking: false,
-                is_me: user.session_id == roster.me,
-                is_current: false,
-                count: 0,
-                // 只对频道有意义。
-                can_delete: false,
-                volume: settings.user_volume(&volume_key(&user.public_key)) as i32,
-                role: user.role,
-                can_kick: roster.can_kick(user.session_id),
-                can_ban: roster.can_ban(user.session_id),
-                can_set_role: roster.can_set_role(user.session_id),
-                can_edit: false,
-            });
-        }
-    }
-
-    let chat: Vec<ChatRow> = roster
-        .chat
-        .iter()
-        .map(|line| ChatRow {
-            sender: line.sender_name.clone().into(),
-            body: line.body.clone().into(),
-            time: clock_time(line.timestamp_ms).into(),
-            is_me: line.sender_session == roster.me,
-        })
-        .collect();
-
-    // 自己的静音状态以服务端为准 —— 别的地方（将来的全局热键）也会改它。
-    if let Some(me) = roster.my_user() {
-        app.set_self_muted(me.self_muted);
-        app.set_self_deafened(me.self_deafened);
-    }
-
-    // 访客建不了频道，那一行就别显示。**这只是画界面** ——
-    // 真正说了算的是服务端，它会把访客的请求直接忽略掉。
-    app.set_can_create_channel(roster.can_create_channel());
-
-    // 封禁名单只有管理员手里有（服务端只发给管理员），别人这里是空的。
-    app.set_is_admin(roster.is_admin());
-    let bans: Vec<BanRow> = roster
-        .bans
-        .iter()
-        .map(|ban| {
-            let mut detail = format!("{} 被 {} 封禁", clock_date(ban.banned_at_ms), ban.banned_by);
-            if !ban.reason.is_empty() {
-                detail.push('：');
-                detail.push_str(&ban.reason);
-            }
-            BanRow {
-                name: ban.name.clone().into(),
-                detail: detail.into(),
-                key: protocol::base32::encode(&ban.public_key).into(),
-            }
-        })
-        .collect();
-    app.set_bans(ModelRc::new(VecModel::from(bans)));
-
-    // 篝火上的人。先把要用的从名单里抄出来，放开名单的锁再去拿 state 的。
-    let my_channel = roster.my_channel();
-    let me = roster.me;
-    let channel_name = roster
-        .channels
-        .get(&my_channel)
-        .map(|c| c.name.clone())
-        .unwrap_or_default();
-    let here: Vec<Seat> = roster
-        .users_in(my_channel)
-        .into_iter()
-        .map(|user| Seat {
-            present: true,
-            id: user.session_id as i32,
-            name: user.name.clone().into(),
-            glyph: campfire::glyph(&user.name).into(),
-            seed: campfire::stone_seed(&user.public_key) as i32,
-            stone: Default::default(),
-            stone_talking: Default::default(),
-            muted: user.self_muted || user.server_muted,
-            deafened: user.self_deafened,
-            speaking: false,
-            is_me: user.session_id == me,
-            volume: settings.user_volume(&volume_key(&user.public_key)) as i32,
-            role: user.role,
-            can_kick: roster.can_kick(user.session_id),
-            can_ban: roster.can_ban(user.session_id),
-            can_set_role: roster.can_set_role(user.session_id),
-        })
-        .collect();
-    drop(roster);
-
-    app.set_rows(ModelRc::new(VecModel::from(rows)));
-    app.set_chat(ModelRc::new(VecModel::from(chat)));
-    app.set_channel_name(channel_name.into());
-    refresh_campfire(app, state, my_channel, me, here);
+    let view = {
+        let roster = client.roster();
+        runtime.set_server_muted(roster.my_user().is_some_and(|me| me.server_muted));
+        CallViewModel::project(
+            &call,
+            &runtime.snapshot(),
+            settings.ptt_key.is_some(),
+            Some(&roster),
+            &settings.user_volumes,
+        )
+    };
+    SlintAdapter::apply_call(app, &view);
+    let here = SlintAdapter::scene_members(&view);
+    refresh_campfire(app, state, view.channel_id, view.me, here);
 }
 
 /// 把频道里的人排到篝火的座位上。
@@ -2305,26 +2131,11 @@ fn refresh_campfire(app: &App, state: &Arc<Mutex<State>>, channel: u32, me: u32,
         (seated, locked.seats.waiting().to_vec())
     };
 
-    // 谁在说话要等下一次同步（50 ms 一次）才知道。这之前先沿用模型里原来的，
-    // 不然每次刷新石头都会灭一下。
-    let was_speaking = |id: i32| {
-        [app.get_seats(), app.get_waiting()]
-            .iter()
-            .any(|m| m.iter().any(|s| s.present && s.id == id && s.speaking))
-    };
-    let find = |id: u32| {
-        here.iter()
-            .find(|s| s.id as u32 == id)
-            .cloned()
-            .map(|mut s| {
-                s.speaking = was_speaking(s.id);
-                s
-            })
-    };
+    let find = |id: u32| here.iter().find(|seat| seat.id as u32 == id).cloned();
     let size = CAMPFIRE.with(|stage| {
         let mut stage = stage.borrow_mut();
         if stage.set_channel(channel) {
-            app.set_campfire_backdrop(stage.still());
+            app.set_campfire_backdrop(ui_timing::measure("scene channel still", || stage.still()));
         }
         stage.size()
     });
@@ -2342,27 +2153,30 @@ fn refresh_campfire(app: &App, state: &Arc<Mutex<State>>, channel: u32, me: u32,
         .collect();
     let waiting: Vec<Seat> = waiting.into_iter().filter_map(find).collect();
 
-    app.set_waiting_talking(waiting.iter().any(|s| s.speaking));
-    let current = app.get_seats();
-    if !update_in_place(&current, seats.clone()) {
-        app.set_seats(ModelRc::new(VecModel::from(seats)));
-    }
-    let current = app.get_waiting();
-    if !update_in_place(&current, waiting.clone()) {
-        app.set_waiting(ModelRc::new(VecModel::from(waiting)));
-    }
+    SlintAdapter::apply_scene(app, seats, waiting);
 }
 
 /// 篝火画面的大小变了：底图和石头都按新尺寸重画（一格的逻辑大小不变，格数变了）。
 fn resize_campfire(app: &App, width: f32, height: f32) {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return;
+    }
     let backdrop = CAMPFIRE.with(|stage| {
         let mut stage = stage.borrow_mut();
-        stage.set_size((width, height)).then(|| stage.still())
+        stage.set_size((width, height)).then(|| {
+            ui_timing::mark_frame(ui_timing::FramePhase::SceneResize);
+            ui_timing::measure("scene resize still", || stage.still())
+        })
     });
     let Some(backdrop) = backdrop else {
         return;
     };
     app.set_campfire_backdrop(backdrop);
+    let geometry: Vec<SeatGeometry> = campfire::seat_geometry((width, height))
+        .into_iter()
+        .map(|(x, y, size, up)| SeatGeometry { x, y, size, up })
+        .collect();
+    app.set_scene_geometry(ModelRc::new(VecModel::from(geometry)));
     let seats = app.get_seats();
     for n in 0..seats.row_count() {
         let Some(mut seat) = seats.row_data(n) else {
@@ -2532,53 +2346,66 @@ fn spawn_fire(weak: slint::Weak<App>) {
     FIRE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
 }
 
-/// 行数一样就逐行改（只改变了的），返回 true；行数变了返回 false，由调用方整个换掉。
-fn update_in_place<T: Clone + PartialEq + 'static>(model: &ModelRc<T>, rows: Vec<T>) -> bool {
-    if model.row_count() != rows.len() {
-        return false;
-    }
-    for (i, row) in rows.into_iter().enumerate() {
-        if model.row_data(i).as_ref() != Some(&row) {
-            model.set_row_data(i, row);
-        }
-    }
-    true
-}
-
+/// Translate view callbacks into portable commands; local focus remains in Slint.
 fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_open_member(move |id| {
+            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
+                return;
+            };
+            if !client.roster().users.contains_key(&(id as u32)) {
+                return;
+            }
+            let rows = app.get_rows();
+            let row = (0..rows.row_count())
+                .filter_map(|i| rows.row_data(i))
+                .find(|row| !row.is_channel && row.id == id);
+            if let Some(row) = row {
+                app.set_member_data(row);
+                app.set_member_id(id);
+            }
+        });
+    }
     // 每个回调都要拿到当前连接。写成一个小闭包而不是宏 ——
     // 回调的签名各不相同（有的带参数有的不带），宏反而要绕。
-    fn current(state: &Arc<Mutex<State>>) -> Option<Client> {
-        state.lock().expect("state poisoned").client.clone()
-    }
 
     {
         let weak = app.as_weak();
         app.on_campfire_resized(move |width, height| {
-            if let Some(app) = weak.upgrade() {
-                resize_campfire(&app, width, height);
+            let scheduled = SCENE_RESIZE
+                .with(|pending| pending.borrow_mut().replace((width, height)).is_some());
+            if scheduled {
+                return;
             }
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let size = SCENE_RESIZE.with(|pending| pending.borrow_mut().take());
+                if let (Some(app), Some((width, height))) = (weak.upgrade(), size) {
+                    resize_campfire(&app, width, height);
+                }
+            });
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_join_channel(move |id| {
-            if let Some(client) = current(&state) {
-                client.join_channel(id as u32);
-            }
+            dispatch_call(&state, CallCommand::JoinChannel { channel: id as u32 });
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_create_channel(move |name| {
-            if let Some(client) = current(&state) {
-                // 不在本地先插一个再等确认：建成了服务端会广播给所有人
-                // （含自己），名单那边照常处理；被拒就什么都不会发生。
-                // 本地先插的话，被拒时界面上会留一个只有自己看得见的幽灵频道。
-                client.create_channel(&name, 0);
-            }
+            dispatch_call(
+                &state,
+                CallCommand::CreateChannel {
+                    name: name.to_string(),
+                    parent: 0,
+                },
+            );
         });
     }
 
@@ -2586,53 +2413,28 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_set_user_volume(move |session, raw| {
-            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
-                return;
-            };
-            let session = session as u32;
-            let percent = snap_volume(raw);
-            let Some(key) = client
-                .roster()
-                .users
-                .get(&session)
-                .map(|u| volume_key(&u.public_key))
+            let Some(app) = weak.upgrade() else { return };
+            let Some(CommandResult::VolumeChanged {
+                public_key,
+                percent,
+                ..
+            }) = dispatch_call(
+                &state,
+                CallCommand::SetVolume {
+                    session: session as u32,
+                    percent: snap_volume(raw),
+                },
+            )
             else {
                 return;
             };
-            let voice = {
-                let mut locked = state.lock().expect("state poisoned");
-                locked.settings.set_user_volume(&key, percent);
-                locked.voice.clone()
-            };
-            if let Some(voice) = voice {
-                voice.set_volume(session, percent as f32 / 100.0);
-            }
-            // 只改这一行，不整个重建名单：拖动时每秒几十次，整个重建会让
-            // 正拖着的滑条被销毁重建，手里的那一下就断了。
-            let rows = app.get_rows();
-            for i in 0..rows.row_count() {
-                let Some(mut row) = rows.row_data(i) else {
-                    continue;
-                };
-                if !row.is_channel && row.id == session as i32 {
-                    if row.volume != percent as i32 {
-                        row.volume = percent as i32;
-                        rows.set_row_data(i, row);
-                    }
-                    break;
-                }
-            }
-            // 篝火上点开的那张卡片也在拖这个音量，同样只改那一块石头。
-            for model in [app.get_seats(), app.get_waiting()] {
-                for i in 0..model.row_count() {
-                    let Some(mut seat) = model.row_data(i) else {
-                        continue;
-                    };
-                    if seat.present && seat.id == session as i32 && seat.volume != percent as i32 {
-                        seat.volume = percent as i32;
-                        model.set_row_data(i, seat);
-                    }
-                }
+            state
+                .lock()
+                .expect("state poisoned")
+                .settings
+                .set_user_volume(&volume_key(&public_key), percent);
+            if let Some(client) = current(&state) {
+                refresh(&app, &state, &client);
             }
         });
     }
@@ -2640,34 +2442,46 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
     {
         let state = Arc::clone(state);
         app.on_save_user_volumes(move || {
-            let _ = state.lock().expect("state poisoned").settings.save();
+            state.lock().expect("state poisoned").persist_settings();
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_rename_channel(move |id, name| {
-            if let Some(client) = current(&state) {
-                client.rename_channel(id as u32, &name);
-            }
+            dispatch_call(
+                &state,
+                CallCommand::RenameChannel {
+                    channel: id as u32,
+                    name: name.to_string(),
+                },
+            );
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_kick_user(move |session| {
-            if let Some(client) = current(&state) {
-                client.kick(session as u32, "");
-            }
+            dispatch_call(
+                &state,
+                CallCommand::Kick {
+                    session: session as u32,
+                    reason: String::new(),
+                },
+            );
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_ban_user(move |session| {
-            if let Some(client) = current(&state) {
-                client.ban(session as u32, "");
-            }
+            dispatch_call(
+                &state,
+                CallCommand::Ban {
+                    session: session as u32,
+                    reason: String::new(),
+                },
+            );
         });
     }
 
@@ -2677,9 +2491,13 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             // 下拉框的序号 0..=3 对应协议里的 1..=4（0 是 Unspecified）。
             let role = protocol::control::Role::try_from(index + 1)
                 .unwrap_or(protocol::control::Role::Unspecified);
-            if let Some(client) = current(&state) {
-                client.set_role(session as u32, role);
-            }
+            dispatch_call(
+                &state,
+                CallCommand::SetRole {
+                    session: session as u32,
+                    role,
+                },
+            );
         });
     }
 
@@ -2689,18 +2507,14 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             let Ok(key) = protocol::base32::decode(&key) else {
                 return;
             };
-            if let Some(client) = current(&state) {
-                client.unban(&key);
-            }
+            dispatch_call(&state, CallCommand::Unban { public_key: key });
         });
     }
 
     {
         let state = Arc::clone(state);
         app.on_delete_channel(move |id| {
-            if let Some(client) = current(&state) {
-                client.delete_channel(id as u32);
-            }
+            dispatch_call(&state, CallCommand::DeleteChannel { channel: id as u32 });
         });
     }
 
@@ -2708,11 +2522,21 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_send_text(move || {
-            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
-                return;
-            };
-            client.send_text(&app.get_draft());
-            app.set_draft(SharedString::new());
+            let Some(app) = weak.upgrade() else { return };
+            if matches!(
+                dispatch_call(
+                    &state,
+                    CallCommand::SendText {
+                        body: app.get_draft().to_string()
+                    }
+                ),
+                Some(
+                    CommandResult::Applied
+                        | CommandResult::Ignored(client_runtime::call::IgnoreReason::EmptyText)
+                )
+            ) {
+                app.set_draft(SharedString::new());
+            }
         });
     }
 
@@ -2720,15 +2544,9 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_toggle_mute(move || {
-            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
-                return;
-            };
-            // 关着耳朵的时候单独开麦没有意义，服务端也会把它改回去。
-            let muted = !app.get_self_muted();
-            client.set_self_state(muted, app.get_self_deafened());
-            if let Some(voice) = current_voice(&state) {
-                voice.set_muted(muted);
-            }
+            let Some(app) = weak.upgrade() else { return };
+            dispatch_call(&state, CallCommand::ToggleMute);
+            sync_audio(&app, &state);
         });
     }
 
@@ -2736,16 +2554,9 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_toggle_deafen(move || {
-            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
-                return;
-            };
-            let deafened = !app.get_self_deafened();
-            // 关耳朵连带闭麦。服务端也会这么改，这里跟着改是为了按下去立刻有反馈。
-            client.set_self_state(app.get_self_muted() || deafened, deafened);
-            if let Some(voice) = current_voice(&state) {
-                voice.set_deafened(deafened);
-                voice.set_muted(app.get_self_muted() || deafened);
-            }
+            let Some(app) = weak.upgrade() else { return };
+            dispatch_call(&state, CallCommand::ToggleDeafen);
+            sync_audio(&app, &state);
         });
     }
 
@@ -2753,13 +2564,16 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_leave(move || {
-            if let Some(client) = current(&state) {
-                client.disconnect();
+            cancel_scan(&state);
+            dispatch_call(&state, CallCommand::Leave);
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.client = None;
+                locked.call.offline();
             }
-            state.lock().expect("state poisoned").voice = None;
             if let Some(app) = weak.upgrade() {
-                // 主动离开不是错误，别把上一次的报错留在首页上。
-                app.set_connected(false);
+                app.invoke_reset_call_view();
+                sync_audio(&app, &state);
                 clear_join_error(&app);
                 refresh_home(&app, &state);
             }
@@ -2798,7 +2612,12 @@ fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
                 (locked.client.clone(), locked.settings.close_action)
             };
             // 没连着就没什么可「继续」的；没有托盘就没地方收。都直接退出。
-            let Some(client) = client.filter(|_| app.get_connected() && has_tray) else {
+            let Some(client) = client.filter(|_| {
+                matches!(
+                    call_connection(&state),
+                    ConnectionState::Connected | ConnectionState::Reconnecting
+                ) && has_tray
+            }) else {
                 quit_app(&state);
                 return HideWindow;
             };
@@ -2832,7 +2651,7 @@ fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
                 app.set_close_action(action.index());
                 let mut locked = state.lock().expect("state poisoned");
                 locked.settings.close_action = action;
-                let _ = locked.settings.save();
+                locked.persist_settings();
             }
             if to_tray {
                 let _ = app.hide();
@@ -2852,7 +2671,7 @@ fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
             }
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.close_action = action;
-            let _ = locked.settings.save();
+            locked.persist_settings();
         });
     }
 }
@@ -2860,9 +2679,12 @@ fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
 /// 真的退出：先离开频道（服务端和别人那边马上看到你走了，而不是等 30 秒超时），
 /// 再停掉事件循环。
 fn quit_app(state: &Arc<Mutex<State>>) {
+    cancel_scan(state);
     let client = {
-        let mut locked = state.lock().expect("state poisoned");
-        locked.voice = None;
+        let locked = state.lock().expect("state poisoned");
+        if let Some(runtime) = &locked.runtime {
+            runtime.stop();
+        }
         locked.client.clone()
     };
     if let Some(client) = client {
@@ -2931,24 +2753,29 @@ fn wire_tray(app: &App, state: &Arc<Mutex<State>>) -> Option<Tray> {
 }
 
 /// 把连接和麦克风的状态搬到托盘图标上。跟着状态轮询的定时器一起跑。
-fn update_tray(app: &App, client: Option<&Client>) {
+fn update_tray(view: &AudioViewModel, client: Option<&Client>) {
     TRAY.with(|slot| {
         let slot = slot.borrow();
         let Some(tray) = slot.as_ref() else { return };
-        let connected = app.get_connected() && client.is_some();
-        let muted = app.get_self_muted();
-        let deafened = app.get_self_deafened();
-        let icon = match (connected, muted || deafened) {
+        let connected = matches!(
+            view.connection,
+            ConnectionState::Connected | ConnectionState::Reconnecting
+        ) && client.is_some();
+        let muted = view.self_muted;
+        let deafened = view.self_state.deafened;
+        let icon = match (connected, view.self_state.muted) {
             (false, _) => 0,
             (true, false) => 1,
             (true, true) => 2,
         };
         let status = match client {
             _ if !connected => "篝火 · 没连着".to_string(),
-            _ if !app.get_reconnecting().is_empty() => "篝火 · 正在重连…".to_string(),
-            _ if !app.get_voice_notice().is_empty() => format!("篝火 · {}", app.get_voice_notice()),
+            _ if !view.reconnecting.is_empty() => "篝火 · 正在重连…".to_string(),
+            _ if !view.voice_notice.is_empty() => format!("篝火 · {}", view.voice_notice),
             Some(client) => {
-                let mic = if deafened {
+                let mic = if view.self_state.server_muted {
+                    "被管理员闭麦"
+                } else if deafened {
                     "关着耳朵"
                 } else if muted {
                     "闭着麦"
@@ -2978,9 +2805,47 @@ fn update_tray(app: &App, client: Option<&Client>) {
     });
 }
 
+fn call_connection(state: &Arc<Mutex<State>>) -> ConnectionState {
+    state.lock().expect("state poisoned").call.connection()
+}
+
+fn sync_audio(app: &App, state: &Arc<Mutex<State>>) {
+    let (call, runtime, ptt_bound) = {
+        let locked = state.lock().expect("state poisoned");
+        (
+            locked.call.clone(),
+            locked.runtime.clone(),
+            locked.settings.ptt_key.is_some(),
+        )
+    };
+    if let Some(runtime) = runtime {
+        let view = CallViewModel::project_audio(&call, &runtime.snapshot(), ptt_bound);
+        SlintAdapter::apply_audio(app, &view);
+        SlintAdapter::apply_activity(app, &view);
+    }
+}
+
+fn dispatch_call(state: &Arc<Mutex<State>>, command: CallCommand) -> Option<CommandResult> {
+    let (client, runtime) = {
+        let locked = state.lock().expect("state poisoned");
+        (locked.client.clone()?, locked.runtime.clone()?)
+    };
+    Some(CallController::dispatch(command, &client, &runtime))
+}
+
 /// 返回 `(身份, 是不是这次新建的)`。
-fn current_voice(state: &Arc<Mutex<State>>) -> Option<Arc<Pipeline>> {
-    state.lock().expect("state poisoned").voice.clone()
+fn current_runtime(state: &Arc<Mutex<State>>) -> Option<RuntimeHandle> {
+    state.lock().expect("state poisoned").runtime.clone()
+}
+
+fn current(state: &Arc<Mutex<State>>) -> Option<Client> {
+    state.lock().expect("state poisoned").client.clone()
+}
+
+fn current_voice(state: &Arc<Mutex<State>>) -> Option<RuntimeHandle> {
+    let locked = state.lock().expect("state poisoned");
+    locked.client.as_ref()?;
+    locked.runtime.clone()
 }
 
 fn load_identity() -> std::io::Result<(Identity, bool)> {

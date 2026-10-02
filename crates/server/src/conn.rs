@@ -616,7 +616,9 @@ fn authenticate(
         &auth.invite_code,
         &auth.desired_name,
         (keys.upstream.as_bytes(), keys.downstream.as_bytes()),
-        outbound,
+        // 拒绝时 Peer 不会留下 sender；本地这份必须活到 Rejected 写完。
+        // 否则 writer 发现队列断开，先关 socket，客户端就收不到拒绝原因了。
+        outbound.clone(),
         shutdown,
     ) {
         Ok(peer) => Ok(Some(peer)),

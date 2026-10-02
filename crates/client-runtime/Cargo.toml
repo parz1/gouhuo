@@ -1,0 +1,16 @@
+[package]
+name = "client-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable client voice lifecycle and state projection, independent of a GUI or audio platform."
+
+[dependencies]
+client-core.workspace = true
+protocol.workspace = true
+voice-core = { workspace = true, features = ["pipeline"] }
+
+[dev-dependencies]
+server = { path = "../server" }
+transport.workspace = true

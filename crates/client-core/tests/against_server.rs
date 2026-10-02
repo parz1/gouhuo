@@ -343,6 +343,47 @@ fn a_private_server_needs_the_code_typed_in_after_the_address() {
     assert_eq!(server.hub.user_count(), 1);
 }
 
+/// 拒绝登录也必须先把原因送到客户端，再关闭连接。
+///
+/// 未入场的 writer 没有 Peer 持有队列。过去拒绝路径把最后一个 sender
+/// 提前放掉，writer 会跟 Rejected 的发送抢着关 socket；反复试两种加入码
+/// 能覆盖这段很窄的调度窗口。
+#[test]
+fn repeated_join_denials_keep_the_rejection_message() {
+    let server = start(Config {
+        require_invite: true,
+        invite_code: Some("winter2026".into()),
+        ..Config::default()
+    });
+    let identity = Identity::generate().unwrap();
+    let mut invite = server.invite.clone();
+
+    for attempt in 0..32 {
+        invite.code = if attempt % 2 == 0 {
+            None
+        } else {
+            Some("wrong".into())
+        };
+        let error = Client::connect_to(&invite, &identity, "路人")
+            .err()
+            .expect("加入码不对却进去了");
+        assert!(
+            matches!(
+                error,
+                ConnectError::Rejected {
+                    reason: Reason::InviteRequired,
+                    ..
+                }
+            ),
+            "第 {attempt} 次拒绝丢了原因：{error:?}"
+        );
+    }
+    assert_eq!(server.hub.user_count(), 0);
+
+    let (_client, _events) = join(&server, "自己人");
+    assert_eq!(server.hub.user_count(), 1);
+}
+
 /// 没人听的端口、不是篝火的服务：取指纹要报出原因，不能卡住。
 #[test]
 fn probing_something_that_is_not_gouhuo_fails_cleanly() {

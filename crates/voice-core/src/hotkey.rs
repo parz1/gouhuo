@@ -171,6 +171,7 @@ impl Drop for Hotkeys {
 }
 
 /// 处理一次原始输入事件。放在平台代码外面，好单独测。
+#[cfg(any(windows, test))]
 fn handle(shared: &Shared, key: Key, pressed: bool) {
     if shared.capturing.load(Ordering::Relaxed) {
         // 只在**按下**的时候捕获。按松开的话，用户抬手那一下会把

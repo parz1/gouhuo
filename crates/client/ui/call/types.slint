@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// 频道树和成员名单压成的一行。
+//
+// 用一个扁平列表而不是嵌套模型：频道和人本来就是交替出现的，
+// 嵌套两层模型换不来任何东西，却要在 Rust 那边维护两套同步逻辑。
+export struct Row {
+    is-channel: bool,
+    id: int,
+    name: string,
+    depth: int,
+    // 下面几个只对人有意义
+    muted: bool,
+    deafened: bool,
+    speaking: bool,
+    is-me: bool,
+    // 只对频道有意义：我在不在这个频道里
+    is-current: bool,
+    // 频道里有几个人，显示在右边
+    count: int,
+    // 只对频道有意义：我能不能删它。**这只决定画不画那个 ×**，
+    // 真正说了算的是服务端 —— 画错了最多是一个点了没反应的按钮。
+    can-delete: bool,
+    // 只对人有意义：我给这个人单独调的音量，百分比。100 是原样，0 是静音。
+    volume: int,
+    // 只对人有意义：角色，协议里的数值（1 访客 2 成员 3 频道管理 4 管理员）。
+    role: int,
+    // 我能对这个人做什么 / 能不能改这个频道。**只决定画不画按钮**，
+    // 说了算的是服务端。
+    can-kick: bool,
+    can-ban: bool,
+    can-set-role: bool,
+    can-edit: bool,
+}
+
+export struct ChatRow {
+    sender: string,
+    body: string,
+    time: string,
+    is-me: bool,
+}

@@ -26,10 +26,19 @@
 //! `read` 上。所以心跳线程同时看着「上一次收到服务端的任何东西是什么时候」，
 //! 超过 [`LIVENESS_TIMEOUT`] 就自己把 socket 掐掉，让读线程醒过来走重连。
 //! 服务端每个 Ping 都回 Pong，所以连接活着时这个时间不会超过一个心跳周期。
+//!
+//! # 用户操作只排队，不等待网络
+//!
+//! 认证完成后，每条连接有一个有界 FIFO 写线程。频道、文字、管理和自身状态
+//! 操作只提交本地命令；返回**不代表服务端已收到或应用**，实际结果由收到的
+//! 名单、频道和文字广播确认。队列耗尽会断开当前连接，沿用统一重连流程，
+//! 不阻塞调用方，也不静默丢一条命令后继续使用这条连接。
+//! 闭麦 / 关耳朵意愿会立即保存并在重连时恢复；文字和管理命令不会重放。
+//! [`Client::connect`] 的初次握手仍会等待网络，应在前端的后台任务中调用。
 
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -78,6 +87,11 @@ pub const RECONNECT_FIRST: Duration = Duration::from_millis(500);
 /// 服务器重启、宽带重拨这种要几十秒才恢复的事，30 秒一次足够及时；
 /// 再频繁就是在给一个没开的服务器刷连接。
 pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// 控制协议平时只有少量用户操作和每五秒一次的 Ping。
+/// 网络停顿时同时限制消息数与字节数，不把积压无限转移到常驻客户端内存里。
+const WRITE_QUEUE_MESSAGES: usize = 128;
+const WRITE_QUEUE_BYTES: usize = 4 * protocol::control::MAX_FRAME_BODY;
 
 /// 连接的时间参数。正常使用就用 [`Options::default`]；
 /// 测试要把它们调短，不然一个「连接死了」的用例要跑十几秒。
@@ -143,7 +157,8 @@ pub enum Event {
         retry_in: Duration,
         reason: String,
     },
-    /// 重连上了，已经回到原来的频道。
+    /// 重新认证成功，恢复原频道和自身状态的命令已经排队。
+    /// 名单广播随后确认服务端实际应用的状态。
     ///
     /// **会话 id、UDP 端口、语音密钥全都换了**（旧密钥的序号空间不能复用，
     /// 见 `protocol::crypto`），所以语音链路要按 [`Client`] 上的新值重起。
@@ -177,26 +192,139 @@ pub struct VoiceKeys {
 /// 一次成功的连接。重连就是换掉这一整个。
 struct Link {
     shutdown_sock: TcpStream,
+    #[cfg(test)]
     wire: Arc<Mutex<Wire>>,
+    writer: SyncSender<PendingMessage>,
+    writer_state: Arc<WriterState>,
     session_id: u32,
     udp_port: u16,
     voice: Arc<VoiceKeys>,
 }
 
+struct WriterState {
+    stopped: AtomicBool,
+    completed: AtomicBool,
+    pending_bytes: Arc<AtomicUsize>,
+    error: Mutex<Option<String>>,
+}
+
+impl WriterState {
+    fn fail(&self, socket: &TcpStream, message: String) {
+        *self.error.lock().expect("writer error poisoned") = Some(message);
+        self.stopped.store(true, Ordering::Release);
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// 字节许可随消息释放；发送失败、排队失败或队列退场都不会泄漏预算。
+struct PendingMessage {
+    message: protocol::control::ClientMessage,
+    bytes: usize,
+    budget: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingMessage {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 impl Link {
     fn send(&self, message: &protocol::control::ClientMessage) {
-        // 发不出去不用在这里处理：读线程马上就会发现连接断了，
-        // 由它统一走善后流程。两个地方都报错只会让界面弹两次。
-        if let Ok(mut wire) = self.wire.lock() {
-            if wire.send(message).is_err() {
-                self.shutdown();
-            }
+        if self.writer_state.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let bytes = prost::Message::encoded_len(message);
+        if bytes > protocol::control::MAX_FRAME_BODY {
+            self.writer_state.fail(
+                &self.shutdown_sock,
+                "控制消息超过协议长度上限，正在重新连接。".into(),
+            );
+            return;
+        }
+        if self
+            .writer_state
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|&total| total <= WRITE_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            self.writer_state.fail(
+                &self.shutdown_sock,
+                "控制消息积压过多，正在重新连接服务器。".into(),
+            );
+            return;
+        }
+        let pending = PendingMessage {
+            message: message.clone(),
+            bytes,
+            budget: Arc::clone(&self.writer_state.pending_bytes),
+        };
+        // try_send 不等待 TLS 锁或 socket。只有单个 writer 消费，保留调用顺序。
+        if self.writer.try_send(pending).is_err() {
+            self.writer_state.fail(
+                &self.shutdown_sock,
+                "控制消息队列不可用，正在重新连接服务器。".into(),
+            );
         }
     }
 
     fn shutdown(&self) {
         // Never wait for a stalled TLS writer before interrupting the socket.
+        self.writer_state.stopped.store(true, Ordering::Release);
         let _ = self.shutdown_sock.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Worker 不持 Link/Shared，也不持 sender：最后一个 Link 释放时可自然退场。
+/// 阻塞的 TLS 发送只发生在这里；shutdown 通过独立 socket 句柄打断它。
+fn writer_loop(
+    wire: Arc<Mutex<Wire>>,
+    socket: TcpStream,
+    state: Arc<WriterState>,
+    queue: Receiver<PendingMessage>,
+) {
+    struct Completed<'a>(&'a WriterState, &'a TcpStream);
+    impl Drop for Completed<'_> {
+        fn drop(&mut self) {
+            self.0.stopped.store(true, Ordering::Release);
+            let _ = self.1.shutdown(std::net::Shutdown::Both);
+            self.0.completed.store(true, Ordering::Release);
+        }
+    }
+    let _completed = Completed(&state, &socket);
+    // Drop the queue and all byte permits before reporting completion.
+    let queue = queue;
+    while !state.stopped.load(Ordering::Acquire) {
+        let pending = match queue.recv_timeout(Duration::from_millis(50)) {
+            Ok(pending) => pending,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let result = match wire.lock() {
+            Ok(mut wire) => {
+                if state.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                wire.send(&pending.message)
+            }
+            Err(_) => Err(std::io::Error::other("TLS 写入状态不可用")),
+        };
+        if let Err(error) = result {
+            state.fail(
+                &socket,
+                format!("控制消息发送失败：{error}。正在重新连接服务器。"),
+            );
+            return;
+        }
     }
 }
 
@@ -211,7 +339,7 @@ struct Shared {
     /// 自己设的闭麦 / 关耳朵。重连之后要原样告诉新会话。
     self_state: Mutex<(bool, bool)>,
 
-    /// 用户要走了。置位之后不再重连，两个后台线程各自收场。
+    /// 用户要走了。置位之后不再重连，后台线程各自收场。
     closing: AtomicBool,
     /// 让后台线程的等待能被 [`Client::disconnect`] 立刻叫醒 ——
     /// 不然点了「取消重连」要等到下一次退避到点才有反应，最长 30 秒。
@@ -367,6 +495,7 @@ impl Client {
         self.shared.roster.lock().expect("roster poisoned")
     }
 
+    /// 排队请求切换频道；返回时不保证已经切换，名单广播确认最终结果。
     pub fn join_channel(&self, channel_id: u32) {
         self.send(&JoinChannel { channel_id }.into());
     }
@@ -474,6 +603,7 @@ impl Client {
         );
     }
 
+    /// 排队发送文字；收到服务器带归属与时间戳的广播才表示发送已确认。
     pub fn send_text(&self, body: &str) {
         let body = body.trim();
         if body.is_empty() {
@@ -493,8 +623,12 @@ impl Client {
 
     /// 闭麦 / 关耳朵。记下来，重连之后原样告诉新会话 ——
     /// 不然用户闭着麦断了一次线，回来就变成开着麦了。
+    /// 返回只保证本地意愿已保存并尝试排队，服务端状态由广播确认。
     pub fn set_self_state(&self, self_muted: bool, self_deafened: bool) {
-        *self.shared.self_state.lock().expect("self_state poisoned") = (self_muted, self_deafened);
+        // 短锁覆盖保存与入队，多线程调用不会把较旧的状态排在新状态后面。
+        // 入队从不等待 TLS 写锁，网络阻塞也不延迟本地意愿。
+        let mut desired = self.shared.self_state.lock().expect("self_state poisoned");
+        *desired = (self_muted, self_deafened);
         self.send(
             &SelfState {
                 self_muted,
@@ -593,10 +727,21 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     }
                 }
             }
-            Ok(None) => return Outcome::Lost("服务器关闭了连接".to_string()),
-            Err(e) => return Outcome::Lost(format!("连接断了：{e}")),
+            Ok(None) => return Outcome::Lost(lost_reason(shared, "服务器关闭了连接".to_string())),
+            Err(e) => return Outcome::Lost(lost_reason(shared, format!("连接断了：{e}"))),
         }
     }
+}
+
+fn lost_reason(shared: &Shared, fallback: String) -> String {
+    shared
+        .link()
+        .writer_state
+        .error
+        .lock()
+        .expect("writer error poisoned")
+        .clone()
+        .unwrap_or(fallback)
 }
 
 /// 第 `attempt` 次重连（从 1 起）前等多久：从 `first` 起翻倍，封顶 `max`，
@@ -702,7 +847,9 @@ fn install(shared: &Shared, link: Link, welcome: &Welcome, wanted: Option<&(u32,
             link.send(&JoinChannel { channel_id }.into());
         }
     }
-    let (self_muted, self_deafened) = *shared.self_state.lock().expect("self_state poisoned");
+    // 与 set_self_state 的保存+入队共用短锁，恢复消息不会覆盖刚排队的新意愿。
+    let desired = shared.self_state.lock().expect("self_state poisoned");
+    let (self_muted, self_deafened) = *desired;
     if self_muted || self_deafened {
         link.send(
             &SelfState {
@@ -823,9 +970,27 @@ fn establish(
         .set_read_timeout(None)?;
     reader.clear_read_timeout()?;
 
+    let writer_state = Arc::new(WriterState {
+        stopped: AtomicBool::new(false),
+        completed: AtomicBool::new(false),
+        pending_bytes: Arc::new(AtomicUsize::new(0)),
+        error: Mutex::new(None),
+    });
+    let (writer, queue) = mpsc::sync_channel(WRITE_QUEUE_MESSAGES);
+    {
+        let wire = Arc::clone(&wire);
+        let socket = handshake_sock.try_clone()?;
+        let state = Arc::clone(&writer_state);
+        std::thread::Builder::new()
+            .name("gouhuo-client-write".into())
+            .spawn(move || writer_loop(wire, socket, state, queue))?;
+    }
     let link = Link {
         shutdown_sock: handshake_sock,
+        #[cfg(test)]
         wire,
+        writer,
+        writer_state,
         session_id: welcome.session_id,
         udp_port: welcome.udp_port as u16,
         voice: Arc::new(voice),
@@ -1233,6 +1398,164 @@ mod tests {
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    fn connection(name: &str) -> (Client, Receiver<Event>) {
+        use server::conn::Hub;
+        use server::state::{Config, Server};
+        use std::net::{TcpListener, UdpSocket};
+        use transport::{server_config, ServerCert};
+        let cert = ServerCert::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let invite = Invite {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            cert: cert.fingerprint(),
+            code: None,
+        };
+        let tls = Arc::new(server_config(&cert).unwrap());
+        let hub = Arc::new(Hub::new(
+            Server::new(Config::default()),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+        ));
+        std::thread::spawn(move || server::accept_loop(listener, tls, hub));
+        Client::connect(
+            &invite.to_url().unwrap(),
+            &Identity::generate().unwrap(),
+            name,
+        )
+        .unwrap()
+    }
+
+    fn wait_for(description: &str, predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn self_intent_and_fifo_commands_do_not_wait_for_a_blocked_tls_writer() {
+        let (client, events) = connection("queued-controls");
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        let commands = client.clone();
+        let (finished, done) = mpsc::channel();
+        let gui = std::thread::spawn(move || {
+            commands.set_self_state(true, true);
+            commands.send_text("first queued command");
+            commands.set_self_state(false, false);
+            commands.send_text("second queued command");
+            commands.set_self_state(true, false);
+            finished.send(()).unwrap();
+        });
+        let immediate = done.recv_timeout(Duration::from_millis(500));
+        let desired = immediate
+            .is_ok()
+            .then(|| *client.shared.self_state.lock().unwrap());
+        // Always release the lock before asserting so a regression cannot leave
+        // a stuck writer/API test thread behind.
+        drop(guard);
+        gui.join().unwrap();
+        assert!(
+            immediate.is_ok(),
+            "GUI command waited for the TLS writer lock"
+        );
+        assert_eq!(
+            desired,
+            Some((true, false)),
+            "latest intent was not saved before returning"
+        );
+
+        let mut texts = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while texts.len() < 2 {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if let Event::Text(line) = event {
+                texts.push(line.body);
+            }
+        }
+        assert_eq!(texts, ["first queued command", "second queued command"]);
+        wait_for("final self-state acknowledgement", || {
+            client
+                .roster()
+                .my_user()
+                .is_some_and(|me| me.self_muted && !me.self_deafened)
+        });
+        let weak_writer = Arc::downgrade(&link.writer_state);
+        client.disconnect();
+        wait_for("writer shutdown", || {
+            link.writer_state.completed.load(Ordering::Acquire)
+        });
+        assert_eq!(link.writer_state.pending_bytes.load(Ordering::Acquire), 0);
+        drop(link);
+        drop(client);
+        wait_for("writer ownership released", || {
+            weak_writer.upgrade().is_none()
+        });
+    }
+
+    #[test]
+    fn a_full_control_queue_interrupts_the_link_and_preserves_latest_intent() {
+        let (client, _events) = connection("bounded-controls");
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        // Worker may have taken the first message before blocking on the wire.
+        // Two messages beyond capacity therefore guarantee overflow.
+        for i in 0..WRITE_QUEUE_MESSAGES + 2 {
+            client.set_self_state(i % 2 == 0, false);
+        }
+        client.set_self_state(true, true);
+        assert!(link.writer_state.stopped.load(Ordering::Acquire));
+        assert!(link
+            .writer_state
+            .error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|e| e.contains("队列")));
+        assert_eq!(*client.shared.self_state.lock().unwrap(), (true, true));
+        assert!(link.writer_state.pending_bytes.load(Ordering::Acquire) <= WRITE_QUEUE_BYTES);
+        client.disconnect();
+        drop(guard);
+        wait_for("overflow writer shutdown", || {
+            link.writer_state.completed.load(Ordering::Acquire)
+        });
+        assert_eq!(link.writer_state.pending_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queued_large_control_messages_also_have_a_total_byte_budget() {
+        let (client, _events) = connection("byte-budget");
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        let text = "x".repeat(protocol::control::MAX_FRAME_BODY / 2);
+        for _ in 0..10 {
+            client.send_text(&text);
+        }
+        assert!(link.writer_state.stopped.load(Ordering::Acquire));
+        assert!(link
+            .writer_state
+            .error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|e| e.contains("积压")));
+        assert!(link.writer_state.pending_bytes.load(Ordering::Acquire) <= WRITE_QUEUE_BYTES);
+        client.disconnect();
+        drop(guard);
+        wait_for("byte-budget writer shutdown", || {
+            link.writer_state.completed.load(Ordering::Acquire)
+        });
+        assert_eq!(link.writer_state.pending_bytes.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn cancelling_does_not_wait_for_the_tls_write_lock() {
         use server::conn::Hub;

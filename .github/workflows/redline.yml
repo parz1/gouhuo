@@ -123,6 +123,33 @@ jobs:
           cargo test --workspace
           cargo test -p voice-core --example quality-probe
 
+  # 跟声卡无关的内核和客户端逻辑也要能在 Linux 上开发、测试。
+  # 不编 Windows 专用的 client / device-probe，也不在共享 runner 上卡延迟。
+  linux-core:
+    needs: [dco, license]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: 安装 Opus 构建工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake build-essential
+      - name: check
+        run: cargo check -p voice-core -p client-core -p client-runtime --all-targets
+      - name: clippy
+        run: cargo clippy -p voice-core -p client-core -p client-runtime -p latency-probe --all-targets -- -D warnings
+      - name: test
+        run: |
+          cargo test -p voice-core -p client-core -p client-runtime
+          cargo test -p voice-core --example quality-probe
+
   # 延迟数字**不在这里测**。
   #
   # 曾经有个 latency-record job 每次跑 4m42s，把 m1.json 存成 artifact 用来看趋势。

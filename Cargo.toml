@@ -8,11 +8,12 @@ members = [
     "crates/device-probe",
     "crates/server",
     "crates/client-core",
+    "crates/client-runtime",
     "crates/client",
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 # 工作区默认是 GPL；引擎层（voice-core / transport）单独放宽为 MPL-2.0，
@@ -51,6 +52,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rcgen = "0.14"
 transport = { path = "crates/transport" }
 client-core = { path = "crates/client-core" }
+client-runtime = { path = "crates/client-runtime" }
 # 界面。选 Slint 不选 Tauri：不带 WebView2，安装包和内存都由我们自己说了算 ——
 # 安装包 60 MB、voice-core RSS 100 MB 这两条红线完全由界面框架决定。
 slint = "1"

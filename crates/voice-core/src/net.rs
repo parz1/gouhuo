@@ -113,7 +113,8 @@ mod tests {
         assert!(h.join().unwrap());
     }
 
-    /// 缓冲太小的那一条：2000 个包一次灌进去，默认的 8 KB 连 100 个都存不下。
+    /// Windows 的缓冲回归：2000 个包一次灌进去，默认的 8 KB 连 100 个都存不下。
+    /// Linux 上目前不调缓冲，突发量按内核实际的容量缩小，避免把宿主机上限当成回归。
     #[test]
     fn large_recv_buffer_survives_a_burst() {
         let sink = bind_voice_socket("127.0.0.1:0").unwrap();
@@ -123,7 +124,20 @@ mod tests {
 
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let packet = [0u8; 120];
-        let burst = 2_000;
+        #[cfg(windows)]
+        let (burst, buffer_detail) = (2_000, format!("请求 SO_RCVBUF={DEFAULT_RECV_BUFFER} 字节"));
+        #[cfg(target_os = "linux")]
+        let (burst, buffer_detail) = {
+            let actual = linux_recv_buffer_size(&sink);
+            // Linux 按 skb 的内存占用计费，120 字节负载不等于只占 120 字节缓冲。
+            // 每包留 4 KiB，再只使用一半容量；这远高于小回环包的常见内核开销。
+            // getsockopt 返回的是内核计费容量；若用 setsockopt 请求缓冲，Linux 会先
+            // 按 rmem_max 截断，再将返回值翻倍，不能按 DEFAULT_RECV_BUFFER 推算包数。
+            let burst = (actual / 4096 / 2).clamp(1, 2_000);
+            (burst, format!("实际 SO_RCVBUF={actual} 字节"))
+        };
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let (burst, buffer_detail) = (32, "平台默认接收缓冲".to_owned());
         for _ in 0..burst {
             tx.send_to(&packet, addr).unwrap();
         }
@@ -133,7 +147,32 @@ mod tests {
         while got < burst && sink.recv_from(&mut buf).is_ok() {
             got += 1;
         }
-        assert!(got as f64 > burst as f64 * 0.95, "只收到 {got}/{burst}");
+        assert!(
+            got as f64 > burst as f64 * 0.95,
+            "只收到 {got}/{burst}（{buffer_detail}）"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_recv_buffer_size(sock: &UdpSocket) -> usize {
+        use std::os::fd::AsRawFd;
+
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: value 和 len 都是可写的有效指针；socket 在调用期间仍存活。
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "读取 SO_RCVBUF 失败：{}", io::Error::last_os_error());
+        assert_eq!(len as usize, std::mem::size_of_val(&value));
+        assert!(value > 0, "SO_RCVBUF 必须为正：{value}");
+        value as usize
     }
 
     /// 回归测试：读超时周期跟到包间隔同频时，Winsock 会吃掉数据报。

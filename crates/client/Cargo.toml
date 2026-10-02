@@ -2,7 +2,9 @@
 name = "client"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# The locked Slint 1.18.1 frontend requires Rust 1.92; portable crates retain
+# their separate workspace minimum and still need an explicit MSRV CI audit.
+rust-version = "1.92"
 license.workspace = true
 description = "篝火客户端。"
 
@@ -12,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 client-core.workspace = true
+client-runtime.workspace = true
 protocol.workspace = true
 # 整条语音链路，**带回声消除和降噪**。不需要任何外部工具链 ——
 # git clone 完 cargo run 就是完整的。

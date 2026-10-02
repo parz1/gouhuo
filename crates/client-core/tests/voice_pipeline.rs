@@ -38,7 +38,10 @@ use voice_core::audio::{
     Capture, CollectingRender, NullRender, Render, SyntheticCapture, FRAME_SAMPLES, SAMPLE_RATE,
 };
 use voice_core::identity::Identity;
-use voice_core::pipeline::{default_jitter, Pipeline, PipelineConfig, TransmitMode};
+use voice_core::pipeline::{default_jitter, Pipeline, PipelineConfig, PipelineState, TransmitMode};
+
+#[path = "support/measured_audio.rs"]
+mod measured_audio;
 
 /// 啁啾前面留多少帧静音。
 ///
@@ -261,6 +264,8 @@ fn a_cue_comes_out_of_the_speakers() {
 /// **量端到端延迟。** 见模块文档：这个数字不含声卡和 APM。
 #[test]
 fn end_to_end_latency_is_measured_not_added_up() {
+    use measured_audio::{MeasuredCapture, MeasuredRender};
+
     let server = start_server();
     let alice = join(&server, "阿狸");
     let bob = join(&server, "波波");
@@ -269,20 +274,9 @@ fn end_to_end_latency_is_measured_not_added_up() {
     source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * CHIRP_FRAMES));
     source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * TAIL_FRAMES));
 
-    let capture = SyntheticCapture::new(source.clone()).then_silence();
-    let capture_t0 = capture.first_frame_at();
-    let _alice_voice = Pipeline::start(
-        voice_config(&alice, &server, TransmitMode::Always),
-        Box::new(capture),
-        Box::new(NullRender::default()),
-        None,
-    )
-    .unwrap();
-
-    let (render, played) = CollectingRender::new();
-    let render_t0 = render.first_frame_at();
+    let (render, rendered) = MeasuredRender::new();
     let silent = SyntheticCapture::new(Vec::new()).then_silence();
-    let _bob_voice = Pipeline::start(
+    let bob_voice = Pipeline::start(
         voice_config(&bob, &server, TransmitMode::PushToTalk),
         Box::new(silent),
         Box::new(render),
@@ -290,39 +284,137 @@ fn end_to_end_latency_is_measured_not_added_up() {
     )
     .unwrap();
 
-    let total_frames = LEAD_FRAMES + CHIRP_FRAMES + TAIL_FRAMES;
-    std::thread::sleep(Duration::from_millis((total_frames * 10 + 500) as u64));
+    // 互相关只搜索非负采样滞后，因此接收端的采样原点必须先于发送端。
+    // 先等到真实第一帧播放完成，避免并行测试下线程启动顺序反转原点。
+    let render_deadline = Instant::now() + Duration::from_secs(5);
+    while rendered.lock().unwrap().frames.is_empty() {
+        assert!(
+            Instant::now() < render_deadline,
+            "接收端播放未在期限内就绪：{:?}",
+            bob_voice.stats()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
-    let played = played.lock().unwrap().clone();
-    let cap_t0 = capture_t0.lock().unwrap().expect("采集没起来");
-    let play_t0 = render_t0.lock().unwrap().expect("播放没起来");
+    let (capture, captured) = MeasuredCapture::new(source.clone());
+    let alice_voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::Always),
+        Box::new(capture),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+
+    // 等实际源帧与播放尾巴到齐，不能用墙钟 sleep 推定线程按时跑完了。
+    let source_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_end = captured.lock().unwrap().sample_time(source.len() - 1);
+        let played_until = rendered.lock().unwrap().frames.last().map(|f| f.at);
+        if source_end.is_some_and(|end| {
+            played_until.is_some_and(|at| at >= end + Duration::from_millis(500))
+        }) {
+            break;
+        }
+        if Instant::now() >= source_deadline {
+            let captured = captured.lock().unwrap().clone();
+            let rendered = rendered.lock().unwrap().clone();
+            let origin = captured
+                .frames
+                .iter()
+                .chain(&rendered.frames)
+                .map(|f| f.at)
+                .min()
+                .unwrap_or_else(Instant::now);
+            panic!(
+                "信号未在期限内完成；发送端 {:?}，接收端 {:?}\n采集 {}\n播放 {}",
+                alice_voice.stats(),
+                bob_voice.stats(),
+                captured.timing_report(origin),
+                rendered.timing_report(origin)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let alice_stats = alice_voice.stats();
+    let bob_stats = bob_voice.stats();
+    // 重的相关计算发生在测量结束之后，不与仍在跑的音频线程抢 CPU。
+    drop(alice_voice);
+    drop(bob_voice);
+    let captured = captured.lock().unwrap().clone();
+    let rendered = rendered.lock().unwrap().clone();
+    let cap_t0 = captured.frames.first().expect("采集没起来").at;
+    let play_t0 = rendered.frames.first().expect("播放没起来").at;
+    let origin = cap_t0.min(play_t0);
+    let diagnostic = || {
+        format!(
+            "初始 muted=false/deafened=false；发送 Always，接收 PTT/released；\
+             发送端 {alice_stats:?}，接收端 {bob_stats:?}\n采集 {}\n播放 {}",
+            captured.timing_report(origin),
+            rendered.timing_report(origin)
+        )
+    };
+    assert!(
+        play_t0 <= cap_t0,
+        "接收端采样原点必须先于发送端；{}",
+        diagnostic()
+    );
+    assert!(
+        alice_stats.udp_ok
+            && bob_stats.udp_ok
+            && alice_stats.packets_sent > 100
+            && bob_stats.packets_received > 100,
+        "真实 UDP 链路没有完成信号传输；{}",
+        diagnostic()
+    );
 
     // ---- 方法一：互相关 ----
     //
     // 拿啁啾中段当参考（避开起播和收尾），在播出来的采样点里找它。
     let reference = to_i16(&source);
-    let observed = to_i16(&played);
+    let observed = to_i16(&rendered.samples);
     let ref_start = FRAME_SAMPLES * (LEAD_FRAMES + CHIRP_FRAMES / 4);
     let ref_len = FRAME_SAMPLES * (CHIRP_FRAMES / 2);
-    // 最多找 300 ms —— 比任何合理的延迟都宽，找不到就是真的没到
-    let max_lag = (SAMPLE_RATE as usize * 300) / 1000;
-
-    let estimate = voice_core::signal::best_lag(&reference, &observed, ref_start, ref_len, max_lag)
-        .expect("互相关没跑起来：播出来的采样点不够长");
+    // 搜索的仍是物理 0..300 ms；跳拍后两端样本序号不能当作同一把时钟。
+    let in_at = captured
+        .sample_time(ref_start)
+        .unwrap_or_else(|| panic!("参考帧没有采集时间；{}", diagnostic()));
+    let candidates = rendered
+        .candidate_window(in_at, Duration::from_millis(300), ref_len)
+        .unwrap_or_else(|| panic!("没有完整的物理延迟搜索窗口；{}", diagnostic()));
+    let observed_start = *candidates.start();
+    let max_lag = *candidates.end() - observed_start;
+    let estimate = voice_core::signal::best_lag(
+        &reference[ref_start..ref_start + ref_len],
+        &observed[observed_start..],
+        0,
+        ref_len,
+        max_lag,
+    )
+    .unwrap_or_else(|| panic!("互相关没跑起来：播出来的采样点不够长；{}", diagnostic()));
     assert!(
         estimate.peak > 0.3,
-        "相关峰值只有 {:.2}，捞到的多半不是那个啁啾",
-        estimate.peak
+        "相关峰值只有 {:.2}，捞到的多半不是那个啁啾；参考位置 {ref_start}，\
+         搜索位置 {candidates:?}，{}",
+        estimate.peak,
+        diagnostic()
     );
-    assert!(!estimate.at_boundary, "峰值落在搜索范围边界上，结果不可信");
+    assert!(
+        !estimate.at_boundary,
+        "峰值落在搜索范围边界上，结果不可信；{}",
+        diagnostic()
+    );
 
-    // 参考信号第 ref_start 个采样点是 cap_t0 + ref_start/fs 那一刻进链路的。
-    // 它在播出来的序列里落在第 ref_start + lag 个采样点，也就是
-    // play_t0 + (ref_start + lag)/fs 那一刻出耳朵。
-    let fs = SAMPLE_RATE as f64;
-    let in_at = cap_t0 + Duration::from_secs_f64(ref_start as f64 / fs);
-    let out_at = play_t0 + Duration::from_secs_f64((ref_start + estimate.lag) as f64 / fs);
-    let measured_ms = out_at.saturating_duration_since(in_at).as_secs_f64() * 1000.0;
+    let observed_sample = observed_start + estimate.lag;
+    let out_at = rendered
+        .sample_time(observed_sample)
+        .unwrap_or_else(|| panic!("匹配帧没有播放时间；{}", diagnostic()));
+    assert!(
+        out_at >= in_at,
+        "匹配声音早于采集，测量不可信；{}",
+        diagnostic()
+    );
+    let measured_ms = out_at.duration_since(in_at).as_secs_f64() * 1000.0;
 
     // ---- 方法二：理论下限 ----
     //
@@ -334,17 +426,27 @@ fn end_to_end_latency_is_measured_not_added_up() {
     println!("端到端（不含声卡和 APM）：{measured_ms:.1} ms");
     println!("理论下限：{floor:.1} ms");
     println!("相关峰值：{:.3}", estimate.peak);
+    println!(
+        "匹配样本：capture[{ref_start}] -> render[{observed_sample}]；\
+         采集 late/skip={}/{}，播放 late/skip={}/{}",
+        captured.frames.last().unwrap().late_ticks,
+        captured.frames.last().unwrap().skipped_ticks,
+        rendered.frames.last().unwrap().late_ticks,
+        rendered.frames.last().unwrap().skipped_ticks,
+    );
 
     assert!(
         measured_ms >= floor - 2.0,
         "实测 {measured_ms:.1} ms 比理论下限 {floor:.1} ms 还小 —— \
-         多半是某一段没真的生效"
+         多半是某一段没真的生效；{}",
+        diagnostic()
     );
     // 上限放得很宽：这是「跑通」的第一版，固定抖动缓冲，而且测试机器上
     // 还跑着服务端和两条链路。收紧要等自适应缓冲那一步。
     assert!(
         measured_ms < 150.0,
-        "实测 {measured_ms:.1} ms，比理论下限 {floor:.1} ms 大太多了"
+        "实测 {measured_ms:.1} ms，比理论下限 {floor:.1} ms 大太多了；{}",
+        diagnostic()
     );
 }
 
@@ -742,9 +844,13 @@ fn a_capture_failure_is_reported_while_receive_remains_available() {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let stats = voice.stats();
-        if let Some(error) = stats.error {
+        if let Some(error) = &stats.error {
             assert!(error.contains("麦克风"));
             assert!(error.contains("重试语音"));
+            assert_eq!(stats.capture_error.as_ref(), Some(error));
+            assert!(!stats.input_available);
+            assert!(!stats.transmitting);
+            assert!(stats.render_error.is_none());
             if stats.udp_ok {
                 break;
             }
@@ -774,10 +880,15 @@ fn a_playback_failure_does_not_stop_sending_voice() {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let stats = voice.stats();
-        if let Some(error) = stats.error {
+        if let Some(error) = &stats.error {
             assert!(error.contains("播放"));
             assert!(error.contains("重试语音"));
+            assert_eq!(stats.render_error.as_ref(), Some(error));
+            assert!(!stats.render_available);
+            assert!(stats.capture_error.is_none());
             if stats.packets_sent > 10 {
+                assert!(stats.transmitting, "输出失败时仍在发送，状态不能被错误抹掉");
+                assert!(stats.input_available);
                 break;
             }
         }
@@ -876,6 +987,8 @@ fn quiescing_stops_transport_but_plays_the_local_disconnect_notice() {
         std::thread::sleep(Duration::from_millis(10));
     }
     voice.quiesce();
+    assert!(!voice.stats().transmitting);
+    assert!(!voice.stats().input_available);
     std::thread::sleep(Duration::from_millis(100));
     let sent = voice.stats().packets_sent;
     collected.lock().unwrap().clear();
@@ -889,6 +1002,279 @@ fn quiescing_stops_transport_but_plays_the_local_disconnect_notice() {
         "intentional capture shutdown is not a device failure"
     );
     assert!(collected.lock().unwrap().iter().any(|s| s.abs() > 0.05));
+    assert!(voice.stats().render_available);
+}
+
+/// 每次只让采集返回一帧；下一次 read 开始后，上一帧的编码和状态提交已经完成。
+/// 验证 VAD 尾音和即时控制时不依赖设备调度与固定 sleep。
+enum CaptureStep {
+    Frame(f32),
+    Fail,
+}
+
+struct SteppedCapture {
+    steps: std::sync::mpsc::Receiver<CaptureStep>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Capture for SteppedCapture {
+    fn read(&mut self, frame: &mut [f32]) -> std::io::Result<bool> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.steps.recv() {
+            Ok(CaptureStep::Frame(value)) => {
+                frame.fill(value);
+                Ok(true)
+            }
+            Ok(CaptureStep::Fail) => Err(std::io::Error::other("受控采集故障")),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+struct SteppedVoice {
+    voice: Option<Pipeline>,
+    steps: Option<std::sync::mpsc::Sender<CaptureStep>>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    completed: usize,
+}
+
+impl SteppedVoice {
+    fn start(config: PipelineConfig, initial: PipelineState) -> Self {
+        let (steps, input) = std::sync::mpsc::channel();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voice = Pipeline::start_with_state(
+            config,
+            Box::new(SteppedCapture {
+                steps: input,
+                reads: reads.clone(),
+            }),
+            Box::new(NullRender::default()),
+            None,
+            initial,
+        )
+        .unwrap();
+        Self {
+            voice: Some(voice),
+            steps: Some(steps),
+            reads,
+            completed: 0,
+        }
+    }
+
+    fn voice(&self) -> &Pipeline {
+        self.voice.as_ref().unwrap()
+    }
+
+    fn frame(&mut self, value: f32) {
+        self.steps
+            .as_ref()
+            .unwrap()
+            .send(CaptureStep::Frame(value))
+            .unwrap();
+        self.completed += 1;
+        wait_until(|| self.reads.load(std::sync::atomic::Ordering::SeqCst) > self.completed);
+    }
+}
+
+impl Drop for SteppedVoice {
+    fn drop(&mut self) {
+        // 即使断言 panic，也先解除受控 Capture 的阻塞，然后才 join Pipeline。
+        self.steps.take();
+        self.voice.take();
+    }
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !condition() {
+        assert!(Instant::now() < deadline, "受控语音链路未达到预期状态");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn actual_transmission_preserves_vad_tail_and_clears_on_mute_or_capture_failure() {
+    let server = start_server();
+    let client = join(&server, "controlled-vad");
+    let mut source = SteppedVoice::start(
+        voice_config(
+            &client,
+            &server,
+            TransmitMode::VoiceActivity {
+                threshold_db: -45.0,
+            },
+        ),
+        PipelineState::default(),
+    );
+    source.frame(0.0);
+    assert!(source.voice().stats().input_available);
+    assert!(!source.voice().stats().transmitting);
+    source.frame(0.2);
+    assert!(source.voice().stats().transmitting);
+    for _ in 0..200 / voice_core::audio::FRAME_MS {
+        source.frame(0.0);
+        assert!(source.voice().stats().transmitting, "VAD 尾音包还在发");
+    }
+    source.frame(0.0);
+    assert!(!source.voice().stats().transmitting);
+
+    source.frame(0.2);
+    source.voice().set_muted(true);
+    assert!(
+        !source.voice().stats().transmitting,
+        "闭麦不能等待下一帧才更新"
+    );
+    assert!(source.voice().stats().input_available, "闭麦不关闭电平采集");
+    let before = source.voice().stats().packets_sent;
+    source.frame(0.2);
+    assert_eq!(source.voice().stats().packets_sent, before);
+    source.voice().set_muted(false);
+    source.frame(0.2);
+    assert!(source.voice().stats().transmitting);
+    source
+        .steps
+        .as_ref()
+        .unwrap()
+        .send(CaptureStep::Fail)
+        .unwrap();
+    wait_until(|| source.voice().stats().capture_error.is_some());
+    wait_until(|| !source.voice().stats().input_available);
+    assert!(!source.voice().stats().transmitting);
+    assert!(source.voice().stats().render_error.is_none());
+}
+
+#[test]
+fn ptt_release_and_permission_revocation_hide_transmission_without_another_frame() {
+    let server = start_server();
+    let client = join(&server, "controlled-ptt");
+    let mut source = SteppedVoice::start(
+        voice_config(&client, &server, TransmitMode::PushToTalk),
+        PipelineState {
+            transmitting: true,
+            ..PipelineState::default()
+        },
+    );
+    source.frame(0.2);
+    assert!(source.voice().stats().transmitting);
+    source.voice().set_transmitting(false);
+    assert!(!source.voice().stats().transmitting);
+    source.voice().set_transmitting(true);
+    assert!(
+        !source.voice().stats().transmitting,
+        "新按键不伪装成已提交音频"
+    );
+    source.frame(0.2);
+    assert!(source.voice().stats().transmitting);
+    source.voice().set_send_enabled(false);
+    assert!(!source.voice().stats().transmitting);
+    let sent = source.voice().stats().packets_sent;
+    source.frame(0.2);
+    assert_eq!(source.voice().stats().packets_sent, sent);
+    source.voice().quiesce();
+    assert!(!source.voice().stats().input_available);
+    assert!(!source.voice().stats().udp_failed, "主动退场不是网络故障");
+}
+
+#[test]
+fn initial_permission_blocks_voice_and_keepalive_until_the_candidate_is_accepted() {
+    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sink.set_nonblocking(true).unwrap();
+    let mut source = SteppedVoice::start(
+        PipelineConfig {
+            sequences: Arc::new(protocol::VoiceSequences::default()),
+            session_id: 7,
+            server: sink.local_addr().unwrap(),
+            upstream_key: [1; 32],
+            downstream_key: [2; 32],
+            jitter: default_jitter(),
+            mode: TransmitMode::Always,
+        },
+        PipelineState {
+            send_enabled: false,
+            transmitting: true,
+            ..PipelineState::default()
+        },
+    );
+    for _ in 0..4 {
+        source.frame(0.2);
+    }
+    wait_until(|| source.voice().stats().render_available);
+    assert!(source.voice().stats().input_available);
+    assert_eq!(source.voice().stats().packets_sent, 0);
+    assert!(!source.voice().stats().transmitting);
+    let mut wire = [0; 2048];
+    assert_eq!(
+        sink.recv_from(&mut wire).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    source.voice().set_muted(true);
+    source.voice().set_send_enabled(true);
+    source.frame(0.2);
+    assert_eq!(
+        source.voice().stats().packets_sent,
+        0,
+        "先注入闭麦再接纳不能漏音"
+    );
+    wait_until(|| sink.recv_from(&mut wire).is_ok());
+    source.voice().set_muted(false);
+    source.frame(0.2);
+    assert!(source.voice().stats().transmitting);
+}
+
+#[test]
+fn initial_muted_state_is_applied_before_the_first_capture_frame() {
+    let server = start_server();
+    let client = join(&server, "initial-mute");
+    let mut source = SteppedVoice::start(
+        voice_config(&client, &server, TransmitMode::Always),
+        PipelineState {
+            muted: true,
+            deafened: true,
+            transmitting: true,
+            monitoring: true,
+            ..PipelineState::default()
+        },
+    );
+    assert!(source.voice().is_monitoring());
+    source.frame(0.2);
+    assert!(source.voice().stats().input_available);
+    assert_eq!(source.voice().stats().packets_sent, 0);
+    assert!(!source.voice().stats().transmitting);
+    source.voice().set_muted(false);
+    source.frame(0.2);
+    assert_eq!(source.voice().stats().packets_sent, 1);
+    assert!(source.voice().stats().transmitting);
+}
+
+#[test]
+fn dropping_a_control_handle_neither_joins_nor_stops_the_owned_pipeline() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<voice_core::pipeline::PipelineControl>();
+    let server = start_server();
+    let client = join(&server, "control-handle");
+    let mut source = SteppedVoice::start(
+        voice_config(&client, &server, TransmitMode::Always),
+        PipelineState::default(),
+    );
+    source.frame(0.2);
+    let control = source.voice().control();
+    let (finished, done) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        drop(control);
+        finished.send(()).unwrap();
+    });
+    // 采集此时阻塞，若控制句柄持有线程并 join，这里就不会返回。
+    done.recv_timeout(Duration::from_secs(1))
+        .expect("控制句柄释放等待了音频线程");
+    worker.join().unwrap();
+    source.frame(0.2);
+    assert_eq!(source.voice().stats().packets_sent, 2);
+    let survivor = source.voice().control();
+    source.steps.take();
+    source.voice.take();
+    assert!(!survivor.stats().transmitting);
+    assert!(!survivor.stats().input_available);
+    assert!(!survivor.stats().render_available);
 }
 
 /// A real UDP relay independently blocks each direction while TLS stays connected.

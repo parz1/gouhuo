@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { ScrollView } from "std-widgets.slint";
+import { Field } from "../theme.slint";
+import { Row } from "types.slint";
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component ChannelNavigator inherits Rectangle {
+    in property <bool> preview-enabled: false;
+    in property <string> server;
+    in property <[Row]> rows;
+    in property <bool> can-create;
+    in property <bool> sending;
+    in property <bool> stale;
+    in property <int> restore-member: -1;
+    callback join-channel(int);
+    callback open-member(int);
+    callback create-channel(string);
+    callback delete-channel(int);
+    callback rename-channel(int, string);
+    property <int> cursor: 0;
+    property <int> cursor-id: root.rows.length > 0 ? root.rows[0].id : -1;
+    property <bool> cursor-channel: root.rows.length > 0 && root.rows[0].is-channel;
+    property <bool> creating: false;
+    property <string> create-name;
+    property <int> renaming: -1;
+    property <string> rename-name;
+    background: CallTokens.panel;
+    forward-focus: list-focus;
+    public function focus-list() { list-focus.focus(); }
+    function move-cursor(delta: int) {
+        root.cursor = Math.clamp(root.cursor + delta, 0, root.rows.length - 1);
+        root.cursor-id = root.rows[root.cursor].id;
+        root.cursor-channel = root.rows[root.cursor].is-channel;
+        let top = root.cursor * 34px + 6px;
+        if (top < -navigation-scroll.content-y) { navigation-scroll.content-y = -top; }
+        else if (top + 36px > -navigation-scroll.content-y + navigation-scroll.visible-height) { navigation-scroll.content-y = Math.max(navigation-scroll.visible-height - navigation-scroll.content-height, navigation-scroll.visible-height - top - 36px); }
+    }
+    function activate(row: Row) {
+        if (row.is-channel) { root.join-channel(row.id); }
+        else if (!row.is-me) { root.open-member(row.id); }
+    }
+    VerticalLayout {
+        spacing: 0;
+        Rectangle { height: 56px; Text { x: 12px; width: parent.width - 24px; height: 100%; text: root.server; min-width: 0; overflow: elide; color: CallTokens.text; font-size: 15px; font-weight: 600; vertical-alignment: center; } }
+        Rectangle { height: 1px; background: CallTokens.line; }
+        list-focus := FocusScope {
+            vertical-stretch: 1;
+            key-pressed(event) => {
+                if (event.text == Key.DownArrow && root.rows.length > 0) { root.move-cursor(1); return accept; }
+                if (event.text == Key.UpArrow && root.rows.length > 0) { root.move-cursor(-1); return accept; }
+                if ((event.text == Key.Return || event.text == " ") && root.rows.length > root.cursor && root.rows[root.cursor].id == root.cursor-id && root.rows[root.cursor].is-channel == root.cursor-channel) { root.activate(root.rows[root.cursor]); return accept; }
+                if (!root.preview-enabled && event.text == Key.F2 && root.rows.length > root.cursor && root.rows[root.cursor].can-edit) { root.rename-name = root.rows[root.cursor].name; root.renaming = root.cursor-id; return accept; }
+                return reject;
+            }
+            navigation-scroll := ScrollView {
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 2px;
+                    alignment: start;
+                    for row[i] in root.rows: VerticalLayout {
+                        if row.is-channel && root.renaming == row.id: HorizontalLayout {
+                            spacing: 4px;
+                            Field { height: 32px; min-width: 0; horizontal-stretch: 1; text <=> root.rename-name; init => { self.focus(); } accepted => { if (root.rename-name != "") { root.rename-channel(row.id, root.rename-name); root.renaming = -1; list-focus.focus(); } } }
+                            CallButton { width: 30px; height: 32px; icon: @image-url("icons/close.svg"); accessible-label: "取消频道改名"; clicked => { root.renaming = -1; list-focus.focus(); } }
+                        }
+                        if root.renaming != row.id || !row.is-channel: Rectangle {
+                            height: row.is-channel ? 34px : 32px;
+                            border-radius: 6px;
+                            border-width: list-focus.has-focus && root.cursor-id == row.id && root.cursor-channel == row.is-channel ? 2px : 0px;
+                            border-color: CallTokens.warm;
+                            background: row.is-channel && row.is-current ? CallTokens.raised : row-touch.has-hover ? CallTokens.hover : transparent;
+                            accessible-role: button;
+                            accessible-label: row.name + (row.is-channel ? "，频道，" + row.count + " 人" : row.is-me ? "，我" : row.deafened ? "，关闭声音" : row.muted ? "，闭麦" : row.speaking && !root.stale ? "，正在说话" : "");
+                            accessible-action-default => { root.activate(row); }
+                            property <Row> stable-row: row;
+                            changed stable-row => { if (row.id == root.cursor-id && row.is-channel == root.cursor-channel) { root.cursor = i; } }
+                            in property <int> restore-id: root.restore-member;
+                            changed restore-id => { if (!row.is-channel && row.id == self.restore-id) { root.cursor = i; root.cursor-id = row.id; root.cursor-channel = row.is-channel; list-focus.focus(); } }
+                            HorizontalLayout {
+                                padding-left: 8px + Math.min(row.depth * 10px, 30px);
+                                padding-right: row.is-channel && (row-touch.has-hover || (list-focus.has-focus && root.cursor == i)) ? (6px + (row.can-edit ? 26px : 0px) + (row.can-delete ? 26px : 0px)) : 6px;
+                                spacing: 6px;
+                                if !row.is-channel: Rectangle { width: 14px; height: 100%; Image {
+                                    x: 0; y: (parent.height - self.height) / 2;
+                                    source: row.deafened ? @image-url("icons/headphones-off.svg") : row.muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+                                    width: 14px;
+                                    height: 14px;
+                                    colorize: !root.stale && (row.is-me ? root.sending : row.speaking) ? CallTokens.speaking : row.deafened || row.muted ? CallTokens.warm : CallTokens.dim;
+                                } }
+                                Text { text: row.name + (row.is-me ? "（我）" : ""); min-width: 0; horizontal-stretch: 1; overflow: elide; color: row.is-me ? CallTokens.warm : CallTokens.text; font-size: row.is-channel ? 13px : 14px; font-weight: row.is-channel ? 600 : 400; vertical-alignment: center; }
+                                if row.is-channel && !(row-touch.has-hover || (list-focus.has-focus && root.cursor == i)): Text { text: row.count; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; }
+                                if !row.is-channel && !row.is-me && row.volume != 100: Text { text: row.volume == 0 ? "静音" : row.volume + "%"; color: CallTokens.warm; font-size: 10px; vertical-alignment: center; }
+                            }
+                            row-touch := TouchArea { mouse-cursor: pointer; clicked => { root.cursor = i; root.cursor-id = row.id; root.cursor-channel = row.is-channel; list-focus.focus(); root.activate(row); } }
+                            // Channel management remains available by pointer and keyboard.
+                            if row.is-channel && (row-touch.has-hover || (list-focus.has-focus && root.cursor == i)): HorizontalLayout {
+                                x: parent.width - self.width - 4px;
+                                y: 3px;
+                                width: (row.can-edit ? 26px : 0px) + (row.can-delete ? 26px : 0px);
+                                height: 28px;
+                                if row.can-edit: CallButton { width: 26px; height: 28px; icon: @image-url("icons/edit.svg"); accessible-label: "重命名频道 " + row.name; clicked => { root.rename-name = row.name; root.renaming = row.id; } }
+                                if row.can-delete: CallButton { width: 26px; height: 28px; icon: @image-url("icons/close.svg"); accessible-label: "删除频道 " + row.name; danger: true; clicked => { root.delete-channel(row.id); } }
+                            }
+                        }
+                    }
+                    if root.can-create && !root.creating: CallButton { height: 34px; quiet: true; label: "＋ 新建频道"; clicked => { root.creating = true; root.create-name = ""; } }
+                    if root.can-create && root.creating: HorizontalLayout {
+                        spacing: 4px;
+                        Field { height: 32px; min-width: 0; horizontal-stretch: 1; placeholder: "频道名"; text <=> root.create-name; init => { self.focus(); } accepted => { if (root.create-name != "") { root.create-channel(root.create-name); root.creating = false; list-focus.focus(); } } }
+                        CallButton { width: 30px; height: 32px; icon: @image-url("icons/close.svg"); accessible-label: "取消新建频道"; clicked => { root.creating = false; list-focus.focus(); } }
+                    }
+                }
+            }
+        }
+    }
+}

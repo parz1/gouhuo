@@ -216,15 +216,19 @@ pub fn detail(r: &RunResult) {
         r.codec_cpu_pct,
         redline::CPU_PCT
     );
-    println!(
-        "    进程 CPU   {:.2}% 单核  <- 含探针自己的自旋等待和网络仿真线程，不可比",
-        r.cpu_pct
-    );
-    println!(
-        "    峰值工作集 {:.1} MB（红线 {:.0} MB，但要等 voice-core 独立进程后才算数）",
-        r.peak_rss_bytes as f64 / 1_048_576.0,
-        redline::VOICE_CORE_RSS_MB
-    );
+    if cfg!(windows) {
+        println!(
+            "    进程 CPU   {:.2}% 单核  <- 含探针自己的自旋等待和网络仿真线程，不可比",
+            r.cpu_pct
+        );
+        println!(
+            "    峰值工作集 {:.1} MB（红线 {:.0} MB，但要等 voice-core 独立进程后才算数）",
+            r.peak_rss_bytes as f64 / 1_048_576.0,
+            redline::VOICE_CORE_RSS_MB
+        );
+    } else {
+        println!("    进程 CPU / 峰值工作集：不可用（仅 Windows 支持；JSON 中以 0 表示）");
+    }
     println!(
         "    说话时单条上行 {:.1} kbps（红线 {:.0}）",
         r.speaking_kbps,

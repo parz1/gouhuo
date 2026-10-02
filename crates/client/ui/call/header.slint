@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+component HeaderActions inherits Rectangle {
+    in property <bool> narrow;
+    in property <bool> navigation;
+    in property <bool> chat;
+    in property <bool> unread;
+    in property <int> navigation-focus;
+    in property <int> chat-focus;
+    in property <int> more-focus;
+    callback toggle-navigation();
+    callback toggle-chat();
+    callback more();
+    callback leave();
+    HorizontalLayout {
+        spacing: 8px;
+        if root.narrow: CallButton { width: root.navigation ? 100px : 76px; label: root.navigation ? "返回通话" : "频道"; icon: root.navigation ? @image-url("icons/back.svg") : @image-url("icons/channel.svg"); focus-epoch: root.navigation-focus; clicked => { root.toggle-navigation(); } }
+        CallButton { width: 60px; label: root.chat ? "篝火" : root.unread ? "文字 ·" : "文字"; selected: root.chat; focus-epoch: root.chat-focus; clicked => { root.toggle-chat(); } }
+        CallButton { width: 36px; icon: @image-url("icons/more.svg"); accessible-label: "更多通话操作"; focus-epoch: root.more-focus; clicked => { root.more(); } }
+        if root.narrow: Rectangle { horizontal-stretch: 1; }
+        CallButton { width: 60px; label: "离开"; clicked => { root.leave(); } }
+    }
+}
+
+export component CallHeader inherits Rectangle {
+    in property <string> server;
+    in property <string> channel;
+    in property <int> count;
+    in property <bool> narrow;
+    in property <bool> navigation;
+    in property <bool> chat;
+    in property <bool> unread;
+    in property <int> navigation-focus;
+    in property <int> chat-focus;
+    in property <int> more-focus;
+    callback toggle-navigation();
+    callback toggle-chat();
+    callback more();
+    callback leave();
+    height: root.narrow ? 80px : 56px;
+    background: CallTokens.panel;
+    VerticalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 4px;
+        HorizontalLayout {
+            Text { text: root.channel + " · " + root.count + " 人"; min-width: 0; overflow: elide; color: CallTokens.text; font-size: root.narrow ? 14px : 16px; vertical-alignment: center; horizontal-stretch: 1; }
+            if !root.narrow: HeaderActions { width: 172px; height: 36px; narrow: false; navigation: root.navigation; chat: root.chat; unread: root.unread; navigation-focus: root.navigation-focus; chat-focus: root.chat-focus; more-focus: root.more-focus; toggle-navigation => { root.toggle-navigation(); } toggle-chat => { root.toggle-chat(); } more => { root.more(); } leave => { root.leave(); } }
+            if root.narrow: Text { text: root.server; min-width: 0; max-width: 130px; overflow: elide; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; }
+        }
+        if root.narrow: HeaderActions { height: 34px; narrow: true; navigation: root.navigation; chat: root.chat; unread: root.unread; navigation-focus: root.navigation-focus; chat-focus: root.chat-focus; more-focus: root.more-focus; toggle-navigation => { root.toggle-navigation(); } toggle-chat => { root.toggle-chat(); } more => { root.more(); } leave => { root.leave(); } }
+    }
+}

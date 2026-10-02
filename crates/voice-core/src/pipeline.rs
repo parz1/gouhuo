@@ -122,7 +122,7 @@ impl AudioProcessor for crate::apm::Apm {
 
 /// 什么时候往外发。
 ///
-/// 能在链路跑着的时候改（[`Pipeline::set_mode`]）—— 改设置不该让声音断一下。
+/// 能在链路跑着的时候改（[`PipelineControl::set_mode`]）—— 改设置不该让声音断一下。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransmitMode {
     /// 按住才发。全局热键控制 —— 游戏里最常用的方式。
@@ -175,12 +175,45 @@ pub struct PipelineConfig {
     pub mode: TransmitMode,
 }
 
-/// 界面要显示的东西。
+/// 创建线程之前注入的控制状态，避免重建设备时短暂使用默认开麦状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineState {
+    pub muted: bool,
+    pub deafened: bool,
+    /// PTT 按键意愿；不等同于实际发送状态。
+    pub transmitting: bool,
+    pub monitoring: bool,
+    /// 新链路被当前会话接纳之前禁止语音和保活包。
+    pub send_enabled: bool,
+}
+
+impl Default for PipelineState {
+    fn default() -> Self {
+        Self {
+            muted: false,
+            deafened: false,
+            transmitting: false,
+            monitoring: false,
+            send_enabled: true,
+        }
+    }
+}
+
+/// 与 GUI 无关的语音事实快照。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VoiceStats {
     pub sequences_exhausted: bool,
     pub udp_failed: bool,
     pub error: Option<String>,
+    pub capture_error: Option<String>,
+    pub render_error: Option<String>,
+    pub transport_error: Option<String>,
+    /// 成功提交了语音包且当前控制许可仍有效；包括 VAD 尾音。
+    pub transmitting: bool,
+    /// 最近有采集帧，且采集线程尚未退出。
+    pub input_available: bool,
+    /// 输出已成功写入，且播放线程尚未退出。
+    pub render_available: bool,
     /// UDP 双向保活是否正常；不通时由客户端执行恢复策略。
     pub udp_ok: bool,
     /// 最近一次保活的往返时间，毫秒。
@@ -244,6 +277,14 @@ impl Speaker {
 
 /// 一条跑着的语音链路。丢掉它就会把所有线程停下来。
 pub struct Pipeline {
+    control: PipelineControl,
+    threads: Vec<JoinHandle<()>>,
+}
+
+/// 可以交给任意前端的轻量控制句柄。释放或克隆它不会等待音频线程。
+/// 线程生命周期由 [`Pipeline`] 的唯一所有者管理。
+#[derive(Clone)]
+pub struct PipelineControl {
     sequences: Arc<protocol::VoiceSequences>,
     stop: Arc<AtomicBool>,
     transport_stop: Arc<AtomicBool>,
@@ -252,13 +293,20 @@ pub struct Pipeline {
     deafened: Arc<AtomicBool>,
     mode: Arc<AtomicU32>,
     monitoring: Arc<AtomicBool>,
+    send_enabled: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
     shared: Arc<Shared>,
-    threads: Vec<JoinHandle<()>>,
 }
 
 struct Shared {
     error: Mutex<Option<String>>,
+    capture_error: Mutex<Option<String>>,
+    render_error: Mutex<Option<String>>,
+    transport_error: Mutex<Option<String>>,
+    transport_fatal: AtomicBool,
+    sending: AtomicBool,
+    input_available: AtomicBool,
+    render_available: AtomicBool,
     speakers: Mutex<BTreeMap<u32, Speaker>>,
     /// 每个人的音量，按会话 id。**跟 [`Speaker`] 分开存**：
     ///
@@ -267,7 +315,7 @@ struct Shared {
     ///   音量要是只存在它身上，歇一会儿就悄悄回到 100% 了
     ///
     /// `Speaker::volume` 是这里的缓存，播放线程每帧读它就不用多拿一把锁。
-    /// 锁的顺序永远是先 `speakers` 后 `volumes`，[`Pipeline::set_volume`]
+    /// 锁的顺序永远是先 `speakers` 后 `volumes`，[`PipelineControl::set_volume`]
     /// 两把分开拿、不嵌套。
     volumes: Mutex<BTreeMap<u32, f32>>,
     /// 提示音和念名字，播放线程每帧混一点进去。见 `cue` 模块。
@@ -286,6 +334,58 @@ struct Shared {
 }
 
 impl Shared {
+    fn report_error(&self, target: &Mutex<Option<String>>, message: String) {
+        *target.lock().expect("voice error poisoned") = Some(message.clone());
+        *self.error.lock().expect("voice error poisoned") = Some(message);
+    }
+
+    fn capture_failed(&self, message: String) {
+        self.sending.store(false, Ordering::Relaxed);
+        self.input_available.store(false, Ordering::Relaxed);
+        self.report_error(&self.capture_error, message);
+    }
+
+    fn render_failed(&self, message: String) {
+        self.render_available.store(false, Ordering::Relaxed);
+        self.report_error(&self.render_error, message);
+    }
+
+    fn transport_failed(&self, message: String, fatal: bool) {
+        if fatal {
+            self.transport_fatal.store(true, Ordering::Relaxed);
+        }
+        let mut transport = self.transport_error.lock().expect("voice error poisoned");
+        if !fatal && self.transport_fatal.load(Ordering::Relaxed) {
+            return;
+        }
+        *transport = Some(message.clone());
+        *self.error.lock().expect("voice error poisoned") = Some(message);
+    }
+
+    fn transport_sent(&self) {
+        let mut transport = self.transport_error.lock().expect("voice error poisoned");
+        if self.transport_fatal.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(previous) = transport.take() {
+            let remaining = self
+                .capture_error
+                .lock()
+                .expect("voice error poisoned")
+                .clone()
+                .or_else(|| {
+                    self.render_error
+                        .lock()
+                        .expect("voice error poisoned")
+                        .clone()
+                });
+            let mut error = self.error.lock().expect("voice error poisoned");
+            if error.as_ref() == Some(&previous) {
+                *error = remaining;
+            }
+        }
+    }
+
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
@@ -307,9 +407,19 @@ impl Pipeline {
     /// 起链路。**立刻返回**，三个线程在后台跑。
     pub fn start(
         cfg: PipelineConfig,
+        capture: Box<dyn Capture>,
+        render: Box<dyn Render>,
+        processor: Option<Box<dyn AudioProcessor>>,
+    ) -> io::Result<Self> {
+        Self::start_with_state(cfg, capture, render, processor, PipelineState::default())
+    }
+
+    pub fn start_with_state(
+        cfg: PipelineConfig,
         mut capture: Box<dyn Capture>,
         mut render: Box<dyn Render>,
         processor: Option<Box<dyn AudioProcessor>>,
+        initial: PipelineState,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(match cfg.server {
             SocketAddr::V4(_) => "0.0.0.0:0",
@@ -328,13 +438,21 @@ impl Pipeline {
 
         let stop = Arc::new(AtomicBool::new(false));
         let transport_stop = Arc::new(AtomicBool::new(false));
-        let transmitting = Arc::new(AtomicBool::new(false));
-        let muted = Arc::new(AtomicBool::new(false));
-        let deafened = Arc::new(AtomicBool::new(false));
+        let transmitting = Arc::new(AtomicBool::new(initial.transmitting));
+        let muted = Arc::new(AtomicBool::new(initial.muted));
+        let deafened = Arc::new(AtomicBool::new(initial.deafened));
         let mode = Arc::new(AtomicU32::new(cfg.mode.encode()));
-        let monitoring = Arc::new(AtomicBool::new(false));
+        let monitoring = Arc::new(AtomicBool::new(initial.monitoring));
+        let send_enabled = Arc::new(AtomicBool::new(initial.send_enabled));
         let shared = Arc::new(Shared {
             error: Mutex::new(None),
+            capture_error: Mutex::new(None),
+            render_error: Mutex::new(None),
+            transport_error: Mutex::new(None),
+            transport_fatal: AtomicBool::new(false),
+            sending: AtomicBool::new(false),
+            input_available: AtomicBool::new(false),
+            render_available: AtomicBool::new(false),
             speakers: Mutex::new(BTreeMap::new()),
             volumes: Mutex::new(BTreeMap::new()),
             cues: Arc::new(CueQueue::new()),
@@ -350,7 +468,23 @@ impl Pipeline {
 
         let jitter = cfg.jitter;
         let processor: Option<Arc<dyn AudioProcessor>> = processor.map(Arc::from);
-        let mut threads = Vec::new();
+        // 先创建所有者：任何后续 spawn 失败都会通过 Drop 停止、唤醒并回收已启动线程。
+        let mut pipeline = Self {
+            control: PipelineControl {
+                sequences: Arc::clone(&cfg.sequences),
+                stop: Arc::clone(&stop),
+                transport_stop: Arc::clone(&transport_stop),
+                transmitting: Arc::clone(&transmitting),
+                muted: Arc::clone(&muted),
+                deafened: Arc::clone(&deafened),
+                mode: Arc::clone(&mode),
+                monitoring: Arc::clone(&monitoring),
+                send_enabled: Arc::clone(&send_enabled),
+                socket: Arc::clone(&socket),
+                shared: Arc::clone(&shared),
+            },
+            threads: Vec::new(),
+        };
 
         // ---- 发送 ----
         {
@@ -359,6 +493,7 @@ impl Pipeline {
             let transmitting = Arc::clone(&transmitting);
             let muted = Arc::clone(&muted);
             let monitoring = Arc::clone(&monitoring);
+            let send_enabled = Arc::clone(&send_enabled);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
             let session_id = cfg.session_id;
@@ -366,7 +501,7 @@ impl Pipeline {
             let server = cfg.server;
             let mode = Arc::clone(&mode);
             let sequences = Arc::clone(&cfg.sequences);
-            threads.push(spawn("gouhuo-voice-send", move || {
+            pipeline.threads.push(spawn("gouhuo-voice-send", move || {
                 send_loop(
                     &mut *capture,
                     processor,
@@ -375,6 +510,7 @@ impl Pipeline {
                     &transmitting,
                     &muted,
                     &monitoring,
+                    &send_enabled,
                     &shared,
                     session_id,
                     key,
@@ -392,7 +528,7 @@ impl Pipeline {
             let shared = Arc::clone(&shared);
             let key = cfg.downstream_key;
             let server = cfg.server;
-            threads.push(spawn("gouhuo-voice-recv", move || {
+            pipeline.threads.push(spawn("gouhuo-voice-recv", move || {
                 recv_loop(socket, &stop, &shared, key, server, jitter);
             })?);
         }
@@ -403,7 +539,7 @@ impl Pipeline {
             let deafened = Arc::clone(&deafened);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
-            threads.push(spawn("gouhuo-voice-play", move || {
+            pipeline.threads.push(spawn("gouhuo-voice-play", move || {
                 play_loop(&mut *render, processor, &stop, &deafened, &shared);
             })?);
         }
@@ -417,35 +553,70 @@ impl Pipeline {
             let server = cfg.server;
             let shared = Arc::clone(&shared);
             let sequences = Arc::clone(&cfg.sequences);
-            threads.push(spawn("gouhuo-voice-keepalive", move || {
-                keepalive_loop(socket, &stop, &shared, session_id, key, server, sequences);
-            })?);
+            let send_enabled = Arc::clone(&send_enabled);
+            pipeline
+                .threads
+                .push(spawn("gouhuo-voice-keepalive", move || {
+                    keepalive_loop(
+                        socket,
+                        &stop,
+                        &shared,
+                        session_id,
+                        key,
+                        server,
+                        sequences,
+                        &send_enabled,
+                    );
+                })?);
         }
 
-        Ok(Self {
-            sequences: cfg.sequences,
-            stop,
-            transport_stop,
-            transmitting,
-            muted,
-            deafened,
-            mode,
-            monitoring,
-            socket,
-            shared,
-            threads,
-        })
+        Ok(pipeline)
     }
 
+    pub fn control(&self) -> PipelineControl {
+        self.control.clone()
+    }
+}
+
+impl std::ops::Deref for Pipeline {
+    type Target = PipelineControl;
+
+    fn deref(&self) -> &Self::Target {
+        &self.control
+    }
+}
+
+impl PipelineControl {
     /// 按下/松开说话键。
     pub fn set_transmitting(&self, on: bool) {
         self.transmitting.store(on, Ordering::Relaxed);
+        if !on && matches!(self.mode(), TransmitMode::PushToTalk) {
+            self.shared.sending.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// 改变会话许可；禁用时不发送语音或保活，仍可检查设备就绪状态。
+    pub fn set_send_enabled(&self, enabled: bool) {
+        self.send_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.shared.sending.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// 请求所有线程退出，立刻返回。等待退出由 Pipeline 的所有者完成。
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.quiesce();
+        self.shared.render_available.store(false, Ordering::Relaxed);
     }
 
     /// Stop capture and UDP immediately, retaining the AEC-aware playback path for a local notice.
     pub fn quiesce(&self) {
         self.muted.store(true, Ordering::Relaxed);
+        self.send_enabled.store(false, Ordering::Relaxed);
         self.transport_stop.store(true, Ordering::Relaxed);
+        self.shared.sending.store(false, Ordering::Relaxed);
+        self.shared.input_available.store(false, Ordering::Relaxed);
         self.shared
             .speakers
             .lock()
@@ -472,6 +643,9 @@ impl Pipeline {
     /// 闭麦。压过说话键和 VAD。
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
+        if muted {
+            self.shared.sending.store(false, Ordering::Relaxed);
+        }
     }
 
     /// 关耳朵。链路照常转，只是播出去的是静音 —— 见 [`play_loop`]。
@@ -510,6 +684,7 @@ impl Pipeline {
         self.mode.store(mode.encode(), Ordering::Relaxed);
         // 从语音激活切到按住说话时，如果不清一下，可能会卡在「一直在发」
         self.transmitting.store(false, Ordering::Relaxed);
+        self.shared.sending.store(false, Ordering::Relaxed);
     }
 
     pub fn mode(&self) -> TransmitMode {
@@ -557,18 +732,51 @@ impl Pipeline {
             .unwrap_or_default();
 
         let last = self.shared.last_keepalive_ms.load(Ordering::Relaxed);
-        let udp_ok = last > 0
+        let transport_live =
+            !self.transport_stop.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed);
+        let udp_ok = transport_live
+            && last > 0
             && self.shared.now_ms().saturating_sub(last) < UDP_DEAD_AFTER.as_millis() as u64;
 
         VoiceStats {
             sequences_exhausted: self.sequences.exhausted(),
-            udp_failed: !udp_ok && self.shared.started.elapsed() >= UDP_DEAD_AFTER,
+            udp_failed: transport_live
+                && self.send_enabled.load(Ordering::Relaxed)
+                && !udp_ok
+                && self.shared.started.elapsed() >= UDP_DEAD_AFTER,
             error: self
                 .shared
                 .error
                 .lock()
                 .expect("voice error poisoned")
                 .clone(),
+            capture_error: self
+                .shared
+                .capture_error
+                .lock()
+                .expect("voice error poisoned")
+                .clone(),
+            render_error: self
+                .shared
+                .render_error
+                .lock()
+                .expect("voice error poisoned")
+                .clone(),
+            transport_error: self
+                .shared
+                .transport_error
+                .lock()
+                .expect("voice error poisoned")
+                .clone(),
+            transmitting: transport_live
+                && self.send_enabled.load(Ordering::Relaxed)
+                && !self.muted.load(Ordering::Relaxed)
+                && (!matches!(self.mode(), TransmitMode::PushToTalk)
+                    || self.transmitting.load(Ordering::Relaxed))
+                && self.shared.sending.load(Ordering::Relaxed),
+            input_available: transport_live && self.shared.input_available.load(Ordering::Relaxed),
+            render_available: !self.stop.load(Ordering::Relaxed)
+                && self.shared.render_available.load(Ordering::Relaxed),
             udp_ok,
             rtt_ms: self.shared.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
             packets_sent: self.shared.packets_sent.load(Ordering::Relaxed),
@@ -582,9 +790,7 @@ impl Pipeline {
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.transport_stop.store(true, Ordering::Relaxed);
-        self.wake_receiver();
+        self.shutdown();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -632,6 +838,32 @@ impl TransmitGate {
     }
 }
 
+struct AudioStatusReset<'a> {
+    available: &'a AtomicBool,
+    sending: Option<&'a AtomicBool>,
+}
+
+impl Drop for AudioStatusReset<'_> {
+    fn drop(&mut self) {
+        self.available.store(false, Ordering::Relaxed);
+        if let Some(sending) = self.sending {
+            sending.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+struct TransportStatusReset<'a> {
+    stop: &'a AtomicBool,
+    sending: &'a AtomicBool,
+}
+
+impl Drop for TransportStatusReset<'_> {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.sending.store(false, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     capture: &mut dyn Capture,
@@ -641,6 +873,7 @@ fn send_loop(
     transmitting: &AtomicBool,
     muted: &AtomicBool,
     monitoring: &AtomicBool,
+    send_enabled: &AtomicBool,
     shared: &Shared,
     session_id: u32,
     key: [u8; 32],
@@ -648,12 +881,20 @@ fn send_loop(
     mode: Arc<AtomicU32>,
     sequences: Arc<protocol::VoiceSequences>,
 ) {
+    let _status = AudioStatusReset {
+        available: &shared.input_available,
+        sending: Some(&shared.sending),
+    };
     // 音频线程要优先于游戏线程被调度，否则一次掉帧就是一次爆音。
     crate::clock::boost_current_thread();
 
     let cipher = VoiceCipher::new(&key);
-    let Ok(mut encoder) = VoiceEncoder::new() else {
-        return;
+    let mut encoder = match VoiceEncoder::new() {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            shared.transport_failed(format!("语音编码器无法启动：{error}"), true);
+            return;
+        }
     };
 
     let mut frame = vec![0.0f32; FRAME_SAMPLES];
@@ -668,21 +909,24 @@ fn send_loop(
             Ok(true) => {}
             Ok(false) => {
                 if !stop.load(Ordering::Relaxed) {
-                    *shared.error.lock().expect("voice error poisoned") =
-                        Some("麦克风录音已停止，正在尝试恢复。请检查设备连接。".into());
+                    shared
+                        .capture_failed("麦克风录音已停止，正在尝试恢复。请检查设备连接。".into());
                 }
                 return;
             }
             Err(error) => {
-                *shared.error.lock().expect("voice error poisoned") = Some(format!(
-                    "麦克风无法继续录音：{error}。请检查设备后点重试语音，或在设置里换一个麦克风。"
-                ));
+                if !stop.load(Ordering::Relaxed) {
+                    shared.capture_failed(format!(
+                        "麦克风无法继续录音：{error}。请检查设备后点重试语音，或在设置里换一个麦克风。"
+                    ));
+                }
                 return;
             }
         }
         if stop.load(Ordering::Relaxed) {
             return;
         }
+        shared.input_available.store(true, Ordering::Relaxed);
         let timestamp = sequences.advance_samples(FRAME_SAMPLES as u32);
 
         if let Some(processor) = &processor {
@@ -711,10 +955,11 @@ fn send_loop(
             TransmitMode::decode(mode.load(Ordering::Relaxed)),
             level,
             transmitting.load(Ordering::Relaxed),
-            muted.load(Ordering::Relaxed),
+            muted.load(Ordering::Relaxed) || !send_enabled.load(Ordering::Relaxed),
         );
 
         if !sending {
+            shared.sending.store(false, Ordering::Relaxed);
             if was_sending {
                 // 说完了。补一个 terminator，对面立刻收尾而不是等欠载。
                 let Some(seq) = sequences.next(false) else {
@@ -726,7 +971,10 @@ fn send_loop(
                     timestamp,
                     flags: FLAG_TERMINATOR,
                 };
-                if cipher.seal(header, &[], &mut wire).is_ok() {
+                if send_enabled.load(Ordering::Relaxed)
+                    && !stop.load(Ordering::Relaxed)
+                    && cipher.seal(header, &[], &mut wire).is_ok()
+                {
                     let _ = socket.send_to(&wire, server);
                 }
                 was_sending = false;
@@ -735,9 +983,11 @@ fn send_loop(
         }
 
         let Ok(packet) = encoder.encode(&frame) else {
+            shared.sending.store(false, Ordering::Relaxed);
             continue;
         };
         let Some(seq) = sequences.next(false) else {
+            shared.transport_failed("语音加密序号已耗尽，需要重新连接。".into(), true);
             return;
         };
         let header = VoiceHeader {
@@ -746,10 +996,27 @@ fn send_loop(
             timestamp,
             flags: 0,
         };
-        if cipher.seal(header, packet, &mut wire).is_ok() && socket.send_to(&wire, server).is_ok() {
-            shared.packets_sent.fetch_add(1, Ordering::Relaxed);
+        // 编码期间控制意愿可能变化；提交之前再检查，避免已退场的候选链路漏包。
+        let permitted = !stop.load(Ordering::Relaxed)
+            && send_enabled.load(Ordering::Relaxed)
+            && !muted.load(Ordering::Relaxed)
+            && (!matches!(
+                TransmitMode::decode(mode.load(Ordering::Relaxed)),
+                TransmitMode::PushToTalk
+            ) || transmitting.load(Ordering::Relaxed));
+        let mut submitted = false;
+        if permitted && cipher.seal(header, packet, &mut wire).is_ok() {
+            match socket.send_to(&wire, server) {
+                Ok(_) => {
+                    shared.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    shared.transport_sent();
+                    submitted = true;
+                }
+                Err(error) => shared.transport_failed(format!("语音包发送失败：{error}"), false),
+            }
         }
-        was_sending = true;
+        shared.sending.store(submitted, Ordering::Relaxed);
+        was_sending = submitted;
     }
 }
 
@@ -761,17 +1028,37 @@ fn recv_loop(
     server: SocketAddr,
     jitter: JitterConfig,
 ) {
+    let _status = TransportStatusReset {
+        stop,
+        sending: &shared.sending,
+    };
     crate::clock::boost_current_thread();
     let cipher = VoiceCipher::new(&key);
     let mut buf = [0u8; 2048];
     let mut payload = Vec::with_capacity(MAX_DATAGRAM);
 
     while !stop.load(Ordering::Relaxed) {
-        let Ok((n, from)) = socket.recv_from(&mut buf) else {
-            // 收不到不代表完蛋：Windows 上给一个关掉的端口发过包之后，
-            // 下一次 recv 会报 WSAECONNRESET。照着它退出就是「有人退游戏，
-            // 全频道哑了」。
-            continue;
+        let (n, from) = match socket.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(error) => {
+                // 收不到不代表完蛋：Windows 上给一个关掉的端口发过包之后，
+                // 下一次 recv 会报 WSAECONNRESET。照着它退出就是「有人退游戏，
+                // 全频道哑了」。
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match error.kind() {
+                    io::ErrorKind::Interrupted
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionRefused => continue,
+                    _ => {
+                        shared.transport_failed(format!("语音包接收失败：{error}"), true);
+                        return;
+                    }
+                }
+            }
         };
         // **先看停止标志再看包内容。** 关链路时会给自己发一个包把这里叫醒，
         // 所以「收到任何东西 + 已经在停了」就该走人。
@@ -843,6 +1130,10 @@ fn play_loop(
     deafened: &AtomicBool,
     shared: &Shared,
 ) {
+    let _status = AudioStatusReset {
+        available: &shared.render_available,
+        sending: None,
+    };
     crate::clock::boost_current_thread();
 
     let mut mix = vec![0.0f32; FRAME_SAMPLES];
@@ -915,12 +1206,16 @@ fn play_loop(
             processor.analyze_render(&mut mix);
         }
         if let Err(error) = render.write(&mix) {
-            *shared.error.lock().expect("voice error poisoned") = Some(format!("耳机或扬声器无法继续播放：{error}。请检查设备后点重试语音，或在设置里换一个输出设备。"));
+            if !stop.load(Ordering::Relaxed) {
+                shared.render_failed(format!("耳机或扬声器无法继续播放：{error}。请检查设备后点重试语音，或在设置里换一个输出设备。"));
+            }
             return;
         }
+        shared.render_available.store(true, Ordering::Relaxed);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn keepalive_loop(
     socket: Arc<UdpSocket>,
     stop: &AtomicBool,
@@ -929,7 +1224,12 @@ fn keepalive_loop(
     key: [u8; 32],
     server: SocketAddr,
     sequences: Arc<protocol::VoiceSequences>,
+    send_enabled: &AtomicBool,
 ) {
+    let _status = TransportStatusReset {
+        stop,
+        sending: &shared.sending,
+    };
     let cipher = VoiceCipher::new(&key);
     let mut wire = Vec::with_capacity(VOICE_HEADER_LEN + 32);
     // 保活序号从连接的共享计数器取，只有换密钥才从 0 开始。服务端留了单独防重放窗口，
@@ -941,7 +1241,16 @@ fn keepalive_loop(
     // 一上来立刻发一个：服务端要靠它学到我们的地址，不然只听不说的人
     // 会完全听不见声音。
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // 候选链路不能抢占服务端记录的 UDP 地址；接纳后第一包再开始保活。
+        if !send_enabled.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         let Some(seq) = sequences.next(true) else {
+            shared.transport_failed("语音加密序号已耗尽，需要重新连接。".into(), true);
             return;
         };
         let header = VoiceHeader {
@@ -951,8 +1260,14 @@ fn keepalive_loop(
             timestamp: shared.now_us(),
             flags: FLAG_KEEPALIVE,
         };
-        if cipher.seal(header, &[], &mut wire).is_ok() {
-            let _ = socket.send_to(&wire, server);
+        if !stop.load(Ordering::Relaxed)
+            && send_enabled.load(Ordering::Relaxed)
+            && cipher.seal(header, &[], &mut wire).is_ok()
+        {
+            match socket.send_to(&wire, server) {
+                Ok(_) => shared.transport_sent(),
+                Err(error) => shared.transport_failed(format!("语音保活发送失败：{error}"), false),
+            }
         }
 
         // 分成小段睡，这样停的时候不用等满一个周期
@@ -1003,6 +1318,69 @@ pub fn intrinsic_latency_ms(jitter_frames: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_transport_retry_clears_only_recoverable_errors() {
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let owner = Pipeline::start_with_state(
+            PipelineConfig {
+                sequences: Arc::new(protocol::VoiceSequences::default()),
+                session_id: 1,
+                server: sink.local_addr().unwrap(),
+                upstream_key: [1; 32],
+                downstream_key: [2; 32],
+                jitter: default_jitter(),
+                mode: TransmitMode::PushToTalk,
+            },
+            Box::new(crate::audio::SyntheticCapture::new(Vec::new()).then_silence()),
+            Box::new(crate::audio::NullRender::default()),
+            None,
+            PipelineState {
+                send_enabled: false,
+                ..PipelineState::default()
+            },
+        )
+        .unwrap();
+        // Inject OS transport outcomes independently of audio pacing and UDP loss,
+        // which does not necessarily make a local send_to call return an error.
+        owner
+            .shared
+            .transport_failed("temporary send error".into(), false);
+        assert_eq!(
+            owner.stats().transport_error.as_deref(),
+            Some("temporary send error")
+        );
+        owner.shared.transport_sent();
+        assert!(owner.stats().transport_error.is_none());
+        assert!(owner.stats().error.is_none());
+
+        owner
+            .shared
+            .report_error(&owner.shared.render_error, "speaker failed".into());
+        owner
+            .shared
+            .transport_failed("temporary send error".into(), false);
+        owner.shared.transport_sent();
+        assert!(owner.stats().transport_error.is_none());
+        assert_eq!(
+            owner.stats().render_error.as_deref(),
+            Some("speaker failed")
+        );
+        assert_eq!(owner.stats().error.as_deref(), Some("speaker failed"));
+
+        owner
+            .shared
+            .transport_failed("sequence exhausted".into(), true);
+        owner.shared.transport_sent();
+        owner
+            .shared
+            .transport_failed("later transient error".into(), false);
+        assert_eq!(
+            owner.stats().transport_error.as_deref(),
+            Some("sequence exhausted")
+        );
+        assert_eq!(owner.stats().error.as_deref(), Some("sequence exhausted"));
+    }
 
     #[test]
     fn vad_preserves_quiet_tails_but_mute_and_ptt_release_are_immediate() {

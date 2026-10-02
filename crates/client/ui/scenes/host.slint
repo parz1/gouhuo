@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { ScrollView } from "std-widgets.slint";
+import { Campfire, Seat, SeatGeometry } from "../campfire.slint";
+import { CallTokens } from "../call/tokens.slint";
+import { CallButton } from "../call/controls/button.slint";
+
+component CompactMemberButton inherits CallButton {
+    in property <int> member-id;
+    in property <int> restore-id: -1;
+    changed restore-id => { if (root.restore-id == root.member-id) { root.focus(); } }
+}
+
+// Compiled scene boundary: members + geometry + presentation policy in, intents out.
+export component SceneHost inherits Rectangle {
+    in property <[Seat]> seats;
+    in property <[Seat]> waiting;
+    in property <[SeatGeometry]> geometry;
+    in property <bool> waiting-talking;
+    in property <bool> transmitting;
+    in property <bool> stale;
+    in property <image> backdrop;
+    in property <int> restore-member: -1;
+    callback resized(length, length);
+    callback open-member(int);
+    init => { root.resized(self.width, self.height); }
+    changed width => { root.resized(self.width, self.height); }
+    changed height => { root.resized(self.width, self.height); }
+    out property <bool> compact: self.height < 160px;
+    background: #0f1013;
+    if !root.compact: Campfire {
+        seats: root.seats; waiting: root.waiting; geometry: root.geometry; waiting-talking: root.waiting-talking; transmitting: root.transmitting; stale: root.stale; backdrop: root.backdrop; restore-member: root.restore-member;
+        open-member(id) => { root.open-member(id); }
+    }
+    if root.compact: ScrollView {
+        VerticalLayout {
+            padding: 8px;
+            spacing: 4px;
+            alignment: start;
+            for seat in root.seats: VerticalLayout {
+                if seat.present: CompactMemberButton { member-id: seat.id; restore-id: root.restore-member; height: 32px; label: seat.name + (seat.is-me ? "（我）" : "") + (!root.stale && (seat.is-me ? root.transmitting : seat.speaking) ? " · 说话中" : seat.deafened ? " · 关闭声音" : seat.muted ? " · 闭麦" : ""); icon: seat.stone; tint-icon: false; enabled: !seat.is-me; clicked => { root.open-member(seat.id); } }
+            }
+            for seat in root.waiting: CompactMemberButton { member-id: seat.id; restore-id: root.restore-member; height: 32px; label: seat.name + (!root.stale && seat.speaking ? " · 说话中" : seat.deafened ? " · 关闭声音" : seat.muted ? " · 闭麦" : ""); icon: seat.stone; tint-icon: false; clicked => { root.open-member(seat.id); } }
+        }
+    }
+}

@@ -92,7 +92,9 @@ pub struct RunResult {
     /// 不含探针自己的自旋等待和网络仿真线程。
     pub codec_cpu_pct: f64,
     pub speaking_kbps: f64,
+    /// 进程资源采样目前只在 Windows 上可用；其他平台用 0 表示不可用。
     pub cpu_pct: f64,
+    /// 非 Windows 上用 0 表示不可用，不是实测内存。
     pub peak_rss_bytes: u64,
     /// 节拍器没能准时醒的次数。不为 0 的话这一次测量的数字都要打折扣。
     pub capture_late_ticks: u64,
@@ -368,6 +370,7 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
     let mut wire: Vec<u8> = Vec::with_capacity(protocol::MAX_DATAGRAM);
     let (mut tx_packets, mut tx_payload_bytes, mut tx_wire_bytes) = (0u64, 0u64, 0u64);
 
+    #[cfg(windows)]
     let mut cpu = voice_core::sysstat::CpuSampler::start();
     let (mut ticker, cap_t0) = Ticker::start(frame_dur);
 
@@ -406,7 +409,10 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
 
     // ---- 收尾 ----
     let mut playout = play_thread.join().expect("playout thread panicked");
+    #[cfg(windows)]
     let cpu_pct = cpu.sample();
+    #[cfg(not(windows))]
+    let cpu_pct = 0.0;
     let netem_stats = netem.shutdown();
     let relay_stats = relay.map(|r| r.shutdown());
     let relay_forwarded = relay_stats.as_ref().map(|s| s.forwarded).unwrap_or(0);
@@ -437,6 +443,12 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
     let decode_summary = playout.decode_us.summary();
     let codec_cpu_pct =
         (encode_summary.mean + decode_summary.mean) / (cfg.frame_ms as f64 * 1000.0) * 100.0;
+    #[cfg(windows)]
+    let peak_rss_bytes = voice_core::sysstat::mem_info()
+        .map(|m| m.peak_working_set)
+        .unwrap_or(0);
+    #[cfg(not(windows))]
+    let peak_rss_bytes = 0;
 
     Ok(RunResult {
         cfg: cfg.clone(),
@@ -460,9 +472,7 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
         codec_cpu_pct,
         speaking_kbps,
         cpu_pct,
-        peak_rss_bytes: voice_core::sysstat::mem_info()
-            .map(|m| m.peak_working_set)
-            .unwrap_or(0),
+        peak_rss_bytes,
         capture_late_ticks,
         playout_late_ticks: playout.late_ticks,
         adaptive_note: playout.adaptive_note.take(),

@@ -514,6 +514,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    // 字节篡改的完整性保护来自 DPAPI；非 Windows 的测试替身只复制明文，
+    // 任意 32 字节种子都是合法密钥，不具备这条保证。
+    #[cfg(windows)]
     #[test]
     fn corrupted_file_is_rejected_not_silently_accepted() {
         let path = temp_path("corrupt");
@@ -526,6 +529,34 @@ mod tests {
         std::fs::write(&path, &blob).unwrap();
 
         assert!(Identity::load(&path).is_err(), "文件被改过却照样读出来了");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn malformed_file_is_rejected_without_replacing_the_identity() {
+        let path = temp_path("malformed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // 格式校验在所有平台都要成立；先经过各平台的 protect，单独验证
+        // 明文格式，而不是让 DPAPI 提前拦下损坏的密文。
+        for plain in [
+            vec![FILE_VERSION; SECRET_LEN],
+            vec![FILE_VERSION; SECRET_LEN + 2],
+            vec![FILE_VERSION + 1; SECRET_LEN + 1],
+        ] {
+            let blob = protect(&plain).unwrap();
+            std::fs::write(&path, &blob).unwrap();
+            assert_eq!(
+                Identity::load(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                Identity::load_or_create(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), blob, "不能覆盖坏的身份文件");
+        }
+
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

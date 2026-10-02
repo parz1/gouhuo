@@ -18,3 +18,6 @@ settings.txt
 
 # docker compose 的 .env：里面是服务器地址，不进仓库
 /.env
+
+# --quick 预览的计时是本地诊断；发布记录使用完整矩阵。
+/docs/design/rebuild/offline-scene-timings-quick.csv

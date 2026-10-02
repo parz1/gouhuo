@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { ScrollView } from "std-widgets.slint";
+import { MemberMenu } from "member-menu.slint";
+import { Row } from "types.slint";
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component CallOverlayHost inherits Rectangle {
+    // CallPage supplies the usable area above SelfDock. It can borrow the
+    // header/recovery area when the ordinary content region is too short.
+    // 1 member, 2 more, 3 mode, 4 identity, 5 recovery details.
+    in property <int> kind;
+    in property <Row> member;
+    in property <string> nick;
+    in property <string> fingerprint;
+    in property <string> recovery;
+    in property <bool> ptt;
+    in property <string> key-label;
+    in property <string> update-version;
+    callback close();
+    callback volume(float);
+    callback save();
+    callback role(int);
+    callback kick();
+    callback ban();
+    callback diagnostics();
+    callback settings();
+    callback mode(bool);
+    callback rebind();
+    callback open-update();
+    callback dismiss-update();
+    background: #00000030;
+    clip: true;
+    TouchArea { clicked => { root.save(); root.close(); } }
+    if root.kind == 1: MemberMenu {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: Math.min(344px, parent.width - 16px);
+        height: Math.min(290px, parent.height - 12px);
+        member: root.member;
+        close => { root.close(); }
+        volume(v) => { root.volume(v); }
+        save => { root.save(); }
+        role(r) => { root.role(r); }
+        kick => { root.kick(); }
+        ban => { root.ban(); }
+    }
+    if root.kind >= 2: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: Math.min(320px, parent.width - 16px);
+        height: Math.min(root.kind == 2 || root.kind == 3 ? 230px : 200px, parent.height - 12px);
+        border-radius: 8px;
+        background: CallTokens.raised;
+        border-width: 1px;
+        border-color: CallTokens.line;
+        TouchArea { }
+        VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+            HorizontalLayout {
+                height: 32px;
+                Text { text: root.kind == 2 ? "通话操作" : root.kind == 3 ? "说话方式" : root.kind == 4 ? "我的身份" : "恢复详情"; color: CallTokens.text; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+                CallButton { width: 32px; height: 32px; icon: @image-url("icons/close.svg"); accessible-label: "关闭详情"; init => { self.focus(); } clicked => { root.close(); } }
+            }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    if root.kind == 2: CallButton { label: "诊断信息"; clicked => { root.diagnostics(); } }
+                    if root.kind == 2: CallButton { label: "设备与设置"; clicked => { root.settings(); } }
+                    if root.kind == 2 && root.update-version != "": CallButton { label: "下载新版本 " + root.update-version; clicked => { root.open-update(); } }
+                    if root.kind == 2 && root.update-version != "": CallButton { label: "这次不提示更新"; clicked => { root.dismiss-update(); } }
+                    if root.kind == 3: CallButton { label: "语音激活 · VAD"; selected: !root.ptt; clicked => { root.mode(false); root.close(); } }
+                    if root.kind == 3: CallButton { label: "按住说话 · PTT"; selected: root.ptt; clicked => { root.mode(true); root.close(); } }
+                    if root.kind == 3 && root.key-label != "": Text { text: "当前按键：" + root.key-label; color: CallTokens.dim; font-size: 12px; wrap: word-wrap; }
+                    if root.kind == 3: CallButton { label: root.key-label == "" ? "绑定说话键" : "重新绑定：" + root.key-label; clicked => { root.close(); root.rebind(); } }
+                    if root.kind == 4: Text { text: root.nick; color: CallTokens.text; font-size: 14px; wrap: word-wrap; }
+                    if root.kind == 4: Text { text: root.fingerprint; color: CallTokens.dim; font-size: 12px; wrap: word-wrap; }
+                    if root.kind == 5: Text { text: root.recovery; color: CallTokens.warm; font-size: 12px; wrap: word-wrap; }
+                    if root.kind == 5: CallButton { label: "查看诊断"; clicked => { root.diagnostics(); } }
+                    if root.kind == 5: CallButton { label: "设备与设置"; clicked => { root.settings(); } }
+                }
+            }
+        }
+    }
+}

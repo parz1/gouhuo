@@ -2,42 +2,11 @@
 
 import { Theme, Btn, Field, Dot, LevelBar } from "theme.slint";
 import { ScrollView, Slider, ComboBox } from "std-widgets.slint";
-import { Campfire, Seat } from "campfire.slint";
+import { Seat, SeatGeometry } from "campfire.slint";
+import { Row, ChatRow } from "call/types.slint";
+import { CallPage } from "call/page.slint";
 import { Home, ServerRow } from "home.slint";
-export { Seat, ServerRow }
-
-// 频道树和成员名单压成的一行。
-//
-// 用一个扁平列表而不是嵌套模型：频道和人本来就是交替出现的，
-// 嵌套两层模型换不来任何东西，却要在 Rust 那边维护两套同步逻辑。
-export struct Row {
-    is-channel: bool,
-    id: int,
-    name: string,
-    depth: int,
-    // 下面几个只对人有意义
-    muted: bool,
-    deafened: bool,
-    speaking: bool,
-    is-me: bool,
-    // 只对频道有意义：我在不在这个频道里
-    is-current: bool,
-    // 频道里有几个人，显示在右边
-    count: int,
-    // 只对频道有意义：我能不能删它。**这只决定画不画那个 ×**，
-    // 真正说了算的是服务端 —— 画错了最多是一个点了没反应的按钮。
-    can-delete: bool,
-    // 只对人有意义：我给这个人单独调的音量，百分比。100 是原样，0 是静音。
-    volume: int,
-    // 只对人有意义：角色，协议里的数值（1 访客 2 成员 3 频道管理 4 管理员）。
-    role: int,
-    // 我能对这个人做什么 / 能不能改这个频道。**只决定画不画按钮**，
-    // 说了算的是服务端。
-    can-kick: bool,
-    can-ban: bool,
-    can-set-role: bool,
-    can-edit: bool,
-}
+export { Seat, SeatGeometry, ServerRow, Row, ChatRow }
 
 /// 封禁名单里的一条。
 export struct BanRow {
@@ -60,13 +29,6 @@ export struct ScanRow {
     /// 对不上就会悄悄选中别的设备 —— 用户点了 A 结果用上了 B，
     /// 而界面上什么都不会说。
     id: string,
-}
-
-export struct ChatRow {
-    sender: string,
-    body: string,
-    time: string,
-    is-me: bool,
 }
 
 // 托盘图标。一直在，程序开着就在。
@@ -162,7 +124,7 @@ component UpdateBar inherits Rectangle {
 }
 
 export component App inherits Window {
-    title: "篝火";
+    title: root.preview-enabled ? "篝火 · #41 离线预览 · " + root.preview-case + " · F1/F2/F3/F4" : "篝火";
     icon: @image-url("icons/flame.svg");
     background: Theme.bg;
     default-font-family: Theme.font;
@@ -176,9 +138,12 @@ export component App inherits Window {
     /// 窗口窄到左边频道树和篝火并排放不下。这时两个只显示一个。
     property <bool> narrow: root.width < 640px;
     /// 窄窗口时：现在显示的是不是频道树。
-    property <bool> tree-open: false;
+    in-out property <bool> tree-open: false;
 
     // ---- 状态 ----
+    in property <string> preview-case;
+    in property <bool> preview-enabled: false;
+    callback preview-key(int);
     in-out property <bool> connected: false;
     in-out property <bool> connecting: false;
     in-out property <string> nick;
@@ -219,6 +184,11 @@ export component App inherits Window {
     in property <bool> waiting-talking: false;
     /// 我所在的频道叫什么，篝火上面那一栏显示。
     in property <string> channel-name;
+    in property <int> channel-count;
+    in property <[SeatGeometry]> scene-geometry;
+    in-out property <int> member-id: -1;
+    in property <Row> member-data;
+    callback open-member(int);
     /// 篝火的像素底图，Rust 那边按画面大小画好。
     in property <image> campfire-backdrop;
     /// 篝火画面大小变了，要重画底图和石头。
@@ -226,17 +196,29 @@ export component App inherits Window {
     /// 篝火现在是不是摆在眼前（不是在看文字聊天、设置、窄窗口下的频道树）。
     /// Rust 那边看它决定火要不要动 —— 看不见的火一帧都不画。
     out property <bool> campfire-shown: root.connected && !root.show-settings && !root.chat-open
-        && !(root.narrow && root.tree-open);
+        && !root.diagnostics-open && !(root.narrow && root.tree-open);
     /// 右边显示文字聊天还是篝火。纯界面状态。
     in-out property <bool> chat-open: false;
     /// 上次看聊天时有几条，用来判断有没有没看过的。
     ///
     /// 按条数比，所以聊天记录攒满（client-core 的 MAX_CHAT_LINES）以后
     /// 新消息就不提示了。一次开黑攒不到两百条，先这样。
-    property <int> chat-seen: 0;
-    changed chat => {
+    out property <int> chat-seen: 0;
+    // Models retain identity across events; observe their length notifications.
+    property <int> chat-count: root.chat.length;
+    // Read markers and drafts belong to one explicit call, never another server.
+    callback reset-call-view();
+    reset-call-view => {
+        root.chat-seen = 0;
+        root.chat-open = false;
+        root.tree-open = false;
+        root.diagnostics-open = false;
+        root.draft = "";
+        root.member-id = -1;
+    }
+    changed chat-count => {
         if (root.chat-open) {
-            root.chat-seen = root.chat.length;
+            root.chat-seen = root.chat-count;
         }
     }
     in-out property <string> draft;
@@ -256,6 +238,8 @@ export component App inherits Window {
     // 自己被踢了，而且会下意识去点「加入」—— 那恰恰是不用做的事。
     in property <string> reconnecting;
     in property <string> voice-notice;
+    /// Rust view-model projection; CallPage only renders this summary.
+    in property <string> recovery-message;
 
     // ---- 设置 ----
     in-out property <bool> show-settings: false;
@@ -268,6 +252,9 @@ export component App inherits Window {
     // ---- 麦克风 ----
     /// 麦克风电平，已经从分贝映射成 0–1。
     in property <float> input-level;
+    in property <bool> input-available: false;
+    in property <bool> render-available: false;
+    in property <string> self-status;
     /// 语音激活的阈值，同一把尺子。
     in-out property <float> vad-level;
     /// 现在在不在往外发。
@@ -437,729 +424,70 @@ export component App inherits Window {
     // =======================================================================
     // 连上了：左边频道树，右边文字
     // =======================================================================
-    if root.connected && !root.show-settings: HorizontalLayout {
-        spacing: 0;
-
-        // ---- 左：频道树 + 成员 ----
-        if !root.narrow || root.tree-open: Rectangle {
-            width: root.narrow ? root.width : 260px;
-            background: Theme.panel;
-
-            VerticalLayout {
-                padding: 0;
-
-                Rectangle {
-                    height: 48px;
-                    HorizontalLayout {
-                        padding-left: Theme.pad;
-                        padding-right: Theme.pad;
-                        spacing: 8px;
-                        Text {
-                            text: root.server-name;
-                            color: Theme.text;
-                            font-size: 15px;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
-                        // 窄窗口时频道树占满整个窗口，这里回到篝火
-                        if root.narrow: Btn {
-                            width: 56px;
-                            height: 28px;
-                            y: (parent.height - self.height) / 2;
-                            label: "篝火";
-                            clicked => { root.tree-open = false; }
-                        }
-                        Btn {
-                            width: 34px;
-                            height: 28px;
-                            y: (parent.height - self.height) / 2;
-                            label: "⚙";
-                            clicked => { root.toggle-settings(); }
-                        }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-
-
-                ScrollView {
-                    VerticalLayout {
-                        padding: 6px;
-                        spacing: 1px;
-
-                        for row[i] in root.rows: VerticalLayout {
-                          if row.is-channel && root.renaming == row.id: HorizontalLayout {
-                              padding-left: 4px + (row.depth * 12px);
-                              spacing: 4px;
-                              Field {
-                                  height: 30px;
-                                  init => { self.focus(); }
-                                  text <=> root.rename-draft;
-                                  horizontal-stretch: 1;
-                                  accepted => {
-                                      if (root.rename-draft != "") {
-                                          root.rename-channel(row.id, root.rename-draft);
-                                      }
-                                      root.renaming = -1;
-                                  }
-                              }
-                              Btn {
-                                  width: 30px;
-                                  height: 30px;
-                                  label: "✕";
-                                  clicked => { root.renaming = -1; }
-                              }
-                          }
-
-                          if !(row.is-channel && root.renaming == row.id): Rectangle {
-                            height: row.is-channel ? 30px : 28px;
-                            border-radius: 6px;
-                            background: row.is-channel && row.is-current
-                                ? Theme.raised
-                                : (rowtouch.has-hover && row.is-channel ? Theme.hover : transparent);
-                            animate background { duration: 100ms; }
-
-                            HorizontalLayout {
-                                padding-left: 8px + (row.depth * 12px);
-                                padding-right: 10px;
-                                spacing: 8px;
-
-                                if !row.is-channel: Dot {
-                                    y: (parent.height - self.height) / 2;
-                                    // 正在说话压过静音状态：一个人可能自己没闭麦
-                                    // 但别人也没听见，那种时候「他在说话」更有用。
-                                    tint: row.speaking
-                                        ? Theme.speaking
-                                        : (row.deafened
-                                            ? Theme.danger
-                                            : (row.muted ? Theme.warn : Theme.faint));
-                                    // 说话时那个点要看得出来在动
-                                    width: row.speaking ? 10px : 8px;
-                                    height: self.width;
-                                    border-radius: self.width / 2;
-                                    animate width { duration: 100ms; }
-                                }
-
-                                Text {
-                                    text: row.is-channel ? row.name : "  " + row.name;
-                                    color: row.is-channel
-                                        ? (row.is-current ? Theme.text : Theme.dim)
-                                        : (row.is-me ? Theme.accent : Theme.text);
-                                    font-size: row.is-channel ? 13px : 14px;
-                                    font-weight: row.is-channel ? 600 : 400;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
-                                }
-
-                                // 频道管理和管理员标一下：要知道该找谁处理问题。
-                                if !row.is-channel && row.role >= 3: Text {
-                                    text: row.role >= 4 ? "管理员" : "频道管理";
-                                    color: Theme.faint;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                }
-
-                                // 调过音量的人在右边标一下。不标的话，一个被自己调成 0
-                                // 的人说话时点在闪却听不见，用户只会以为是他麦克风坏了。
-                                if !row.is-channel && !row.is-me && row.volume != 100: Text {
-                                    text: row.volume == 0 ? "已静音" : row.volume + "%";
-                                    color: row.volume == 0 ? Theme.warn : Theme.faint;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                }
-
-                                if row.is-channel && !((row.can-delete || row.can-edit) && rowtouch.has-hover): Text {
-                                    text: row.count > 0 ? row.count : "";
-                                    color: Theme.faint;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                }
-
-                                // 改名。跟删除一样，只在鼠标移上来时才出现。
-                                if row.is-channel && row.can-edit && rowtouch.has-hover: Rectangle {
-                                    width: 20px;
-                                    height: 20px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 4px;
-                                    background: edithover.has-hover ? Theme.hover : transparent;
-
-                                    Text {
-                                        text: "✎";
-                                        color: edithover.has-hover ? Theme.text : Theme.faint;
-                                        font-size: 13px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                        width: 100%;
-                                        height: 100%;
-                                    }
-
-                                    edithover := TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => {
-                                            root.rename-draft = row.name;
-                                            root.renaming = row.id;
-                                        }
-                                    }
-                                }
-
-                                // 删频道。**只在鼠标移上来时才出现** ——
-                                // 常驻的话每一行都挂一个红叉，而删频道是低频且
-                                // 不可逆的操作，不该长期占着视觉位置。
-                                if row.is-channel && row.can-delete && rowtouch.has-hover: Rectangle {
-                                    width: 20px;
-                                    height: 20px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 4px;
-                                    background: delhover.has-hover ? Theme.danger : transparent;
-                                    animate background { duration: 100ms; }
-
-                                    Text {
-                                        text: "×";
-                                        color: delhover.has-hover ? Theme.text : Theme.faint;
-                                        font-size: 15px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                        width: 100%;
-                                        height: 100%;
-                                    }
-
-                                    delhover := TouchArea {
-                                        mouse-cursor: pointer;
-                                        // 别让这一下顺手把频道也切了 —— TouchArea
-                                        // 会吃掉事件，不会透到下面的 rowtouch。
-                                        clicked => { root.delete-channel(row.id); }
-                                    }
-                                }
-                            }
-
-                            // 点频道是进去；点别人是展开 / 收起他的音量滑条。
-                            // 点自己没有反应 —— 自己的音量在底部那两个按钮上。
-                            rowtouch := TouchArea {
-                                enabled: row.is-channel || !row.is-me;
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    if (row.is-channel) {
-                                        root.join-channel(row.id);
-                                        root.tree-open = false;
-                                    } else {
-                                        volume-open = volume-open == row.id ? -1 : row.id;
-                                    }
-                                }
-                            }
-                          }
-
-                          if !row.is-channel && !row.is-me && root.volume-open == row.id: HorizontalLayout {
-                              height: 34px;
-                              padding-left: 8px + (row.depth * 12px) + 16px;
-                              padding-right: 10px;
-                              spacing: 8px;
-
-                              vol := Slider {
-                                  minimum: 0;
-                                  maximum: 400;
-                                  value: row.volume;
-                                  horizontal-stretch: 1;
-                                  changed(v) => { root.set-user-volume(row.id, v); }
-                                  released(v) => { root.save-user-volumes(); }
-                              }
-                              Text {
-                                  text: row.volume + "%";
-                                  color: Theme.dim;
-                                  font-size: 12px;
-                                  width: 40px;
-                                  horizontal-alignment: right;
-                                  vertical-alignment: center;
-                              }
-                              Btn {
-                                  width: 52px;
-                                  height: 26px;
-                                  y: (parent.height - self.height) / 2;
-                                  label: row.volume == 0 ? "恢复" : "静音";
-                                  clicked => {
-                                      // 滑条被拖过之后，它的 value 就不再跟着 row.volume 走了
-                                      // （Slint 里赋值会打断绑定），所以这里要亲手把它拨过去。
-                                      vol.value = row.volume == 0 ? 100 : 0;
-                                      root.set-user-volume(row.id, vol.value);
-                                      root.save-user-volumes();
-                                  }
-                              }
-                          }
-
-                          // 管理操作。没有任何权限的人看不到这一行。
-                          if !row.is-channel && !row.is-me && root.volume-open == row.id
-                              && (row.can-kick || row.can-ban || row.can-set-role): HorizontalLayout {
-                              height: 34px;
-                              padding-left: 8px + (row.depth * 12px) + 16px;
-                              padding-right: 10px;
-                              spacing: 6px;
-
-                              if row.can-set-role: ComboBox {
-                                  horizontal-stretch: 1;
-                                  model: ["访客", "成员", "频道管理", "管理员"];
-                                  current-index: row.role - 1;
-                                  selected(v) => { root.set-role(row.id, self.current-index); }
-                              }
-                              if !row.can-set-role: Rectangle { horizontal-stretch: 1; }
-                              if row.can-kick: Btn {
-                                  width: 52px;
-                                  height: 26px;
-                                  y: (parent.height - self.height) / 2;
-                                  label: "踢出";
-                                  clicked => { root.kick-user(row.id); }
-                              }
-                              // 封禁要点两下：第一下只是「武装」，按钮变成红色的「确认封禁」。
-                              // 封禁虽然能解，但被封的人那边是立刻断线的，手滑的代价太大。
-                              if row.can-ban: Btn {
-                                  width: root.ban-armed == row.id ? 76px : 52px;
-                                  height: 26px;
-                                  y: (parent.height - self.height) / 2;
-                                  label: root.ban-armed == row.id ? "确认封禁" : "封禁";
-                                  primary: root.ban-armed == row.id;
-                                  clicked => {
-                                      if (root.ban-armed == row.id) {
-                                          root.ban-armed = -1;
-                                          root.ban-user(row.id);
-                                      } else {
-                                          root.ban-armed = row.id;
-                                      }
-                                  }
-                              }
-                          }
-                        }
-
-                        // ---- 新建频道 ----
-                        //
-                        // 平时只是一行浅色的「＋ 新建频道」，点了才变成输入框。
-                        // 常驻一个输入框的话，一个低频操作会一直占着列表底部，
-                        // 而这个列表的主角是频道和人。
-                        if root.can-create-channel && !newchan-open: Rectangle {
-                            height: 30px;
-                            border-radius: 6px;
-                            background: newchan-touch.has-hover ? Theme.hover : transparent;
-                            animate background { duration: 100ms; }
-
-                            HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 10px;
-                                Text {
-                                    text: "＋ 新建频道";
-                                    color: newchan-touch.has-hover ? Theme.dim : Theme.faint;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            newchan-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    newchan-open = true;
-                                    newchan-name = "";
-                                }
-                            }
-                        }
-
-                        if root.can-create-channel && newchan-open: HorizontalLayout {
-                            padding-top: 2px;
-                            spacing: 4px;
-
-                            Field {
-                                height: 30px;
-                                placeholder: "频道名";
-                                // 展开的那一刻就把光标放进去 —— 点了「＋」还要
-                                // 再点一次输入框是多余的一步。
-                                //
-                                // 聚焦写在这里而不是「＋」的 clicked 里：那两个
-                                // 分支互相看不见对方的 id（Slint 的 if 各自成域），
-                                // 而这个组件正好是在展开时才被创建的。
-                                init => { self.focus(); }
-                                text <=> newchan-name;
-                                horizontal-stretch: 1;
-                                accepted => {
-                                    // 空名字不发。服务端也会拒，但让它连发都不发
-                                    // 更干脆 —— 用户按回车没反应就知道还没填。
-                                    if (newchan-name != "") {
-                                        root.create-channel(newchan-name);
-                                        newchan-name = "";
-                                        newchan-open = false;
-                                    }
-                                }
-                            }
-                            Btn {
-                                width: 30px;
-                                height: 30px;
-                                label: "✕";
-                                clicked => {
-                                    newchan-open = false;
-                                    newchan-name = "";
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ---- 封禁名单：只有管理员看得到，平时收着 ----
-                if root.is-admin && root.bans.length > 0: Rectangle {
-                    height: 30px;
-                    background: banstouch.has-hover ? Theme.hover : transparent;
-                    HorizontalLayout {
-                        padding-left: 14px;
-                        padding-right: 10px;
-                        Text {
-                            text: (root.bans-open ? "▾ " : "▸ ") + "封禁名单（" + root.bans.length + "）";
-                            color: Theme.faint;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                    }
-                    banstouch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.bans-open = !root.bans-open; }
-                    }
-                }
-                if root.is-admin && root.bans-open: VerticalLayout {
-                    padding-left: 14px;
-                    padding-right: 10px;
-                    padding-bottom: 6px;
-                    spacing: 4px;
-                    for ban in root.bans: HorizontalLayout {
-                        spacing: 6px;
-                        VerticalLayout {
-                            horizontal-stretch: 1;
-                            Text {
-                                text: ban.name;
-                                color: Theme.text;
-                                font-size: 12px;
-                                overflow: elide;
-                            }
-                            Text {
-                                text: ban.detail;
-                                color: Theme.faint;
-                                font-size: 11px;
-                                overflow: elide;
-                            }
-                        }
-                        Btn {
-                            width: 52px;
-                            height: 26px;
-                            y: (parent.height - self.height) / 2;
-                            label: "解封";
-                            clicked => { root.unban(ban.key); }
-                        }
-                    }
-                }
-
-                // ---- 自己的那一条，钉在底部 ----
-                Rectangle { height: 1px; background: Theme.line; }
-                Rectangle {
-                    height: 56px;
-                    background: Theme.bg;
-
-                    HorizontalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
-                        spacing: 6px;
-
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Text {
-                                text: root.nick;
-                                color: Theme.text;
-                                font-size: 13px;
-                                overflow: elide;
-                            }
-                            HorizontalLayout {
-                                spacing: 5px;
-                                Dot {
-                                    y: 4px;
-                                    tint: root.udp-ok && root.reconnecting == "" ? Theme.speaking : Theme.warn;
-                                }
-                                Text {
-                                    text: root.reconnecting != ""
-                                        ? "正在重连…"
-                                        : root.voice-error != ""
-                                        ? "语音出错"
-                                        : (!root.udp-ok
-                                            ? (root.udp-failed ? "语音网络未连通" : "语音连接中…")
-                                            : (root.ptt-mode
-                                                ? (root.ptt-label == ""
-                                                    ? "没绑说话键"
-                                                    : "按住 " + root.ptt-label + " 说话")
-                                                : "语音激活"));
-                                    color: root.voice-error != "" ? Theme.danger : Theme.faint;
-                                    font-size: 11px;
-                                    overflow: elide;
-                                }
-                            }
-                        }
-
-                        Btn {
-                            width: 44px;
-                            y: (parent.height - self.height) / 2;
-                            label: root.self-muted ? "🔇" : "🎤";
-                            clicked => { root.toggle-mute(); }
-                        }
-                        Btn {
-                            width: 44px;
-                            y: (parent.height - self.height) / 2;
-                            label: root.self-deafened ? "🔕" : "🔊";
-                            clicked => { root.toggle-deafen(); }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !root.narrow: Rectangle { width: 1px; background: Theme.line; }
-
-        // ---- 右：篝火，或者文字聊天 ----
-        if !root.narrow || !root.tree-open: Rectangle {
-            background: Theme.bg;
-            horizontal-stretch: 1;
-
-            VerticalLayout {
-                Rectangle {
-                    height: 48px;
-                    HorizontalLayout {
-                        padding-left: Theme.pad;
-                        padding-right: Theme.pad;
-                        spacing: 8px;
-                        // 不用「☰」：雅黑里没有这个字，画出来是个方框
-                        if root.narrow: Btn {
-                            width: 52px;
-                            y: (parent.height - self.height) / 2;
-                            label: "频道";
-                            clicked => { root.tree-open = true; }
-                        }
-                        Text {
-                            text: root.chat-open ? "频道文字" : root.channel-name;
-                            color: Theme.dim;
-                            font-size: 13px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
-                        // 窄窗口时左下角那一条（闭麦、关耳朵）跟着频道树收起来了，搬到这里
-                        if root.narrow: Btn {
-                            width: 40px;
-                            y: (parent.height - self.height) / 2;
-                            label: root.self-muted ? "🔇" : "🎤";
-                            clicked => { root.toggle-mute(); }
-                        }
-                        if root.narrow: Btn {
-                            width: 40px;
-                            y: (parent.height - self.height) / 2;
-                            label: root.self-deafened ? "🔕" : "🔊";
-                            clicked => { root.toggle-deafen(); }
-                        }
-                        // 篝火和文字来回切。有没看过的消息时按钮上亮个点 ——
-                        // 看着篝火的时候，别人发的链接不能就这么错过了。
-                        Rectangle {
-                            width: root.narrow ? 56px : 72px;
-                            height: 36px;
-                            y: (parent.height - self.height) / 2;
-                            Btn {
-                                width: 100%;
-                                label: root.chat-open ? "篝火" : "文字";
-                                clicked => {
-                                    root.chat-open = !root.chat-open;
-                                    root.chat-seen = root.chat.length;
-                                }
-                            }
-                            if !root.chat-open && root.chat.length > root.chat-seen: Rectangle {
-                                x: parent.width - 12px;
-                                y: 4px;
-                                width: 8px;
-                                height: 8px;
-                                border-radius: 4px;
-                                background: Theme.accent;
-                            }
-                        }
-                        Btn {
-                            width: root.narrow ? 56px : 72px;
-                            y: (parent.height - self.height) / 2;
-                            label: "离开";
-                            clicked => { root.leave(); }
-                        }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-
-                if root.update-version != "": UpdateBar {
-                    version: root.update-version;
-                    open => { root.open-update(); }
-                    dismiss => { root.update-version = ""; }
-                }
-
-                if root.reconnecting != "": Rectangle {
-                    background: #2a251a;
-                    HorizontalLayout {
-                        padding: 12px;
-                        spacing: 10px;
-                        Text {
-                            text: root.reconnecting;
-                            color: Theme.warn;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                        Btn {
-                            width: 64px;
-                            label: "取消";
-                            clicked => { root.leave(); }
-                        }
-                    }
-                }
-
-                // 语音出错要占住位置一起显示。麦克风没声音的时候，用户第一件
-                // 想知道的就是「为什么」，而弹窗一关就没了。
-                if root.voice-notice != "" && root.reconnecting == "": Rectangle {
-                    background: #2a251a;
-                    HorizontalLayout {
-                        padding: 12px;
-                        Text { text: root.voice-notice; color: Theme.warn; wrap: word-wrap; horizontal-stretch: 1; }
-                        Btn { label: "立即重试"; clicked => { root.retry-voice(); } }
-                    }
-                }
-                if root.voice-error != "" && root.reconnecting == "": Rectangle {
-                    background: #2a1d1d;
-                    VerticalLayout {
-                        padding: 12px;
-                        Text {
-                            text: root.voice-error;
-                            color: Theme.danger;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-                    }
-                }
-
-                if root.udp-failed && root.reconnecting == "": Rectangle {
-                    background: #2a1d1d;
-                    VerticalLayout {
-                        padding: 12px;
-                        Text {
-                            text: "语音网络未连通，正在自动恢复。若持续失败，请检查本地网络、VPN，以及服务器 UDP 端口。";
-                            color: Theme.warn;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    padding-left: 12px;
-                    padding-right: 12px;
-                    spacing: 8px;
-                    if root.voice-error != "" || root.udp-failed: Btn {
-                        label: "重试语音";
-                        enabled: root.reconnecting == "";
-                        clicked => { root.retry-voice(); }
-                    }
-                    Btn {
-                        label: "诊断信息";
-                        clicked => { root.show-diagnostics(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                if root.diagnostics-open: Rectangle {
-                    background: Theme.panel;
-                    VerticalLayout {
-                        padding: 12px;
-                        spacing: 6px;
-                        Text { text: "选中下面的文字，Ctrl+C 复制；点诊断信息可刷新。"; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
-                        TextInput {
-                            text: root.diagnostics;
-                            read-only: true;
-                            single-line: false;
-                            color: Theme.text;
-                            font-size: 12px;
-                            height: 180px;
-                        }
-                        Btn { label: "收起诊断"; clicked => { root.diagnostics-open = false; } }
-                    }
-                }
-
-                if !root.chat-open: Campfire {
-                    vertical-stretch: 1;
-                    seats: root.seats;
-                    waiting: root.waiting;
-                    waiting-talking: root.waiting-talking;
-                    transmitting: root.transmitting;
-                    backdrop: root.campfire-backdrop;
-                    resized(w, h) => { root.campfire-resized(w, h); }
-                    set-volume(id, v) => { root.set-user-volume(id, v); }
-                    save-volumes => { root.save-user-volumes(); }
-                    kick(id) => { root.kick-user(id); }
-                    ban(id) => { root.ban-user(id); }
-                    set-role(id, index) => { root.set-role(id, index); }
-                }
-
-                if root.chat-open: ScrollView {
-                    vertical-stretch: 1;
-                    VerticalLayout {
-                        padding: Theme.pad;
-                        spacing: 10px;
-                        alignment: start;
-
-                        if root.chat.length == 0: Text {
-                            text: "这里的消息关掉就没了 —— 发个链接、报个坐标用的，不留记录。";
-                            color: Theme.faint;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-
-                        for line[i] in root.chat: VerticalLayout {
-                            spacing: 3px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Text {
-                                    text: line.sender;
-                                    color: line.is-me ? Theme.accent : Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-                                Text {
-                                    text: line.time;
-                                    color: Theme.faint;
-                                    font-size: 11px;
-                                    vertical-alignment: bottom;
-                                }
-                            }
-                            Text {
-                                text: line.body;
-                                color: Theme.text;
-                                font-size: 14px;
-                                wrap: word-wrap;
-                            }
-                        }
-                    }
-                }
-
-                if root.chat-open: Rectangle {
-                    height: 60px;
-                    HorizontalLayout {
-                        padding: 12px;
-                        spacing: 8px;
-                        Field {
-                            placeholder: "说点什么";
-                            text <=> root.draft;
-                            horizontal-stretch: 1;
-                            accepted => { root.send-text(); }
-                        }
-                        Btn {
-                            width: 64px;
-                            label: "发送";
-                            primary: true;
-                            enabled: root.draft != "";
-                            clicked => { root.send-text(); }
-                        }
-                    }
-                }
-            }
-        }
+    if root.connected && !root.show-settings: CallPage {
+        preview-enabled: root.preview-enabled;
+        preview-key(key) => { root.preview-key(key); }
+        server-name: root.server-name;
+        channel-name: root.channel-name;
+        channel-count: root.channel-count;
+        nick: root.nick;
+        my-fingerprint: root.my-fingerprint;
+        rows: root.rows;
+        chat: root.chat;
+        seats: root.seats;
+        waiting: root.waiting;
+        scene-geometry: root.scene-geometry;
+        waiting-talking: root.waiting-talking;
+        can-create-channel: root.can-create-channel;
+        self-muted: root.self-muted;
+        self-deafened: root.self-deafened;
+        ptt-mode: root.ptt-mode;
+        ptt-label: root.ptt-label;
+        rebinding: root.rebinding;
+        input-level: root.input-level;
+        vad-level: root.vad-level;
+        input-available: root.input-available;
+        render-available: root.render-available;
+        transmitting: root.transmitting;
+        self-status: root.self-status;
+        recovery-message: root.recovery-message;
+        udp-ok: root.udp-ok;
+        udp-failed: root.udp-failed;
+        reconnecting: root.reconnecting;
+        voice-error: root.voice-error;
+        voice-notice: root.voice-notice;
+        diagnostics: root.diagnostics;
+        member-data: root.member-data;
+        backdrop: root.campfire-backdrop;
+        member-id <=> root.member-id;
+        tree-open <=> root.tree-open;
+        chat-open <=> root.chat-open;
+        diagnostics-open <=> root.diagnostics-open;
+        draft <=> root.draft;
+        chat-seen <=> root.chat-seen;
+        update-version <=> root.update-version;
+        campfire-resized(w, h) => { root.campfire-resized(w, h); }
+        open-member(id) => { root.open-member(id); }
+        join-channel(id) => { root.join-channel(id); }
+        create-channel(name) => { root.create-channel(name); }
+        delete-channel(id) => { root.delete-channel(id); }
+        rename-channel(id, name) => { root.rename-channel(id, name); }
+        set-user-volume(id, value) => { root.set-user-volume(id, value); }
+        set-role(id, role) => { root.set-role(id, role); }
+        set-ptt-mode(ptt) => { root.set-ptt-mode(ptt); }
+        save-user-volumes => { root.save-user-volumes(); }
+        kick-user(id) => { root.kick-user(id); }
+        ban-user(id) => { root.ban-user(id); }
+        toggle-mute => { root.toggle-mute(); }
+        toggle-deafen => { root.toggle-deafen(); }
+        toggle-settings => { root.toggle-settings(); }
+        rebind-ptt => { root.rebind-ptt(); }
+        cancel-rebind => { root.cancel-rebind(); }
+        retry-voice => { root.retry-voice(); }
+        show-diagnostics => { root.show-diagnostics(); }
+        send-text => { root.send-text(); }
+        open-update => { root.open-update(); }
+        leave => { root.leave(); }
     }
     // =======================================================================
     // 设置。**连不连服务器都能开** —— 「我的麦克风好不好使」这个问题，
@@ -1304,19 +632,21 @@ export component App inherits Window {
                         show-threshold: !root.ptt-mode;
                     }
                     Text {
-                        text: root.input-level < 0.02
-                            ? "没收到声音。说句话看看条子动不动。"
-                            : (root.ptt-mode
-                                ? "按住说话键时才会发出去。"
-                                : (root.transmitting
-                                    ? "正在发送。"
-                                    : "有声音，但没过竖线那道坎，所以没发出去。"));
-                        color: root.input-level >= 0.02 && !root.transmitting && !root.ptt-mode
-                            ? Theme.warn
-                            : Theme.faint;
+                        text: !root.connected
+                            ? (root.input-level < 0.02 ? "没收到声音。说句话看看条子动不动。" : "输入正常，未连接频道不会发送。")
+                            : root.self-deafened ? "已关闭声音，麦克风也已关闭。"
+                            : root.self-muted ? "已闭麦；输入电平仍可检测，声音不会发送。"
+                            : root.reconnecting != "" ? "正在重连，暂不发送。"
+                            : root.transmitting ? "正在发送。"
+                            : root.input-level < 0.02 ? "没收到声音。说句话看看条子动不动。"
+                            : root.ptt-mode ? (root.ptt-label == "" ? "请先绑定说话键。" : "按住说话键时才会发出去。")
+                            : root.input-level < root.vad-level ? "有输入，尚未达到语音激活阈值。"
+                            : "已达到语音激活阈值，等待发送状态。";
+                        color: root.connected && !root.self-muted && !root.self-deafened && !root.transmitting && !root.ptt-mode && root.input-level >= 0.02 && root.input-level < root.vad-level ? Theme.warn : Theme.faint;
                         font-size: 11px;
                         wrap: word-wrap;
                     }
+                    Text { text: "进入通话前可逐个检测麦克风。"; color: Theme.faint; font-size: 11px; wrap: word-wrap; }
                     // 一键把每个麦克风都试一遍。用户对着一个下拉框是猜不出来哪个能用的，
                     // 而程序挨个试只要几秒。
                     Btn {
@@ -1324,7 +654,7 @@ export component App inherits Window {
                             ? "正在挨个试…一直说话别停"
                             : "挨个试一遍，找出哪个麦克风能用";
                         primary: root.scanning;
-                        enabled: !root.scanning;
+                        enabled: !root.connected && !root.scanning;
                         clicked => { root.scan-microphones(); }
                     }
 

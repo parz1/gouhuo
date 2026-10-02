@@ -67,15 +67,21 @@ impl Shared {
 
 /// 一次试麦。丢掉它就会把两个线程收干净、把设备还回去。
 pub struct MicCheck {
-    shared: Arc<Shared>,
+    control: MicCheckControl,
     threads: Vec<JoinHandle<()>>,
+}
+
+/// 无 GUI 依赖的轻量试麦控制句柄；释放它不会停止或等待设备线程。
+#[derive(Clone)]
+pub struct MicCheckControl {
+    shared: Arc<Shared>,
 }
 
 impl MicCheck {
     /// 开始试麦。**立刻返回**，两个线程在后台跑。
     ///
     /// 设备打不开不在这里报错 —— 设备是在音频线程上打开的（COM 的线程亲和性，
-    /// 见 `wasapi::live`），所以错误要从 [`error`](Self::error) 取。
+    /// 见 `wasapi::live`），所以错误要从 [`MicCheckControl::error`] 取。
     pub fn start(
         mut capture: Box<dyn Capture>,
         mut render: Box<dyn Render>,
@@ -91,24 +97,49 @@ impl MicCheck {
             error: Mutex::new(None),
         });
         let processor: Option<Arc<dyn AudioProcessor>> = processor.map(Arc::from);
-        let mut threads = Vec::new();
+        // 后续线程创建失败时，所有者负责回收已启动的线程。
+        let mut check = Self {
+            control: MicCheckControl {
+                shared: Arc::clone(&shared),
+            },
+            threads: Vec::new(),
+        };
 
         {
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
-            threads.push(
+            check.threads.push(
                 std::thread::Builder::new()
                     .name("gouhuo-miccheck-in".into())
                     .spawn(move || {
+                        struct RunningReset<'a>(&'a AtomicBool);
+                        impl Drop for RunningReset<'_> {
+                            fn drop(&mut self) {
+                                self.0.store(false, Ordering::Relaxed);
+                            }
+                        }
+                        let _running = RunningReset(&shared.running);
                         let mut frame = vec![0.0f32; FRAME_SAMPLES];
                         while !shared.stop.load(Ordering::Relaxed) {
                             match capture.read(&mut frame) {
                                 Ok(true) => {}
-                                Ok(false) => break,
+                                Ok(false) => {
+                                    if !shared.stop.load(Ordering::Relaxed) {
+                                        shared.capture_failed(io::Error::other(
+                                            "麦克风录音已停止，请检查设备连接后重试。",
+                                        ));
+                                    }
+                                    break;
+                                }
                                 Err(e) => {
-                                    shared.capture_failed(e);
+                                    if !shared.stop.load(Ordering::Relaxed) {
+                                        shared.capture_failed(e);
+                                    }
                                     return;
                                 }
+                            }
+                            if shared.stop.load(Ordering::Relaxed) {
+                                return;
                             }
                             shared.running.store(true, Ordering::Relaxed);
                             if let Some(processor) = &processor {
@@ -132,7 +163,7 @@ impl MicCheck {
 
         {
             let shared = Arc::clone(&shared);
-            threads.push(
+            check.threads.push(
                 std::thread::Builder::new()
                     .name("gouhuo-miccheck-out".into())
                     .spawn(move || {
@@ -158,9 +189,28 @@ impl MicCheck {
             );
         }
 
-        Ok(Self { shared, threads })
+        Ok(check)
     }
 
+    pub fn control(&self) -> MicCheckControl {
+        self.control.clone()
+    }
+}
+
+impl std::ops::Deref for MicCheck {
+    type Target = MicCheckControl;
+
+    fn deref(&self) -> &Self::Target {
+        &self.control
+    }
+}
+
+impl MicCheckControl {
+    /// 请求退出，不等待音频线程；等待退出由 MicCheck 的所有者完成。
+    pub fn shutdown(&self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.running.store(false, Ordering::Relaxed);
+    }
     /// 麦克风当前电平，分贝（满刻度 0 dB）。
     pub fn input_db(&self) -> f32 {
         self.shared.input_centi_db.load(Ordering::Relaxed) as f32 / 100.0
@@ -189,7 +239,7 @@ impl MicCheck {
 
     /// 采集那边真的转起来了没有。
     pub fn is_running(&self) -> bool {
-        self.shared.running.load(Ordering::Relaxed)
+        !self.shared.stop.load(Ordering::Relaxed) && self.shared.running.load(Ordering::Relaxed)
     }
 
     /// 设备出了什么问题，能直接显示给用户。
@@ -200,7 +250,7 @@ impl MicCheck {
 
 impl Drop for MicCheck {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shutdown();
         // 两个线程都阻塞在设备上，最多一个设备周期（10 ms 上下）就会醒。
         // 不需要额外的叫醒机制 —— 这也是「让设备当时钟」的附带好处。
         for thread in self.threads.drain(..) {
@@ -267,39 +317,195 @@ const PURE_SILENCE_DB: f32 = -118.0;
 ///
 /// 调用方要提示用户**在检测期间一直说话**，否则每个设备都只会报底噪。
 pub fn scan_microphones(per_device: std::time::Duration) -> Vec<ScanResult> {
+    scan_microphones_cancellable(per_device, Arc::new(AtomicBool::new(false)))
+}
+
+/// 可取消的扫描。取消不算设备故障，返回此前完成的结果及当前已取得的电平。
+///
+/// 每个设备和每帧读取前检查标记。已进行的设备枚举/打开/读取仍需由操作系统
+/// 返回，调用方必须在后台运行并等待此函数结束后才重新开启其他音频链路。
+#[cfg(windows)]
+pub fn scan_microphones_cancellable(
+    per_device: std::time::Duration,
+    cancel: Arc<AtomicBool>,
+) -> Vec<ScanResult> {
+    if cancel.load(Ordering::Acquire) {
+        return Vec::new();
+    }
     let Ok(endpoints) = crate::wasapi::list_endpoints(crate::wasapi::Direction::Capture) else {
         return Vec::new();
     };
+    scan_devices(
+        endpoints.into_iter().map(|endpoint| ScanDevice {
+            id: endpoint.id,
+            name: endpoint.name,
+            is_hardware: endpoint.is_hardware,
+        }),
+        per_device,
+        &cancel,
+        |id| {
+            Ok(Box::new(crate::wasapi::WasapiCapture::new(Some(
+                id.to_owned(),
+            ))))
+        },
+    )
+}
 
-    endpoints
-        .into_iter()
-        .map(|endpoint| {
-            let mut capture = crate::wasapi::WasapiCapture::new(Some(endpoint.id.clone()));
-            let mut frame = vec![0.0f32; FRAME_SAMPLES];
-            let mut peak = f32::NEG_INFINITY;
-            let mut error = None;
-            let deadline = std::time::Instant::now() + per_device;
+/// 其他平台还没有麦克风扫描后端，返回空设备列表。
+#[cfg(not(windows))]
+pub fn scan_microphones_cancellable(
+    _per_device: std::time::Duration,
+    _cancel: Arc<AtomicBool>,
+) -> Vec<ScanResult> {
+    Vec::new()
+}
 
-            while std::time::Instant::now() < deadline {
-                match capture.read(&mut frame) {
-                    Ok(true) => peak = peak.max(crate::pipeline::frame_db(&frame)),
-                    Ok(false) => break,
-                    Err(e) => {
-                        error = Some(e.to_string());
-                        break;
-                    }
-                }
+#[cfg(any(windows, test))]
+struct ScanDevice {
+    id: String,
+    name: String,
+    is_hardware: bool,
+}
+
+#[cfg(any(windows, test))]
+fn scan_devices(
+    devices: impl IntoIterator<Item = ScanDevice>,
+    per_device: std::time::Duration,
+    cancel: &AtomicBool,
+    mut open: impl FnMut(&str) -> io::Result<Box<dyn Capture>>,
+) -> Vec<ScanResult> {
+    let mut results = Vec::new();
+    for device in devices {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let (peak_db, error) = match open(&device.id) {
+            Ok(mut capture) => sample_capture(&mut *capture, per_device, cancel),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        // A cancelled device that produced no samples has no verdict. Do not
+        // turn user cancellation into an artificial "cannot open" result.
+        if cancel.load(Ordering::Acquire) && peak_db.is_none() {
+            break;
+        }
+        results.push(ScanResult {
+            id: device.id,
+            name: device.name,
+            is_hardware: device.is_hardware,
+            peak_db,
+            error,
+        });
+    }
+    results
+}
+
+#[cfg(any(windows, test))]
+fn sample_capture(
+    capture: &mut dyn Capture,
+    per_device: std::time::Duration,
+    cancel: &AtomicBool,
+) -> (Option<f32>, Option<String>) {
+    let mut frame = vec![0.0f32; FRAME_SAMPLES];
+    let mut peak = f32::NEG_INFINITY;
+    let mut error = None;
+    let deadline = std::time::Instant::now() + per_device;
+    while std::time::Instant::now() < deadline && !cancel.load(Ordering::Acquire) {
+        match capture.read(&mut frame) {
+            Ok(true) => peak = peak.max(crate::pipeline::frame_db(&frame)),
+            Ok(false) => break,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
             }
+        }
+    }
+    (peak.is_finite().then_some(peak), error)
+}
 
-            ScanResult {
-                id: endpoint.id,
-                name: endpoint.name,
-                is_hardware: endpoint.is_hardware,
-                peak_db: peak.is_finite().then_some(peak),
-                error,
+#[cfg(test)]
+mod scan_cancellation {
+    use super::*;
+    use std::{
+        sync::{atomic::AtomicUsize, mpsc},
+        time::Duration,
+    };
+
+    fn device(id: &str) -> ScanDevice {
+        ScanDevice {
+            id: id.into(),
+            name: id.into(),
+            is_hardware: true,
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_does_not_open_any_device_or_invent_a_failure() {
+        let cancel = AtomicBool::new(true);
+        let results = scan_devices(
+            [device("first"), device("second")],
+            Duration::from_secs(1),
+            &cancel,
+            |_| panic!("pre-cancelled scan opened a device"),
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn cancellation_while_reading_keeps_the_real_peak_and_skips_the_next_device() {
+        struct ControlledCapture {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Capture for ControlledCapture {
+            fn read(&mut self, frame: &mut [f32]) -> io::Result<bool> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                frame.fill(0.2);
+                Ok(true)
             }
-        })
-        .collect()
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let worker_reads = Arc::clone(&reads);
+        let (finished, results) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut capture = Some(ControlledCapture {
+                entered,
+                release: released,
+                reads: worker_reads,
+            });
+            let scanned = scan_devices(
+                [device("first"), device("must-not-open")],
+                Duration::from_secs(30),
+                &worker_cancel,
+                |id| {
+                    assert_eq!(id, "first", "cancellation opened the next microphone");
+                    Ok(Box::new(capture.take().unwrap()))
+                },
+            );
+            finished.send(scanned).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        let scanned = results
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation waited for the full device duration");
+        worker.join().unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].id, "first");
+        assert!(scanned[0].peak_db.unwrap() > -20.0);
+        assert!(
+            scanned[0].error.is_none(),
+            "cancellation became a device error"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +583,138 @@ mod tests {
             "关试麦花了 {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn a_control_handle_is_send_sync_and_releasing_it_does_not_join_capture() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MicCheckControl>();
+        struct WaitingCapture(std::sync::mpsc::Receiver<()>);
+        impl Capture for WaitingCapture {
+            fn read(&mut self, frame: &mut [f32]) -> io::Result<bool> {
+                // 有界阻塞也让断言失败时的所有者清理能够完成。
+                match self.0.recv_timeout(Duration::from_secs(2)) {
+                    Ok(()) => {
+                        frame.fill(0.2);
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),
+                }
+            }
+        }
+        let (frames, input) = std::sync::mpsc::channel();
+        let check = MicCheck::start(
+            Box::new(WaitingCapture(input)),
+            Box::new(crate::audio::NullRender::default()),
+            None,
+        )
+        .unwrap();
+        let control = check.control();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            drop(control);
+            finished.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("试麦控制句柄等待了采集线程");
+        released.join().unwrap();
+        frames.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !check.is_running() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(check.input_db() > -45.0);
+        let survivor = check.control();
+        survivor.shutdown();
+        assert!(!survivor.is_running());
+        drop(frames);
+        drop(check);
+        assert!(!survivor.is_running());
+    }
+
+    #[test]
+    fn unexpected_capture_eof_is_an_error_but_requested_shutdown_eof_is_not() {
+        struct ControlledCapture {
+            commands: std::sync::mpsc::Receiver<Option<f32>>,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Capture for ControlledCapture {
+            fn read(&mut self, frame: &mut [f32]) -> io::Result<bool> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                match self.commands.recv() {
+                    Ok(Some(value)) => {
+                        frame.fill(value);
+                        Ok(true)
+                    }
+                    Ok(None) | Err(_) => Ok(false),
+                }
+            }
+        }
+        struct Fixture {
+            check: Option<MicCheck>,
+            commands: Option<std::sync::mpsc::Sender<Option<f32>>>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Unblock capture before joining, including when an assertion fails.
+                self.commands.take();
+                self.check.take();
+            }
+        }
+        fn wait(predicate: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !predicate() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "controlled capture did not progress"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for requested_shutdown in [false, true] {
+            let (commands, input) = std::sync::mpsc::channel();
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let check = MicCheck::start(
+                Box::new(ControlledCapture {
+                    commands: input,
+                    reads: Arc::clone(&reads),
+                }),
+                Box::new(crate::audio::NullRender::default()),
+                None,
+            )
+            .unwrap();
+            let fixture = Fixture {
+                check: Some(check),
+                commands: Some(commands),
+            };
+            let check = fixture.check.as_ref().unwrap();
+            let commands = fixture.commands.as_ref().unwrap();
+            commands.send(Some(0.2)).unwrap();
+            // Starting the second read confirms the first frame's state is published.
+            wait(|| reads.load(Ordering::SeqCst) == 2);
+            assert!(check.is_running());
+            if requested_shutdown {
+                check.shutdown();
+            }
+            commands.send(None).unwrap();
+            wait(|| check.threads[0].is_finished());
+            assert!(
+                !check.is_running(),
+                "ended capture must not retain a running indicator"
+            );
+            if requested_shutdown {
+                assert!(
+                    check.error().is_none(),
+                    "intentional stop was reported as a device failure"
+                );
+            } else {
+                assert!(check
+                    .error()
+                    .is_some_and(|error| error.contains("录音已停止")));
+            }
+        }
     }
 
     /// 采集出错要报出来，而且整个试麦停下。
@@ -491,7 +829,7 @@ mod verdicts {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod live_scan {
     use super::*;
 
@@ -523,7 +861,7 @@ mod live_scan {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod endurance {
     use super::*;
 
@@ -584,7 +922,7 @@ mod endurance {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod render_check {
     use super::*;
     use crate::audio::Render;

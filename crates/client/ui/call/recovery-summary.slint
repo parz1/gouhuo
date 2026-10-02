@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component RecoverySummary inherits Rectangle {
+    in property <string> message;
+    in property <bool> reconnecting;
+    callback retry();
+    callback cancel();
+    callback details();
+    height: 72px;
+    background: #29251d;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        Text { text: root.message; min-width: 0; height: 18px; overflow: elide; color: CallTokens.warm; font-size: 12px; accessible-label: root.message; accessible-live-region: polite; }
+        HorizontalLayout {
+            spacing: 8px;
+            CallButton { width: 88px; height: 30px; label: root.reconnecting ? "取消重连" : "重试语音"; clicked => { if (root.reconnecting) { root.cancel(); } else { root.retry(); } } }
+            CallButton { width: 64px; height: 30px; label: "详情"; clicked => { root.details(); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

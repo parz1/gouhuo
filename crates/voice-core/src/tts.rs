@@ -21,7 +21,9 @@ use std::io;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 
-use crate::cue::{decode_wav, resample_to_48k, trim_silence, CueQueue};
+use crate::cue::CueQueue;
+#[cfg(windows)]
+use crate::cue::{decode_wav, resample_to_48k, trim_silence};
 
 /// 最多排几句还没合成的话。
 pub const PENDING_LIMIT: usize = 3;

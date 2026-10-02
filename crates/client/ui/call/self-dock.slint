@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+component SelfIdentity inherits Rectangle {
+    in property <string> nick;
+    in property <image> stone;
+    callback details();
+    callback focused();
+    in property <int> focus-epoch: 0;
+    changed focus-epoch => { identity-focus.focus(); }
+    min-width: 0;
+    forward-focus: identity-focus;
+    identity-focus := FocusScope {
+        changed has-focus => { if (self.has-focus) { root.focused(); } }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) { root.details(); return accept; }
+            return reject;
+        }
+    }
+    border-width: identity-focus.has-focus ? 2px : 0px;
+    border-color: CallTokens.warm;
+    border-radius: 6px;
+    accessible-role: button;
+    accessible-label: root.nick + "，我，查看身份详情";
+    accessible-action-default => { root.details(); }
+    HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 32px;
+            height: 100%;
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                width: 32px;
+                height: 32px;
+                border-radius: 8px;
+                background: #302a22;
+                Image { source: root.stone; width: 100%; height: 100%; image-fit: contain; image-rendering: pixelated; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            min-width: 0;
+            Text { text: root.nick; height: 18px; min-width: 0; overflow: elide; color: CallTokens.text; font-size: 13px; }
+            Text { text: "我"; height: 14px; color: CallTokens.dim; font-size: 11px; }
+        }
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { identity-focus.focus(); root.details(); } }
+}
+
+component InputMeter inherits Rectangle {
+    in property <bool> available;
+    in property <float> level;
+    in property <float> threshold;
+    in property <bool> ptt;
+    min-width: 0;
+    accessible-role: text;
+    accessible-label: root.available ? "麦克风输入电平" : "麦克风输入尚未就绪";
+    VerticalLayout {
+        spacing: 0;
+        HorizontalLayout {
+            height: 24px;
+            spacing: 6px;
+            Rectangle { width: 14px; height: 24px; Image { y: 5px; source: @image-url("icons/mic.svg"); width: 14px; height: 14px; colorize: CallTokens.dim; } }
+            Text { text: root.available ? "麦克风输入" : "输入未就绪"; min-width: 0; height: 24px; vertical-alignment: center; overflow: elide; color: CallTokens.dim; font-size: 12px; }
+        }
+        Rectangle {
+            height: 16px;
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                width: 100%;
+                height: 5px;
+                border-radius: 3px;
+                background: CallTokens.line;
+                clip: true;
+                Rectangle { x: 0; y: 0; width: parent.width * (root.available ? Math.clamp(root.level, 0, 1) : 0); height: 100%; border-radius: 3px; background: root.level > 0.92 ? CallTokens.danger : CallTokens.warm; }
+                if root.available && !root.ptt: Rectangle { x: parent.width * Math.clamp(root.threshold, 0, 1); y: 0; width: 2px; height: 100%; background: CallTokens.text; }
+            }
+        }
+    }
+}
+
+// The mode title shares the meter's baseline; disclosure follows the text.
+component TalkModeEntry inherits Rectangle {
+    in property <string> label;
+    in property <string> accessible-name;
+    in property <bool> cancelling;
+    in property <int> focus-epoch: 0;
+    callback clicked();
+    callback focused();
+    height: 24px;
+    min-width: 0;
+    border-radius: 5px;
+    border-width: keyboard.has-focus ? 2px : 0px;
+    border-color: CallTokens.warm;
+    background: touch.has-hover ? CallTokens.hover : transparent;
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-action-default => { root.clicked(); }
+    forward-focus: keyboard;
+    changed focus-epoch => { keyboard.focus(); }
+    keyboard := FocusScope {
+        changed has-focus => { if (self.has-focus) { root.focused(); } }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n" || event.text == Key.Return) { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        Text { text: root.label; height: 24px; min-width: 0; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; color: CallTokens.text; font-size: 12px; }
+        Rectangle {
+            width: 14px;
+            height: 24px;
+            Image { y: 5px; width: 14px; height: 14px; source: root.cancelling ? @image-url("icons/close.svg") : @image-url("icons/chevron.svg"); colorize: CallTokens.dim; }
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { keyboard.focus(); root.clicked(); } }
+}
+
+component TalkStatus inherits Rectangle {
+    in property <bool> ptt;
+    in property <string> key-label;
+    in property <bool> rebinding;
+    in property <string> status;
+    in property <bool> sending;
+    in property <int> focus-epoch: 0;
+    callback change-mode();
+    callback bind-key();
+    callback cancel-bind();
+    callback focused();
+    min-width: 0;
+    VerticalLayout {
+        spacing: 0;
+        mode := TalkModeEntry {
+            focus-epoch: root.focus-epoch;
+            label: root.rebinding ? "绑定按键…" : root.ptt && root.key-label == "" ? "绑定说话键" : root.ptt ? "按住说话" : "语音激活";
+            cancelling: root.rebinding;
+            accessible-name: root.rebinding ? "正在绑定按住说话键，激活取消" : root.ptt ? "按住说话，按键 " + root.key-label + "，激活选择说话模式" : "语音激活，激活选择说话模式";
+            clicked => { if (root.rebinding) { root.cancel-bind(); } else if (root.ptt && root.key-label == "") { root.bind-key(); } else { root.change-mode(); } }
+            focused => { root.focused(); }
+        }
+        HorizontalLayout {
+            height: 16px;
+            spacing: 6px;
+            Rectangle { width: 6px; height: 16px; Rectangle { x: 0; y: 5px; width: 6px; height: 6px; border-radius: 3px; background: root.sending ? CallTokens.speaking : CallTokens.dim; } }
+            Text { text: root.rebinding ? "按键完成 · 点击取消" : root.ptt && root.status == "等待按键" && root.key-label != "" ? "等待 " + root.key-label : root.status; min-width: 0; height: 16px; vertical-alignment: center; overflow: elide; color: root.sending ? CallTokens.speaking : CallTokens.dim; font-size: 11px; }
+        }
+    }
+}
+
+component CallActions inherits Rectangle {
+    in property <bool> muted;
+    in property <bool> deafened;
+    in property <bool> compact;
+    in property <int> focus-epoch;
+    callback mute();
+    callback deafen();
+    callback settings();
+    callback focused();
+    public function focus-mute() { if (root.deafened) { sound.focus(); } else { mic.focus(); } }
+    HorizontalLayout {
+        spacing: 8px;
+        mic := CallButton {
+            horizontal-stretch: 1;
+            min-width: 0;
+            height: 40px;
+            icon: root.muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+            label: root.muted ? "开麦" : "闭麦";
+            selected: root.muted;
+            enabled: !root.deafened;
+            focus-epoch: root.deafened ? 0 : root.focus-epoch;
+            accessible-label: root.deafened ? "开麦不可用，请先打开声音" : root.muted ? "开麦" : "闭麦";
+            clicked => { root.mute(); }
+            focused => { root.focused(); }
+        }
+        sound := CallButton {
+            horizontal-stretch: 1.35;
+            min-width: 0;
+            height: 40px;
+            icon: root.deafened ? @image-url("icons/headphones-off.svg") : @image-url("icons/headphones.svg");
+            label: root.deafened ? "打开声音" : "关闭声音";
+            selected: root.deafened;
+            focus-epoch: root.deafened ? root.focus-epoch : 0;
+            accessible-label: root.deafened ? "打开声音，麦克风保持关闭" : "关闭声音并闭麦";
+            clicked => { root.deafen(); }
+            focused => { root.focused(); }
+        }
+        CallButton {
+            width: 40px;
+            height: 40px;
+            icon: @image-url("icons/settings.svg");
+            accessible-label: "设置";
+            clicked => { root.settings(); }
+            focused => { root.focused(); }
+        }
+    }
+}
+
+// One dock instance. Only the inner arrangement changes at its own breakpoint.
+export component SelfDock inherits Rectangle {
+    in property <string> nick;
+    in property <image> identity-image;
+    in property <bool> input-available;
+    in property <float> input-level;
+    in property <float> vad-level;
+    in property <bool> ptt-mode;
+    in property <string> ptt-label;
+    in property <bool> rebinding;
+    in property <string> status;
+    in property <bool> transmitting;
+    in property <bool> muted;
+    in property <bool> deafened;
+    in property <int> focus-epoch: 0;
+    in property <int> mode-focus: 0;
+    in property <int> identity-focus: 0;
+    out property <bool> compact: self.width < 736px;
+    callback identity-details();
+    callback mode-menu();
+    callback rebind();
+    callback cancel-rebind();
+    callback toggle-mute();
+    callback toggle-deafen();
+    callback settings();
+    callback focused();
+    height: root.compact ? 105px : 65px;
+    background: CallTokens.panel;
+    VerticalLayout {
+        spacing: 0;
+        Rectangle { height: 1px; background: CallTokens.line; }
+        if !root.compact: HorizontalLayout {
+            padding: 12px;
+            spacing: 8px;
+            SelfIdentity { width: 112px; height: 40px; nick: root.nick; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
+            Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
+            InputMeter { width: 124px; height: 40px; available: root.input-available; level: root.input-level; threshold: root.vad-level; ptt: root.ptt-mode; }
+            Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
+            TalkStatus { min-width: 128px; height: 40px; horizontal-stretch: 1; ptt: root.ptt-mode; key-label: root.ptt-label; rebinding: root.rebinding; focus-epoch: root.mode-focus; status: root.status; sending: root.transmitting; change-mode => { root.mode-menu(); } bind-key => { root.rebind(); } cancel-bind => { root.cancel-rebind(); } focused => { root.focused(); } }
+            Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
+            CallActions { width: 260px; height: 40px; muted: root.muted; deafened: root.deafened; compact: false; focus-epoch: root.focus-epoch; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
+        }
+        if root.compact: VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 8px;
+            HorizontalLayout {
+                height: 40px;
+                spacing: 6px;
+                SelfIdentity { preferred-width: 100px; height: 40px; min-width: 0; horizontal-stretch: 1; nick: root.nick; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
+                Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
+                InputMeter { preferred-width: 110px; height: 40px; min-width: 0; horizontal-stretch: 1; available: root.input-available; level: root.input-level; threshold: root.vad-level; ptt: root.ptt-mode; }
+                Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
+                TalkStatus { preferred-width: 140px; height: 40px; min-width: 0; horizontal-stretch: 1.2; ptt: root.ptt-mode; key-label: root.ptt-label; rebinding: root.rebinding; focus-epoch: root.mode-focus; status: root.status; sending: root.transmitting; change-mode => { root.mode-menu(); } bind-key => { root.rebind(); } cancel-bind => { root.cancel-rebind(); } focused => { root.focused(); } }
+            }
+            CallActions { height: 40px; muted: root.muted; deafened: root.deafened; compact: true; focus-epoch: root.focus-epoch; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
+        }
+    }
+}

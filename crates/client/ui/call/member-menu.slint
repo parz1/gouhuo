@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { Slider, ComboBox, ScrollView } from "std-widgets.slint";
+import { Row } from "types.slint";
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component MemberMenu inherits Rectangle {
+    in property <Row> member;
+    // The edit draft is owned by this menu. Model refreshes never reset a dragged value.
+    property <float> draft-volume: root.member.volume;
+    property <int> confirm: 0;
+    property <int> target: root.member.id;
+    changed target => { root.draft-volume = root.member.volume; root.confirm = 0; }
+    callback volume(float);
+    callback save();
+    callback role(int);
+    callback kick();
+    callback ban();
+    callback close();
+    callback vanished();
+    init => { volume-slider.focus(); }
+    background: CallTokens.raised;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: CallTokens.line;
+    TouchArea { }
+    forward-focus: menu-keys;
+    menu-keys := FocusScope {
+        key-released(event) => { if (event.text == Key.LeftArrow || event.text == Key.RightArrow || event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.Home || event.text == Key.End) { root.save(); } return reject; }
+        VerticalLayout {
+            padding: 10px;
+            spacing: 8px;
+            HorizontalLayout {
+                height: 32px;
+                spacing: 8px;
+                Text { text: root.member.name; min-width: 0; overflow: elide; color: CallTokens.text; font-size: 14px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; accessible-label: root.member.name; }
+                CallButton { width: 32px; height: 32px; icon: @image-url("icons/close.svg"); accessible-label: "关闭成员菜单"; clicked => { root.save(); root.close(); } }
+            }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Text { text: root.member.name; color: CallTokens.dim; font-size: 12px; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "个人音量"; color: CallTokens.dim; font-size: 12px; horizontal-stretch: 1; }
+                        Text { text: Math.round(root.draft-volume) + "%"; color: CallTokens.text; font-size: 12px; }
+                    }
+                    volume-slider := Slider { height: 32px; minimum: 0; maximum: 400; value <=> root.draft-volume; changed(v) => { root.volume(v); } released(v) => { root.save(); } }
+                    CallButton { label: root.draft-volume == 0 ? "恢复个人音量" : "仅对我静音"; clicked => { root.draft-volume = root.draft-volume == 0 ? 100 : 0; root.volume(root.draft-volume); root.save(); } }
+                    if root.member.can-set-role: ComboBox { height: 32px; model: ["访客", "成员", "频道管理", "管理员"]; current-index: root.member.role - 1; selected(v) => { root.role(self.current-index); } }
+                    if root.member.can-kick || root.member.can-ban: HorizontalLayout {
+                        spacing: 8px;
+                        if root.member.can-kick: CallButton { horizontal-stretch: 1; label: root.confirm == 1 ? "确认踢出" : "踢出"; danger: root.confirm == 1; clicked => { if (root.confirm == 1) { root.kick(); root.close(); } else { root.confirm = 1; } } }
+                        if root.member.can-ban: CallButton { horizontal-stretch: 1; label: root.confirm == 2 ? "确认封禁" : "封禁"; danger: root.confirm == 2; clicked => { if (root.confirm == 2) { root.ban(); root.close(); } else { root.confirm = 2; } } }
+                    }
+                    if root.confirm != 0: Text { text: "再次点击确认；这会使对方离开服务器。"; color: CallTokens.warm; font-size: 11px; wrap: word-wrap; }
+                }
+            }
+        }
+    }
+}

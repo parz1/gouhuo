@@ -139,7 +139,7 @@ fn main() -> ExitCode {
     // 整个进程持有 1 ms 定时器精度。没有它，20 ms 的节拍在 Windows 上会变成
     // 31 ms，测出来的全是调度器的锅，跟架构无关。
     let timer = TimerResolutionGuard::acquire();
-    if !timer.is_active() {
+    if cfg!(windows) && !timer.is_active() {
         eprintln!("警告：timeBeginPeriod(1) 没拿到，节拍会不准，这次的数字别当真。");
     }
 

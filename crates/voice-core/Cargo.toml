@@ -43,6 +43,10 @@ sha2.workspace = true
 opus = { workspace = true, optional = true }
 sonora = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# 仅在测试里读取内核实际的 UDP 接收缓冲，不改变客户端的 socket 热路径。
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Devices_FunctionDiscovery",

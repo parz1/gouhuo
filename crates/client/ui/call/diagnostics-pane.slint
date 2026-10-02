@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { ScrollView } from "std-widgets.slint";
+import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
+
+export component DiagnosticsPane inherits Rectangle {
+    in property <string> report;
+    callback refresh();
+    callback close();
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            height: 32px;
+            spacing: 8px;
+            CallButton { width: 96px; height: 32px; label: "返回通话"; icon: @image-url("icons/back.svg"); clicked => { root.close(); } }
+            CallButton { width: 64px; height: 32px; label: "刷新"; clicked => { root.refresh(); } }
+            Text { text: "选中文字，Ctrl+C 复制"; min-width: 0; overflow: elide; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            TextInput { text: root.report; read-only: true; single-line: false; color: CallTokens.text; font-family: CallTokens.font; font-size: 12px; wrap: word-wrap; }
+        }
+    }
+}
