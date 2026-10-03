@@ -10,6 +10,7 @@ members = [
     "crates/client-core",
     "crates/client-runtime",
     "crates/client",
+    "crates/test-bot",
 ]
 
 [workspace.package]

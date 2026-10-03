@@ -5266,6 +5266,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-bot"
+version = "0.3.0"
+dependencies = [
+ "client-core",
+ "client-runtime",
+ "latency-probe",
+ "protocol",
+ "serde_json",
+ "server",
+ "transport",
+ "voice-core",
+]
+
+[[package]]
 name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

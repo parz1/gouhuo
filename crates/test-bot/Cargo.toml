@@ -1,0 +1,23 @@
+[package]
+name = "test-bot"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.92"
+license.workspace = true
+description = "Headless Gouhuo call bots with deterministic UDP impairment and bounded diagnostics."
+
+[[bin]]
+name = "gouhuo-bot"
+path = "src/main.rs"
+
+[dependencies]
+client-core.workspace = true
+client-runtime.workspace = true
+protocol.workspace = true
+voice-core = { workspace = true, features = ["pipeline"] }
+latency-probe = { path = "../latency-probe" }
+serde_json = "1"
+
+[dev-dependencies]
+server = { path = "../server" }
+transport.workspace = true

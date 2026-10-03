@@ -298,6 +298,7 @@ crates/
   client-runtime/  不含 GUI 的语音生命周期、意愿/事实快照、恢复策略与状态投影
   client/          Slint 界面与桌面适配器；不拥有语音线程
   latency-probe/   协议链路延迟的测量工具
+  test-bot/        无声卡多人语音测试机器人（gouhuo-bot）
   device-probe/    WASAPI 设备延迟 + APM 逐块计价
 docs/
   measurements.md      红线表的依据：量法、每个数字的由来
@@ -314,6 +315,8 @@ docs/
 ---
 
 ## 开发
+
+多人语音可用无界面机器人测试，支持循环 WAV、回声和单向断网模拟，见 [测试机器人](docs/test-bots.md)。
 
 ```bash
 cargo test --workspace

@@ -12,7 +12,7 @@
 
 mod bandwidth;
 mod cpucost;
-mod netem;
+use latency_probe::netem;
 mod relay;
 mod report;
 mod run;
