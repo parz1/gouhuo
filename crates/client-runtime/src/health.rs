@@ -51,11 +51,24 @@ impl CallHealth {
                 || stats.is_some_and(|s| {
                     s.udp_failed || s.transport_error.is_some() || s.sequences_exhausted
                 }));
-        let action = if reconnecting {
+        let mut action = if reconnecting {
             None
         } else {
             self.recovery.tick(now, healthy, failed, device_error)
         };
+        // Keep probing on the current socket during a UDP-only outage. Opening
+        // audio devices cannot repair packet loss and can disrupt virtual or
+        // Bluetooth routing. The recovery policy still escalates persistent
+        // failure to a rate-limited authenticated reconnect. Fatal transport
+        // and preparation failures retain the normal voice replacement path.
+        let udp_only = snapshot.error.is_none()
+            && !device_error
+            && stats.is_some_and(|s| {
+                s.udp_failed && s.transport_error.is_none() && !s.sequences_exhausted
+            });
+        if udp_only && action == Some(Action::RetryVoice) {
+            action = None;
+        }
         let playback_only = stats.is_some_and(|s| {
             s.render_error.is_some()
                 && s.capture_error.is_none()
@@ -91,6 +104,91 @@ impl CallHealth {
 mod tests {
     use super::*;
     use voice_core::pipeline::VoiceStats;
+
+    #[test]
+    fn udp_outage_keeps_audio_open_until_reconnect_and_can_recover_in_place() {
+        let mut health = CallHealth::default();
+        let mut snapshot = RuntimeSnapshot {
+            stage: RuntimeStage::Failed,
+            voice: Some(VoiceStats {
+                udp_failed: true,
+                input_available: true,
+                render_available: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            health.tick(Duration::from_secs(8), &snapshot, false).action,
+            Some(Action::Lost)
+        );
+        for s in [9, 11] {
+            assert_eq!(
+                health.tick(Duration::from_secs(s), &snapshot, false).action,
+                None
+            );
+        }
+        assert_eq!(
+            health
+                .tick(Duration::from_secs(15), &snapshot, false)
+                .action,
+            Some(Action::Reconnect)
+        );
+        let stats = snapshot.voice.as_mut().unwrap();
+        stats.udp_failed = false;
+        stats.udp_ok = true;
+        snapshot.stage = RuntimeStage::Ready;
+        assert_eq!(
+            health
+                .tick(Duration::from_secs(16), &snapshot, false)
+                .action,
+            Some(Action::Recovered)
+        );
+        let stats = snapshot.voice.as_mut().unwrap();
+        stats.udp_failed = true;
+        stats.udp_ok = false;
+        snapshot.stage = RuntimeStage::Failed;
+        assert_eq!(
+            health
+                .tick(Duration::from_secs(17), &snapshot, false)
+                .action,
+            Some(Action::Lost)
+        );
+        for s in [18, 20, 24, 32] {
+            assert_eq!(
+                health.tick(Duration::from_secs(s), &snapshot, false).action,
+                None
+            );
+        }
+        assert_eq!(
+            health
+                .tick(Duration::from_secs(48), &snapshot, false)
+                .action,
+            Some(Action::Reconnect)
+        );
+    }
+
+    #[test]
+    fn a_dead_receive_thread_still_replaces_the_voice_pipeline() {
+        let mut health = CallHealth::default();
+        let snapshot = RuntimeSnapshot {
+            stage: RuntimeStage::Failed,
+            voice: Some(VoiceStats {
+                udp_failed: true,
+                transport_error: Some("receive thread stopped".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            health.tick(Duration::ZERO, &snapshot, false).action,
+            Some(Action::Lost)
+        );
+        assert_eq!(
+            health.tick(Duration::from_secs(1), &snapshot, false).action,
+            Some(Action::RetryVoice)
+        );
+    }
 
     #[test]
     fn playback_failure_notice_preserves_the_direction_of_the_failure() {

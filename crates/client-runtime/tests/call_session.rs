@@ -210,7 +210,7 @@ impl Endpoint {
     }
 
     fn start(&self) -> u64 {
-        let (session_id, udp_port, keys) = self.client.voice_session();
+        let (session_id, server, keys) = self.client.voice_endpoint_session();
         let handle = self.handle();
         // Match the host start path: mode changes clear an old PTT press;
         // current local mute/deafen intent is never replaced by a roster echo.
@@ -222,8 +222,8 @@ impl Endpoint {
                 .is_some_and(|u| u.server_muted),
         );
         handle.start_voice(StartVoice {
-            host: self.client.server_host().to_owned(),
-            udp_port,
+            host: server.ip().to_string(),
+            udp_port: server.port(),
             session_id,
             sequences: Arc::clone(&keys.sequences),
             upstream_key: *keys.upstream.as_bytes(),

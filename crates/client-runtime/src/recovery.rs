@@ -37,7 +37,11 @@ impl Recovery {
     ) -> Option<Action> {
         if healthy {
             let recovered = self.interrupted;
-            *self = Self::default();
+            // A brief recovery must not bypass the full reconnect cooldown.
+            *self = Self {
+                reconnect_after: self.reconnect_after,
+                ..Self::default()
+            };
             return recovered.then_some(Action::Recovered);
         }
         if !failed {

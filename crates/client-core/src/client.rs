@@ -36,7 +36,7 @@
 //! 闭麦 / 关耳朵意愿会立即保存并在重连时恢复；文字和管理命令不会重放。
 //! [`Client::connect`] 的初次握手仍会等待网络，应在前端的后台任务中调用。
 
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -198,6 +198,7 @@ struct Link {
     writer_state: Arc<WriterState>,
     session_id: u32,
     udp_port: u16,
+    voice_addr: SocketAddr,
     voice: Arc<VoiceKeys>,
 }
 
@@ -489,6 +490,14 @@ impl Client {
     pub fn voice_session(&self) -> (u32, u16, Arc<VoiceKeys>) {
         let link = self.shared.link();
         (link.session_id, link.udp_port, Arc::clone(&link.voice))
+    }
+
+    /// Voice destination and keys from the same authenticated connection.
+    /// Use the TCP peer rather than resolving the invitation again: DNS may
+    /// put an unreachable IPv6 address or a different server first.
+    pub fn voice_endpoint_session(&self) -> (u32, SocketAddr, Arc<VoiceKeys>) {
+        let link = self.shared.link();
+        (link.session_id, link.voice_addr, Arc::clone(&link.voice))
     }
 
     /// 借出名单来画界面。**别在持有它的时候做慢事情** ——
@@ -972,6 +981,8 @@ fn establish(
         .set_read_timeout(None)?;
     reader.clear_read_timeout()?;
 
+    let mut voice_addr = handshake_sock.peer_addr()?;
+    voice_addr.set_port(welcome.udp_port as u16);
     let writer_state = Arc::new(WriterState {
         stopped: AtomicBool::new(false),
         completed: AtomicBool::new(false),
@@ -988,6 +999,7 @@ fn establish(
             .spawn(move || writer_loop(wire, socket, state, queue))?;
     }
     let link = Link {
+        voice_addr,
         shutdown_sock: handshake_sock,
         #[cfg(test)]
         wire,

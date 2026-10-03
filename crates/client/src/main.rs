@@ -1139,15 +1139,15 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
     let Some(runtime) = current_runtime(state) else {
         return;
     };
-    let (session_id, udp_port, keys) = client.voice_session();
+    let (session_id, server, keys) = client.voice_endpoint_session();
     let settings = state.lock().expect("state poisoned").settings.clone();
     runtime.set_mode(transmit_mode(&settings));
     // Replacements preserve local intent. Volumes are staged before admission
     // so a candidate cannot send with stale/default controls.
     apply_volumes(state, client);
     runtime.start_voice(StartVoice {
-        host: client.server_host().to_string(),
-        udp_port,
+        host: server.ip().to_string(),
+        udp_port: server.port(),
         session_id,
         sequences: Arc::clone(&keys.sequences),
         upstream_key: *keys.upstream.as_bytes(),
@@ -1405,6 +1405,8 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
         ));
     }
     if let Some(client) = &locked.client {
+        let (_, endpoint, _) = client.voice_endpoint_session();
+        text.push_str(&format!("当前语音目标：{endpoint}\n"));
         text.push_str(&format!(
             "服务端最近报告的 UDP 接收数（含保活）：{}\n",
             client.server_udp_received()
@@ -1795,7 +1797,20 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 update_tray(&view, client.as_ref());
             }
             if let Some(action) = &health.action {
-                record_recovery(&state, &format!("{action:?}; stage={:?}", snapshot.stage));
+                let mut reason = format!(
+                    "{action:?}; stage={:?}; preparation={:?}",
+                    snapshot.stage, snapshot.error
+                );
+                if let Some(stats) = &snapshot.voice {
+                    reason.push_str(&format!(
+                        "; udp_failed={}; capture={:?}; render={:?}; transport={:?}",
+                        stats.udp_failed,
+                        stats.capture_error,
+                        stats.render_error,
+                        stats.transport_error
+                    ));
+                }
+                record_recovery(&state, &reason);
             }
             match health.action {
                 Some(recovery::Action::Lost) => connection_notice(&state, false),

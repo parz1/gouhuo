@@ -95,18 +95,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let (session_id, udp_port, keys) = client.voice_session();
-    let Some(server) = format!("{}:{}", client.server_host(), udp_port)
-        .parse()
-        .ok()
-    else {
-        eprintln!(
-            "服务器地址解析不了：{}:{}",
-            client.server_host(),
-            client.udp_port()
-        );
-        std::process::exit(1);
-    };
+    let (session_id, server, keys) = client.voice_endpoint_session();
     let _voice = Pipeline::start(
         PipelineConfig {
             session_id,

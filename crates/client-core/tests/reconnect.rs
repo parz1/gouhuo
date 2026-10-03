@@ -413,6 +413,52 @@ fn a_quiet_connection_is_not_dropped() {
     }
 }
 
+/// Domain resolution must not send UDP to a different peer than TCP.
+#[test]
+fn domain_voice_destination_uses_the_authenticated_tcp_peer() {
+    let mut server = open_server();
+    server.invite.host = "localhost".into();
+    let (client, _) = Client::connect_with(
+        &server.invite.to_url().unwrap(),
+        &Identity::generate().unwrap(),
+        "domain",
+        fast(),
+    )
+    .unwrap();
+    let (session, addr, keys) = client.voice_endpoint_session();
+    assert_eq!(addr.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(addr.port(), client.udp_port());
+    assert_eq!(session, client.session_id());
+    assert!(Arc::ptr_eq(&keys, &client.voice_keys()));
+
+    // Confirm this destination really reaches the authenticated UDP session,
+    // rather than merely checking that an address accessor returns an IP.
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let header = protocol::VoiceHeader {
+        session,
+        seq: keys.sequences.next(true).unwrap(),
+        timestamp: 123,
+        flags: protocol::FLAG_KEEPALIVE,
+    };
+    let mut wire = Vec::new();
+    protocol::VoiceCipher::new(keys.upstream.as_bytes())
+        .seal(header, &[], &mut wire)
+        .unwrap();
+    socket.send_to(&wire, addr).unwrap();
+    let mut buffer = [0; 2048];
+    let (n, from) = socket.recv_from(&mut buffer).unwrap();
+    assert_eq!(from, addr);
+    let reply = protocol::VoiceCipher::new(keys.downstream.as_bytes())
+        .open(&buffer[..n], &mut Vec::new())
+        .unwrap();
+    assert!(reply.is_keepalive());
+    assert_eq!(reply.timestamp, 123);
+    client.disconnect();
+}
+
 /// Voice-only failure can explicitly refresh the session without losing channel or mute state.
 #[test]
 fn requested_reconnect_restores_channel_and_self_state() {
@@ -441,6 +487,11 @@ fn requested_reconnect_restores_channel_and_self_state() {
     wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
     wait_for(&events, |e| matches!(e, Event::Reconnected));
     assert_ne!(session, client.session_id());
+    let (voice_session, addr, keys) = client.voice_endpoint_session();
+    assert_eq!(voice_session, client.session_id());
+    assert_eq!(addr.ip(), server.addr().ip());
+    assert_eq!(addr.port(), client.udp_port());
+    assert!(Arc::ptr_eq(&keys, &client.voice_keys()));
     eventually("restored", || {
         let r = client.roster();
         let u = r.users.get(&r.me).unwrap();
