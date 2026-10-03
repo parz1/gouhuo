@@ -110,6 +110,13 @@ cargo run --release -p server --bin gouhuo-server
 | `GOUHUO_JOIN_URL` | 对外的 HTTPS 加入页地址；设置后在日志里打印浏览器邀请 |
 | `GOUHUO_NAME` | `朋友的篝火`，加入页显示的服务器名称 |
 
+### Linux 单文件服务端
+
+Linux x86_64 静态服务端的打包脚本与后续 Release 资产流程已加入仓库。
+可从源码运行 `bash packaging/linux/build.sh`，生成 musl 静态二进制压缩包及 SHA-256 校验文件；
+已有 Release 是否带此资产，以实际下载列表为准。构建与部署步骤见
+[Linux 服务端说明](packaging/linux/README.md)。它不需要运行时动态库，仍需放行 TCP/UDP 20800 并保留数据目录。
+
 ### 用 Docker 部署
 
 放到一台 Linux 服务器上，最省事的是 Docker。服务器上不用放代码，也不用编译。

@@ -40,7 +40,11 @@ pub fn is_wake(buf: &[u8]) -> bool {
 
 /// 往 `addr` 发一个哨兵包，把阻塞在那个 socket 上的收包线程叫醒。
 pub fn send_wake(addr: SocketAddr) -> io::Result<()> {
-    let s = UdpSocket::bind("127.0.0.1:0")?;
+    let s = UdpSocket::bind(if addr.is_ipv4() {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    })?;
     s.send_to(&WAKE_MAGIC, addr)?;
     Ok(())
 }
@@ -50,7 +54,7 @@ pub fn set_recv_buffer(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF};
 
-    let value = bytes as i32;
+    let value = recv_buffer_value(bytes)?;
     let rc = unsafe {
         setsockopt(
             sock.as_raw_socket() as usize,
@@ -67,7 +71,42 @@ pub fn set_recv_buffer(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn set_recv_buffer(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let value = recv_buffer_value(bytes)?;
+    // SAFETY: the socket remains live and value is a valid c_int pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(windows, unix))]
+fn recv_buffer_value(bytes: usize) -> io::Result<i32> {
+    i32::try_from(bytes)
+        .ok()
+        .filter(|&value| value > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "接收缓冲大小必须在 1..=i32::MAX 内",
+            )
+        })
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn set_recv_buffer(_sock: &UdpSocket, _bytes: usize) -> io::Result<()> {
     Ok(())
 }
@@ -114,7 +153,7 @@ mod tests {
     }
 
     /// Windows 的缓冲回归：2000 个包一次灌进去，默认的 8 KB 连 100 个都存不下。
-    /// Linux 上目前不调缓冲，突发量按内核实际的容量缩小，避免把宿主机上限当成回归。
+    /// Linux 突发量按内核实际的容量缩小，避免把宿主机上限当成回归。
     #[test]
     fn large_recv_buffer_survives_a_burst() {
         let sink = bind_voice_socket("127.0.0.1:0").unwrap();
@@ -173,6 +212,59 @@ mod tests {
         assert_eq!(len as usize, std::mem::size_of_val(&value));
         assert!(value > 0, "SO_RCVBUF 必须为正：{value}");
         value as usize
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn invalid_buffer_sizes_are_rejected() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for size in [0, i32::MAX as usize + 1, usize::MAX] {
+            assert_eq!(
+                set_recv_buffer(&sock, size).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_buffer_request_changes_the_kernel_socket_option() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        set_recv_buffer(&sock, 4096).unwrap();
+        let small = linux_recv_buffer_size(&sock);
+        // Linux doubles the requested capacity for bookkeeping, after clamping
+        // it to rmem_max. Test the actual option, not an assumed 1 MB result.
+        assert_eq!(small, 8192);
+        set_recv_buffer(&sock, DEFAULT_RECV_BUFFER).unwrap();
+        let large = linux_recv_buffer_size(&sock);
+        // Some container kernels do not expose rmem_max in /proc. Inspect the
+        // real socket instead; a host cap may legitimately truncate the request.
+        assert!(large >= small, "buffer shrank: {small} -> {large}");
+        assert!(
+            large <= DEFAULT_RECV_BUFFER * 2,
+            "unexpected capacity: {large}"
+        );
+    }
+
+    #[test]
+    fn send_wake_reaches_an_ipv6_receiver() {
+        let sink = match UdpSocket::bind("[::1]:0") {
+            Ok(socket) => socket,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                return
+            }
+            Err(error) => panic!("IPv6 socket: {error}"),
+        };
+        sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        send_wake(sink.local_addr().unwrap()).unwrap();
+        let mut buf = [0; 64];
+        let (n, _) = sink.recv_from(&mut buf).unwrap();
+        assert!(is_wake(&buf[..n]));
     }
 
     /// 回归测试：读超时周期跟到包间隔同频时，Winsock 会吃掉数据报。

@@ -151,6 +151,36 @@ jobs:
       - name: quality-probe test
         run: cargo test -p voice-core --example quality-probe
 
+  linux-server:
+    needs: [dco, license]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--no-default-features"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-server-${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: 安装 musl 构建工具
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: 独立服务端构建
+        run: cargo build --locked -p server ${{ matrix.features }}
+      - name: 独立服务端 Clippy
+        run: cargo clippy --locked -p server --all-targets ${{ matrix.features }} -- -D warnings
+      - name: 服务端与协议测试
+        run: cargo test --locked -p server -p transport -p protocol ${{ matrix.features }}
+      - name: Unix socket 回归
+        run: cargo test --locked -p voice-core --no-default-features net::tests
+      - name: 静态二进制构建与检查
+        run: bash packaging/linux/build.sh ${{ matrix.features }}
+
   # 延迟数字**不在这里测**。
   #
   # 曾经有个 latency-record job 每次跑 4m42s，把 m1.json 存成 artifact 用来看趋势。
