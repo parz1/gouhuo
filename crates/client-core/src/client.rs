@@ -916,7 +916,7 @@ fn establish(
     identity: &Identity,
     desired_name: &str,
 ) -> Result<(Link, Reader, Welcome), ConnectError> {
-    let sock = connect_tcp(&invite.host, invite.port)?;
+    let (sock, mut voice_addr) = connect_tcp_peer(&invite.host, invite.port)?;
     sock.set_nodelay(true)?;
     sock.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     // 握手和认证期间要有读超时：对面接了 TCP 却一声不吭（半死的 NAT、
@@ -981,7 +981,6 @@ fn establish(
         .set_read_timeout(None)?;
     reader.clear_read_timeout()?;
 
-    let mut voice_addr = handshake_sock.peer_addr()?;
     voice_addr.set_port(welcome.udp_port as u16);
     let writer_state = Arc::new(WriterState {
         stopped: AtomicBool::new(false),
@@ -1105,6 +1104,14 @@ fn apply(roster: &Mutex<Roster>, message: ServerMessage) -> Vec<Event> {
 }
 
 pub(crate) fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
+    connect_tcp_peer(host, port).map(|(socket, _)| socket)
+}
+
+// Preserve the address of the successful connect, rather than querying a
+// cloned Winsock handle after TLS authentication. A late getpeername can fail
+// with WSAENOTCONN even after the welcome was read. The address is published
+// only after authentication and uses the same DNS attempt as that TCP stream.
+fn connect_tcp_peer(host: &str, port: u16) -> Result<(TcpStream, SocketAddr), ConnectError> {
     use std::net::ToSocketAddrs;
 
     let unreachable = |source: std::io::Error| ConnectError::Unreachable {
@@ -1126,7 +1133,7 @@ pub(crate) fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectErr
     let mut last = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(sock) => return Ok(sock),
+            Ok(sock) => return Ok((sock, addr)),
             Err(e) => last = Some(e),
         }
     }
@@ -1191,6 +1198,24 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use protocol::control::Channel;
+
+    #[test]
+    fn selected_tcp_address_remains_available_after_remote_close() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            drop(socket);
+        });
+        let (mut socket, selected) = connect_tcp_peer("localhost", address.port()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+        server.join().unwrap();
+        assert_eq!(selected, address);
+    }
 
     #[test]
     fn heartbeat_leaves_room_for_lost_packets() {
