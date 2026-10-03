@@ -5,7 +5,7 @@
 //! 跟 `server::conn` 里那套是同一个形状，原因也一样：rustls 的连接状态只有
 //! 一份，读和写都要 `&mut`，所以
 //!
-//! - **读**：自己一个 socket 句柄（`try_clone`），阻塞读原始字节，**不持锁**
+//! - **读**：通过 `Arc<TcpStream>` 共享同一 OS 句柄，阻塞读原始字节，**不持锁**
 //! - **写**：`Mutex<Wire>` 里装着 TLS 状态和写用的 socket 句柄
 //!
 //! 没有把它抽到 `transport` 里共用，是因为两边真正共享的只有这三十行机械代码：
@@ -21,15 +21,15 @@ use protocol::control::{decode_frame, encode_frame, MAX_FRAME_BODY};
 
 pub struct Wire {
     pub conn: rustls::ClientConnection,
-    pub sock: TcpStream,
+    pub sock: Arc<TcpStream>,
 }
 
 impl Wire {
     fn flush_tls(&mut self) -> io::Result<()> {
         while self.conn.wants_write() {
-            self.conn.write_tls(&mut self.sock)?;
+            self.conn.write_tls(&mut self.sock.as_ref())?;
         }
-        self.sock.flush()
+        self.sock.as_ref().flush()
     }
 
     pub fn send<M: Message>(&mut self, message: &M) -> io::Result<()> {
@@ -42,13 +42,13 @@ impl Wire {
 
 /// 从 TLS 流里一条一条读消息。
 pub struct Reader {
-    sock: TcpStream,
+    sock: Arc<TcpStream>,
     wire: Arc<Mutex<Wire>>,
     buffered: Vec<u8>,
 }
 
 impl Reader {
-    pub fn new(sock: TcpStream, wire: Arc<Mutex<Wire>>) -> Self {
+    pub fn new(sock: Arc<TcpStream>, wire: Arc<Mutex<Wire>>) -> Self {
         Self {
             sock,
             wire,
@@ -56,8 +56,7 @@ impl Reader {
         }
     }
 
-    /// 撤掉读超时。**要在读用的这个句柄上撤**：Windows 上 `try_clone`
-    /// 出来的句柄各自带着自己的读超时，在别的句柄上撤，这边照样会超时。
+    /// 撤掉认证期的读超时，所有读写与取消共享同一 OS 句柄。
     pub fn clear_read_timeout(&self) -> io::Result<()> {
         self.sock.set_read_timeout(None)
     }
@@ -87,7 +86,7 @@ impl Reader {
         }
 
         let mut chunk = [0u8; 8192];
-        let n = self.sock.read(&mut chunk)?;
+        let n = self.sock.as_ref().read(&mut chunk)?;
         if n == 0 {
             return Ok(false);
         }

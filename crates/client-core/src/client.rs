@@ -191,7 +191,7 @@ pub struct VoiceKeys {
 
 /// 一次成功的连接。重连就是换掉这一整个。
 struct Link {
-    shutdown_sock: TcpStream,
+    shutdown_sock: Arc<TcpStream>,
     #[cfg(test)]
     wire: Arc<Mutex<Wire>>,
     writer: SyncSender<PendingMessage>,
@@ -291,7 +291,7 @@ impl Drop for Link {
 /// 阻塞的 TLS 发送只发生在这里；shutdown 通过独立 socket 句柄打断它。
 fn writer_loop(
     wire: Arc<Mutex<Wire>>,
-    socket: TcpStream,
+    socket: Arc<TcpStream>,
     state: Arc<WriterState>,
     queue: Receiver<PendingMessage>,
 ) {
@@ -917,13 +917,16 @@ fn establish(
     desired_name: &str,
 ) -> Result<(Link, Reader, Welcome), ConnectError> {
     let (sock, mut voice_addr) = connect_tcp_peer(&invite.host, invite.port)?;
+    // One OS handle for concurrent reads, serialized TLS writes and lock-free
+    // cancellation. This also makes shutdown/timeout state consistent on Windows.
+    let sock = Arc::new(sock);
     sock.set_nodelay(true)?;
     sock.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     // 握手和认证期间要有读超时：对面接了 TCP 却一声不吭（半死的 NAT、
     // 不是篝火的服务），没有超时的话这里会永远等下去 —— 重连循环也跟着卡死。
     // 超时一旦触发这条连接就作废了，所以下面那条「超时会吃数据」的坑碰不到。
     sock.set_read_timeout(Some(CONNECT_TIMEOUT))?;
-    let read_sock = sock.try_clone()?;
+    let read_sock = Arc::clone(&sock);
 
     let config =
         Arc::new(client_config(invite.cert).map_err(|e| ConnectError::Tls(e.to_string()))?);
@@ -933,7 +936,7 @@ fn establish(
     let mut conn = rustls::ClientConnection::new(config, name)
         .map_err(|e| ConnectError::Tls(e.to_string()))?;
 
-    let mut handshake_sock = sock.try_clone()?;
+    let mut handshake_sock = sock.as_ref();
     if let Err(e) = conn.complete_io(&mut handshake_sock) {
         let text = e.to_string();
         return Err(if text.contains("指纹对不上") {
@@ -956,7 +959,10 @@ fn establish(
             .map_err(|e| ConnectError::Tls(e.to_string()))?,
     };
 
-    let wire = Arc::new(Mutex::new(Wire { conn, sock }));
+    let wire = Arc::new(Mutex::new(Wire {
+        conn,
+        sock: Arc::clone(&sock),
+    }));
     let mut reader = Reader::new(read_sock, Arc::clone(&wire));
 
     let welcome = authenticate(
@@ -972,9 +978,7 @@ fn establish(
     // 表现为 TLS 流错位（见 server::conn 的模块文档）。
     // 之后「连接还活着吗」由心跳线程看 LIVENESS_TIMEOUT 判断。
     //
-    // 两个句柄都要撤：Windows 上 `try_clone` 出来的句柄各自带着读超时，
-    // 只撤一个的话，读线程那个句柄会在安静 8 秒后自己报超时 —— 一条好好的
-    // 连接平白断掉，还正好踩上上面那个吃数据的坑。
+    // 读、写和取消共享同一个 OS 句柄，撤掉超时对整个连接生效。
     wire.lock()
         .expect("wire poisoned")
         .sock
@@ -991,7 +995,7 @@ fn establish(
     let (writer, queue) = mpsc::sync_channel(WRITE_QUEUE_MESSAGES);
     {
         let wire = Arc::clone(&wire);
-        let socket = handshake_sock.try_clone()?;
+        let socket = Arc::clone(&sock);
         let state = Arc::clone(&writer_state);
         std::thread::Builder::new()
             .name("gouhuo-client-write".into())
@@ -999,7 +1003,7 @@ fn establish(
     }
     let link = Link {
         voice_addr,
-        shutdown_sock: handshake_sock,
+        shutdown_sock: sock,
         #[cfg(test)]
         wire,
         writer,
@@ -1439,6 +1443,11 @@ mod shutdown_tests {
     use super::*;
 
     fn connection(name: &str) -> (Client, Receiver<Event>) {
+        let (client, events, _) = connection_with_hub(name);
+        (client, events)
+    }
+
+    fn connection_with_hub(name: &str) -> (Client, Receiver<Event>, Arc<server::conn::Hub>) {
         use server::conn::Hub;
         use server::state::{Config, Server};
         use std::net::{TcpListener, UdpSocket};
@@ -1457,13 +1466,33 @@ mod shutdown_tests {
             Server::new(Config::default()),
             UdpSocket::bind("127.0.0.1:0").unwrap(),
         ));
-        std::thread::spawn(move || server::accept_loop(listener, tls, hub));
-        Client::connect(
+        let accept_hub = Arc::clone(&hub);
+        std::thread::spawn(move || server::accept_loop(listener, tls, accept_hub));
+        let (client, events) = Client::connect(
             &invite.to_url().unwrap(),
             &Identity::generate().unwrap(),
             name,
         )
-        .unwrap()
+        .unwrap();
+        (client, events, hub)
+    }
+
+    #[test]
+    fn cancellation_closes_the_remote_connection_while_tls_write_lock_is_held() {
+        let (client, _events, hub) = connection_with_hub("remote-cancellation");
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        client.disconnect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while hub.user_count() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let remaining = hub.user_count();
+        drop(guard);
+        assert_eq!(
+            remaining, 0,
+            "cancel must close the actual TCP connection, not just mark it stopped"
+        );
     }
 
     fn wait_for(description: &str, predicate: impl Fn() -> bool) {
