@@ -300,3 +300,7 @@ Working Set 90.543 MiB、Private 105.184 MiB。候选观测是在双端通话场
 忽略项和既有未测范围不改为通过。最终公开状态与 CI 产物以 v0.3.0 Release / Actions 为准；本次发布前复测使用自动检查和离线验证。
 
 首次远端 CI 使用 Rust 1.99，而本地为 1.96；`client-core::Link::send` 的 `fetch_update` 旧名称触发新增弃用警告，严格 Clippy 失败（运行 `37079894221`）。参照协议层已有处理，为该方法局部标注弃用兼容，保留 Rust 1.80 可用的原子 API，不改变队列预算、原子序或运行逻辑。修正后本地格式、严格 `client-core --all-targets` Clippy 及 106 passed / 0 failed / 1 ignored 通过（`ci-compat-*.log`）；正式发布提交仍需远端 CI 验证。
+
+运行 `37080236696` 的 Windows job 显示成功，但复查原始日志发现工作区 Clippy 实际失败：Rust 1.99 新增 `chunks_exact_to_as_chunks` 检查，预览例子的 PNG 像素转换触发警告。原 workflow 在同一 PowerShell step 继续运行服务端 Clippy，成功退出码掩盖了前一条失败。工作区测试实际为 556 passed / 0 failed / 13 ignored，另有 quality-probe 1 项通过；不能把这些结果或 job 绿色当作严格 Clippy 通过。
+
+已取消尚未公开的发布运行 `37080763443`。预览转换改为客户端 Rust 1.92 已支持的 `as_chunks_mut::<4>()`，RGBA 像素内容不变；将各条 Clippy 和测试命令拆为独立 steps，失败直接阻止后续步骤。修正后的提交重新通过远端检查后，才重新创建未发布的 v0.3.0 标签并构建正式产物。原日志保留为 `ci-windows-final.log`，后续成功日志另存，不覆盖这次误绿证据。

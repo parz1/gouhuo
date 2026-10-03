@@ -52,7 +52,7 @@ fn render(window: &MinimalSoftwareWindow, w: u32, h: u32, scale: f32, path: &std
         for (src, dst) in pixels
             .as_slice()
             .iter()
-            .zip(png.data_mut().chunks_exact_mut(4))
+            .zip(png.data_mut().as_chunks_mut::<4>().0)
         {
             dst.copy_from_slice(&[src.r, src.g, src.b, 255]);
         }
