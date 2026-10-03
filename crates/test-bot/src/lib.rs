@@ -123,7 +123,7 @@ fn start(
 }
 
 fn net(c: &Counters) -> Value {
-    json!({ "accepted": c.accepted.load(Ordering::Relaxed), "dropped": c.dropped.load(Ordering::Relaxed), "delivered": c.delivered.load(Ordering::Relaxed), "overflow": c.overflow.load(Ordering::Relaxed), "send_errors": c.send_errors.load(Ordering::Relaxed) })
+    json!({ "accepted": c.accepted.load(Ordering::Relaxed), "accepted_bytes": c.accepted_bytes.load(Ordering::Relaxed), "dropped": c.dropped.load(Ordering::Relaxed), "delivered": c.delivered.load(Ordering::Relaxed), "delivered_bytes": c.delivered_bytes.load(Ordering::Relaxed), "overflow": c.overflow.load(Ordering::Relaxed), "send_errors": c.send_errors.load(Ordering::Relaxed) })
 }
 
 /// One independent identity and actual client runtime. The caller owns output

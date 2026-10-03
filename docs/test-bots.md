@@ -12,6 +12,8 @@ cargo run --release -p test-bot -- --invite-file invite.txt --room 大厅 --coun
 
 `--room` 接受已有频道名称或 ID，同名频道必须用 ID；省略时留在服务端默认频道。目前不创建临时房间。`--count` 为 1–256，默认运行 60 秒，结束后断开连接；这只是数量上限，尚未测定几百机器人所需的 CPU、内存和带宽。
 
+默认每隔 100 ms 启动一个机器人，避免同时登录触发服务端 32 条待认证连接的保护。`--ramp-ms 0` 可专门测试突发登录，最大间隔 1000 ms。`--speakers 2` 只让前两个机器人发声，其余仅收听；省略则所有机器人同时发声。64 人全发声需要在机器人端持续解码 4032 条音频流，同机负载会干扰服务端测量。
+
 回声测试只启动一个机器人：
 
 ```powershell
@@ -40,6 +42,7 @@ cargo run --release -p test-bot -- --invite-file invite.txt --silent --seconds 3
 - `sent` / `received`、`rtt_ms`、`underruns`：当前语音实例统计。
 - `generation`：语音实例代数，重连后增加；`audio_opens`、`audible_frames` 是整次机器人运行的累计值。
 - `up` / `down`：代理接受、丢弃、送达、队列溢出和发送失败计数；代理随重连重建，计数从零开始，尚未到期的排队包不计为送达。
+- `accepted_bytes` / `delivered_bytes`：UDP 数据报字节，包括语音头和加密标签，不含 IP / UDP 头或 TCP。上行送达与下行接受计数可估算服务端链路流量，不能据此推断内核丢包数。
 - `server_udp_received`：服务端反馈的上行统计。
 
 诊断不输出邀请码、密钥、聊天消息或音频内容。仍应妥善保管邀请码文件。正常到期会清理连接；强制结束进程依赖操作系统回收资源。
@@ -50,3 +53,18 @@ cargo run -p test-bot -- --help
 ```
 
 测试包含真实服务端多人加密语音、回声、单向中断后的恢复、退出清理及参数校验。机器人替代了声卡，因此不能证明虚拟声卡的设备兼容性；该问题还需要异常设备上的诊断与真人回归。
+
+## 本地压测
+
+```powershell
+cargo build --release -p server -p test-bot
+./scripts/bot-stress.ps1 -Counts 8,32,64 -Seconds 30
+./scripts/bot-stress.ps1 -Counts 8,32,64 -Speakers 2 -Seconds 30
+python scripts/summarize-bot-stress.py target/bot-stress/实际运行目录
+```
+
+Windows 脚本需要 PowerShell 7，为每轮启动独立服务端，人数上限设为机器人数加 8，保留数据目录、机器人日志、每 500 ms 的进程资源样本和退出码。服务端端口经过 TCP / UDP 探测，邀请码不放进命令行。仅结束脚本自己启动的进程。
+
+默认测试干净网络、每方向 5% 丢包 + 30 ms 延迟 + 10 ms 抖动，以及第 5–17 秒上行中断三种场景；中断按每个机器人语音启动时间计算，并非全局同时开始。CPU 按单核百分比记录（400% = 约四个核心），汇总取全局第 10–25 秒。内存取已采样峰值私有字节，带宽取各机器人第 5–25 秒、同一语音代数的计数增量。跨重连未采到的尾部计数可能漏计，欠载 / 溢出总数因此是观测下界。
+
+合成声卡使用绝对截止时间的睡眠计时，错过期限会跳过节拍，不通过自旋抢占服务器 CPU。调度误差仍会产生欠载；这些短时本机数据应与多机、长时间验证一起使用。

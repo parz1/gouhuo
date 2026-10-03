@@ -225,6 +225,34 @@ fn cli_loops_wav_and_writes_private_jsonl_without_overwriting() {
     }
     assert!(!command().output().unwrap().status.success());
     assert_eq!(std::fs::read_to_string(&log).unwrap(), text);
+    let listener_log = dir.join("listeners.jsonl");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_gouhuo-bot"))
+        .arg("--invite-file")
+        .arg(&invite_file)
+        .args(["--count", "2", "--speakers", "1", "--seconds", "3"])
+        .arg("--log")
+        .arg(&listener_log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: Vec<Value> = std::fs::read_to_string(&listener_log)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let receiver = rows
+        .iter()
+        .find(|r| r["event"] == "finished" && r["bot"] == 2)
+        .unwrap();
+    assert_eq!(receiver["sent"], 0);
+    assert!(
+        receiver["audible_frames"].as_u64().unwrap() > 20,
+        "{receiver}"
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
     while hub.user_count() != 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -232,7 +260,7 @@ fn cli_loops_wav_and_writes_private_jsonl_without_overwriting() {
     assert_eq!(hub.user_count(), 0);
     std::fs::write(&wav_file, b"not a WAV").unwrap();
     assert!(test_bot::audio::load_wav(&wav_file).is_err());
-    for path in [&invite_file, &wav_file, &log] {
+    for path in [&invite_file, &wav_file, &log, &listener_log] {
         std::fs::remove_file(path).unwrap();
     }
     std::fs::remove_dir(dir).unwrap();

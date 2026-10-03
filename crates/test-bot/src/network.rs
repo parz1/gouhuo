@@ -55,8 +55,10 @@ impl Impairment {
 #[derive(Default)]
 pub struct Counters {
     pub accepted: AtomicU64,
+    pub accepted_bytes: AtomicU64,
     pub dropped: AtomicU64,
     pub delivered: AtomicU64,
+    pub delivered_bytes: AtomicU64,
     pub overflow: AtomicU64,
     pub send_errors: AtomicU64,
 }
@@ -89,6 +91,9 @@ impl Schedule {
     }
     fn push(&mut self, bytes: &[u8], dest: SocketAddr, blocked: bool) {
         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .accepted_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         // Consume the same PRNG decisions for every input packet, including
         // outage drops, so the random loss stream is independent of the outage.
         let delay = self.delay();
@@ -117,6 +122,9 @@ impl Schedule {
                 self.counters.dropped.fetch_add(1, Ordering::Relaxed);
             } else if socket.send_to(&bytes, dest).is_ok() {
                 self.counters.delivered.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .delivered_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             } else {
                 self.counters.send_errors.fetch_add(1, Ordering::Relaxed);
             }
@@ -260,6 +268,10 @@ mod tests {
         }
         assert_eq!(a.queue.len(), QUEUE_LIMIT);
         assert_eq!(a.counters.overflow.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            a.counters.accepted_bytes.load(Ordering::Relaxed),
+            (QUEUE_LIMIT + 10) as u64
+        );
     }
     #[test]
     fn outage_direction_and_end_are_exact() {

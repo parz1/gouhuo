@@ -5,9 +5,34 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use voice_core::audio::{Capture, Render, FRAME_SAMPLES, SAMPLE_RATE};
-use voice_core::clock::Ticker;
+
+// Synthetic devices must yield CPU: a per-device precision spin would consume
+// several cores before we even measure the server with dozens of bots.
+struct Pace {
+    next: Instant,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            next: Instant::now() + Duration::from_millis(10),
+        }
+    }
+
+    fn tick(&mut self) {
+        if let Some(left) = self.next.checked_duration_since(Instant::now()) {
+            std::thread::sleep(left);
+        }
+        self.next += Duration::from_millis(10);
+        let now = Instant::now();
+        // Missed deadlines are skipped, rather than producing a catch-up burst.
+        if self.next < now {
+            self.next = now + Duration::from_millis(10);
+        }
+    }
+}
 
 pub const MAX_WAV_BYTES: usize = 10 * 1024 * 1024;
 const ECHO_DELAY_FRAMES: usize = 20;
@@ -85,7 +110,7 @@ struct Input {
     gain: f32,
     metrics: Arc<Metrics>,
     queue: Arc<Mutex<VecDeque<Vec<f32>>>>,
-    ticker: Ticker,
+    ticker: Pace,
 }
 
 impl Capture for Input {
@@ -122,7 +147,7 @@ struct Output {
     echo: bool,
     metrics: Arc<Metrics>,
     queue: Arc<Mutex<VecDeque<Vec<f32>>>>,
-    ticker: Ticker,
+    ticker: Pace,
 }
 
 impl Render for Output {
@@ -161,7 +186,7 @@ impl AudioBackend for Backend {
             gain: self.gain,
             metrics: Arc::clone(&self.metrics),
             queue: Arc::clone(&self.queue),
-            ticker: Ticker::start(Duration::from_millis(10)).0,
+            ticker: Pace::new(),
         })))
     }
     fn render(&self, _: Option<&str>) -> io::Result<Box<dyn Render>> {
@@ -169,7 +194,7 @@ impl AudioBackend for Backend {
             echo: self.echo,
             metrics: Arc::clone(&self.metrics),
             queue: Arc::clone(&self.queue),
-            ticker: Ticker::start(Duration::from_millis(10)).0,
+            ticker: Pace::new(),
         }))
     }
 }

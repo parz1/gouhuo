@@ -10,6 +10,8 @@ const HELP: &str = "gouhuo-bot <invite> [options]
   --invite-file FILE       Read an invitation without placing it in shell history
   --room NAME_OR_ID        Join an existing channel; no temporary rooms yet
   --count N               Independent bots, 1..256 (default 1)
+  --ramp-ms N             Delay between bot starts, 0..1000 (default 100)
+  --speakers N            Only first N bots transmit; others receive (default all)
   --seconds N             Duration per connected bot, 0<N<=86400 (default 60)
   --name PREFIX           Nickname prefix (default bot)
   --play FILE.wav         Loop 16-bit PCM WAV, mono/stereo, 8–96 kHz
@@ -30,6 +32,8 @@ No microphone, speaker, GUI or persisted identity is used.";
 struct Args {
     cfg: Config,
     log: Option<PathBuf>,
+    ramp: Duration,
+    speakers: Option<usize>,
 }
 
 fn invalid(text: &str) -> io::Error {
@@ -53,6 +57,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> io::Result<Args> {
     let mut log = None;
     let mut invite_file = None;
     let mut play = None;
+    let mut ramp = Duration::from_millis(100);
+    let mut speakers = None;
     while let Some(flag) = args.next() {
         if flag == "--echo" {
             cfg.echo = true;
@@ -71,6 +77,20 @@ fn parse(args: impl IntoIterator<Item = String>) -> io::Result<Args> {
             "--invite-file" => invite_file = Some(PathBuf::from(value)),
             "--room" => cfg.room = Some(value),
             "--count" => cfg.count = value.parse().map_err(|_| invalid("invalid count"))?,
+            "--speakers" => {
+                speakers = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| invalid("invalid speaker count"))?,
+                )
+            }
+            "--ramp-ms" => {
+                let ms = value.parse::<u64>().map_err(|_| invalid("invalid ramp"))?;
+                if ms > 1000 {
+                    return Err(invalid("ramp must be within 0..1000 ms"));
+                }
+                ramp = Duration::from_millis(ms);
+            }
             "--seconds" => cfg.seconds = duration(&value)?,
             "--name" => cfg.name = value,
             "--play" => play = Some(PathBuf::from(value)),
@@ -127,7 +147,17 @@ fn parse(args: impl IntoIterator<Item = String>) -> io::Result<Args> {
         cfg.samples = audio::load_wav(&path)?;
     }
     cfg.validate()?;
-    Ok(Args { cfg, log })
+    if speakers.is_some_and(|n| n == 0 || n > cfg.count) || (speakers.is_some() && cfg.silent) {
+        return Err(invalid(
+            "speakers must be within 1..count and cannot accompany silent",
+        ));
+    }
+    Ok(Args {
+        cfg,
+        log,
+        ramp,
+        speakers,
+    })
 }
 
 fn run(args: Args) -> io::Result<()> {
@@ -143,11 +173,26 @@ fn run(args: Args) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel(1024);
     let mut workers = Vec::new();
+    let epoch = std::time::Instant::now();
     for index in 0..args.cfg.count {
-        let cfg = args.cfg.clone();
+        let mut cfg = args.cfg.clone();
+        if args.speakers.is_some_and(|n| index >= n) {
+            cfg.silent = true;
+        }
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
+        let start_at = epoch + args.ramp * index as u32;
         workers.push(std::thread::spawn(move || {
+            while std::time::Instant::now() < start_at {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                std::thread::sleep(
+                    start_at
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
             let result = run_bot(cfg, index, tx.clone(), Arc::clone(&stop));
             if let Err(e) = &result {
                 stop.store(true, Ordering::Relaxed);
@@ -207,6 +252,10 @@ mod tests {
             vec!["--seconds", "NaN"],
             vec!["--seconds", "-1"],
             vec!["--count", "0"],
+            vec!["--ramp-ms", "1001"],
+            vec!["--speakers", "0"],
+            vec!["--speakers", "2"],
+            vec!["--silent", "--speakers", "1"],
             vec!["--loss", "101"],
             vec!["--jitter-ms", "inf"],
             vec!["--echo", "--count", "2"],

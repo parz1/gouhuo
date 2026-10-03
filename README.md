@@ -317,6 +317,7 @@ docs/
 ## 开发
 
 多人语音可用无界面机器人测试，支持循环 WAV、回声和单向断网模拟，见 [测试机器人](docs/test-bots.md)。
+8 / 32 / 64 人本机压测与工具修正记录见 [多人语音压测](docs/bot-stress-2026-10-04.md)。
 
 ```bash
 cargo test --workspace
