@@ -230,6 +230,8 @@ impl Drop for PendingMessage {
 }
 
 impl Link {
+    // 新 Rust 将 fetch_update 改名为 try_update；保留旧名以兼容 Rust 1.80。
+    #[allow(deprecated)]
     fn send(&self, message: &protocol::control::ClientMessage) {
         if self.writer_state.stopped.load(Ordering::Acquire) {
             return;

@@ -298,3 +298,5 @@ Working Set 90.543 MiB、Private 105.184 MiB。候选观测是在双端通话场
 本次源码清单 `publish-source-files.sha256` 共 176 文件，SHA-256 为 `58D0B9C1D6A4C4039CB63DDCE95A1A36F32EB2503366948F4E09E64BDAA4FD4B`；相对 Header 阶段仅集成测试坐标和 `types.slint` 文件末尾空行整理。最终提交另由 CI 核对格式、测试和许可。
 安装包体积门禁的 6 项边界检查通过，证据为 `publish-size-tests.log`。
 忽略项和既有未测范围不改为通过。最终公开状态与 CI 产物以 v0.3.0 Release / Actions 为准；本次发布前复测使用自动检查和离线验证。
+
+首次远端 CI 使用 Rust 1.99，而本地为 1.96；`client-core::Link::send` 的 `fetch_update` 旧名称触发新增弃用警告，严格 Clippy 失败（运行 `37079894221`）。参照协议层已有处理，为该方法局部标注弃用兼容，保留 Rust 1.80 可用的原子 API，不改变队列预算、原子序或运行逻辑。修正后本地格式、严格 `client-core --all-targets` Clippy 及 106 passed / 0 failed / 1 ignored 通过（`ci-compat-*.log`）；正式发布提交仍需远端 CI 验证。
