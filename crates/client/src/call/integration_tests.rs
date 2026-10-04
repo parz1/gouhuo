@@ -31,7 +31,7 @@ use slint::{
     ModelRc,
     VecModel,
 };
-use voice_core::pipeline::{TransmitMode, VoiceStats};
+use voice_types::{TransmitMode, VoiceStats};
 
 use super::SlintAdapter;
 use crate::{App, Row, Seat, SeatGeometry};

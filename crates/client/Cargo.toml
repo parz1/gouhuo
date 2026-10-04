@@ -15,12 +15,11 @@ path = "src/main.rs"
 [dependencies]
 client-core.workspace = true
 client-runtime.workspace = true
+client-process.workspace = true
+voice-types.workspace = true
 protocol.workspace = true
-# 整条语音链路，**带回声消除和降噪**。不需要任何外部工具链 ——
-# git clone 完 cargo run 就是完整的。
-#
-# feature 要显式列：工作区那条关掉了默认值，见根 Cargo.toml 的注释。
-voice-core = { workspace = true, features = ["pipeline", "apm"] }
+# Only identity/global hotkeys remain here; audio lives in gouhuo-voice.
+voice-core.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
 

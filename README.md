@@ -46,8 +46,8 @@
 | 通话中 CPU（单核占比） | < 6% | < 4% | 历史配置 **2.97%**；64 kbps + 自适应 AGC 的完整客户端配置待重测 |
 | 静音时带宽（DTX 生效） | **< 5 kbps** | — | **1.2 kbps** |
 | 说话时单条上行 | < 120 kbps | — | 当前 64 kbps / 10 ms；合成诊断 IPv4 上行 **109.7 kbps**，真人验收见 [音质记录](docs/audio-quality.md) |
-| 常驻内存（在频道里） | voice-core < 100 MB | — | **73 MB** 整个进程，语音那一半约 13 MB；最小化、收在托盘里一样，挂 48 分钟不涨 |
-| 安装包 | < 60 MB | — | **0.2.0 本地验收包：7,942,844 字节，约 7.94 MB**（本地构建记录） |
+| 常驻内存（在频道里） | voice-core < 100 MB | — | **73 MB** 拆分前整个进程，语音那一半约 13 MB；拆分后的 UI + 内核总量待重新测量 |
+| 安装包 | < 60 MB | < 10 MB | **0.3.1 双进程本地候选：8,325,955 字节，约 8.33 MB**（未发布） |
 
 91.9 ms 是分项合计，用于延迟预算评估；软件链路端到端另测得 36.7 ms
 （本机回环、合成设备、不含声卡和 APM）。完整双机真实设备嘴到耳延迟尚未测量，
@@ -257,6 +257,7 @@ server {
 ### 连上去
 
 ```bash
+cargo build --release -p voice-engine
 cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 ```
 
@@ -292,10 +293,13 @@ crates/
   protocol/        客户端与服务端共享的唯一一份协议定义：包格式、序列化、加密
   voice-core/      语音内核：采集/APM/Opus/抖动缓冲/混音、WASAPI、全局热键、
                    实时时钟、socket 调优、度量、红线定义
+  voice-types/     UI 与引擎共享的发送模式、语音事实和音量上限；无音频依赖
   transport/       TLS 怎么建、UDP 密钥从哪来。两端共用
   server/          服务端。state = 纯状态机，conn = TLS/线程/分帧，voice = UDP 转发
   client-core/     客户端逻辑，不含界面：连接、认证、状态镜像
   client-runtime/  不含 GUI 的语音生命周期、意愿/事实快照、恢复策略与状态投影
+  client-process/  UI 使用的进程代理：版本握手、控制、快照与子进程监督
+  voice-engine/    独立版本的 gouhuo-voice：声卡、APM、Opus、UDP、提示音与扫描
   client/          Slint 界面与桌面适配器；不拥有语音线程
   latency-probe/   协议链路延迟的测量工具
   test-bot/        无声卡多人语音测试机器人（gouhuo-bot）
@@ -309,8 +313,9 @@ docs/
 ```
 
 `protocol` 两端都依赖，改一个字段两边同时编译报错 —— 这是把它独立成 crate 的
-全部理由。`voice-core` 完全独立于 UI，将来实测内存不达标时把它拆成独立进程
-是纯工程重构。
+全部理由。桌面声音现在运行在独立的 `gouhuo-voice` 进程中，UI 的正式依赖树
+不包含 Opus 或 APM。内核可独立构建和编号；自动下载、签名校验与回滚仍待实现，
+详见 [声音内核边界](docs/voice-engine-boundary.md) 和 [#46](https://github.com/parz1/gouhuo/issues/46)。
 
 ---
 
@@ -464,7 +469,7 @@ git push origin v0.1.0
 客户端目前只有 Windows 实现（WASAPI、DPAPI、Raw Input 热键）。这是先后顺序，
 不是范围：平台相关的代码基本收在 `voice-core`（音频设备、热键、时钟、身份落盘），
 语音运行层通过 `AudioBackend` 注入设备实现，桌面 WASAPI/APM 接入位于
-`client/src/platform_audio.rs`。其他平台可以复用 `client-core` 与 `client-runtime`，
+`voice-engine/src/platform_audio.rs`。其他平台可以复用 `client-core` 与 `client-runtime`，
 提供自己的音频、热键和系统集成适配器；这不表示其他平台的客户端已交付。
 服务端要能跑在 Linux 上（专用服务器基本都是 Linux）。
 

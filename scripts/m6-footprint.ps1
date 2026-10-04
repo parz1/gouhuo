@@ -1,6 +1,7 @@
 ﻿# 量客户端在各种状态下的开销：内存、CPU、唤醒次数（#11）。
 #
 # 用法（先编好：cargo build --profile dist -p client -p server
+#             cargo build --profile dist -p voice-engine
 #             cargo build --release -p client-core --example talker）：
 #
 #   .\scripts\m6-footprint.ps1                  # 四个状态各 30 秒
@@ -50,9 +51,10 @@ public class FP {
 
 $root = Split-Path -Parent $PSScriptRoot
 $client = Join-Path $root "target\dist\gouhuo.exe"
+$engine = Join-Path $root "target\dist\gouhuo-voice.exe"
 $serverExe = Join-Path $root "target\dist\gouhuo-server.exe"
 $talker = Join-Path $root "target\release\examples\talker.exe"
-foreach ($f in @($client, $serverExe, $talker)) { if (-not (Test-Path $f)) { throw "找不到 $f，先按文件头的命令编一下" } }
+foreach ($f in @($client, $engine, $serverExe, $talker)) { if (-not (Test-Path $f)) { throw "找不到 $f，先按文件头的命令编一下" } }
 
 $work = Join-Path $env:TEMP "gouhuo-footprint"
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
@@ -79,26 +81,48 @@ function Context-Switches($p) {
 }
 
 function Measure-State($p, [string]$label, [int]$secs) {
+    # 固定这一轮的父子 PID，内核退役时测量失败，不能把进程重启当成开销下降。
+    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id) AND Name='gouhuo-voice.exe'")
+    if ($children.Count -ne 1) { throw "需要一个运行中的声音内核，实际为 $($children.Count) 个" }
+    $processes = @($p, (Get-Process -Id $children[0].ProcessId))
     $ws = @(); $priv = @()
-    $p.Refresh()
-    $cpu0 = $p.TotalProcessorTime; $cs0 = Context-Switches $p; $t0 = Get-Date
+    $cpu0 = 0; $cs0 = 0
+    foreach ($process in $processes) {
+        $process.Refresh()
+        $cpu0 += $process.TotalProcessorTime.TotalSeconds
+        $cs0 += Context-Switches $process
+    }
+    $t0 = Get-Date
     for ($i = 0; $i -lt $secs; $i++) {
         Start-Sleep -Seconds 1
-        $p.Refresh()
-        $ws += $p.WorkingSet64 / 1MB
-        $priv += $p.PrivateMemorySize64 / 1MB
+        $totalWs = 0; $totalPrivate = 0
+        foreach ($process in $processes) {
+            $process.Refresh()
+            if ($process.HasExited) { throw "测量中进程退出：$($process.Id)" }
+            $totalWs += $process.WorkingSet64
+            $totalPrivate += $process.PrivateMemorySize64
+        }
+        $ws += $totalWs / 1MB
+        $priv += $totalPrivate / 1MB
     }
-    $p.Refresh()
+    $cpu1 = 0; $cs1 = 0; $threads = 0
+    foreach ($process in $processes) {
+        $process.Refresh()
+        if ($process.HasExited) { throw "测量中进程退出：$($process.Id)" }
+        $cpu1 += $process.TotalProcessorTime.TotalSeconds
+        $cs1 += Context-Switches $process
+        $threads += $process.Threads.Count
+    }
     $wall = ((Get-Date) - $t0).TotalSeconds
-    $cpu = ($p.TotalProcessorTime - $cpu0).TotalSeconds / $wall * 100
-    $wake = ((Context-Switches $p) - $cs0) / $wall
+    $cpu = ($cpu1 - $cpu0) / $wall * 100
+    $wake = ($cs1 - $cs0) / $wall
     [pscustomobject]@{
         状态 = $label
         工作集MB = "{0:N1}（最高 {1:N1}）" -f ($ws | Measure-Object -Average).Average, ($ws | Measure-Object -Maximum).Maximum
         私有MB = "{0:N1}（最高 {1:N1}）" -f ($priv | Measure-Object -Average).Average, ($priv | Measure-Object -Maximum).Maximum
         CPU = "{0:N2}%" -f $cpu
         唤醒每秒 = "{0:N0}" -f $wake
-        线程 = $p.Threads.Count
+        线程 = $threads
     }
 }
 

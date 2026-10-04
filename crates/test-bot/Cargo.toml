@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 client-core.workspace = true
-client-runtime.workspace = true
+client-runtime = { workspace = true, features = ["in-process"] }
 protocol.workspace = true
 voice-core = { workspace = true, features = ["pipeline"] }
 latency-probe = { path = "../latency-probe" }

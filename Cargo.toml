@@ -4,6 +4,9 @@ members = [
     "crates/protocol",
     "crates/transport",
     "crates/voice-core",
+    "crates/voice-types",
+    "crates/voice-engine",
+    "crates/client-process",
     "crates/latency-probe",
     "crates/device-probe",
     "crates/server",
@@ -36,6 +39,10 @@ protocol = { path = "crates/protocol" }
 # voice-core 自己的 `default` 仍然有意义：它是 MPL 的引擎，给工作区外面
 # 的人用的时候，默认就该是完整的一份。
 voice-core = { path = "crates/voice-core", default-features = false }
+voice-types = { path = "crates/voice-types" }
+client-process = { path = "crates/client-process" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 opus = "0.3"
 chacha20poly1305 = "0.10"
 windows-sys = "0.59"
@@ -53,7 +60,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rcgen = "0.14"
 transport = { path = "crates/transport" }
 client-core = { path = "crates/client-core" }
-client-runtime = { path = "crates/client-runtime" }
+client-runtime = { path = "crates/client-runtime", default-features = false }
 # 界面。选 Slint 不选 Tauri：不带 WebView2，安装包和内存都由我们自己说了算 ——
 # 安装包 60 MB、voice-core RSS 100 MB 这两条红线完全由界面框架决定。
 slint = "1"

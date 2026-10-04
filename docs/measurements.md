@@ -593,3 +593,19 @@ A startup / call enter / tagged draw wall span 为 389.07 / 35.79 / 14.25ms，B 
 `header-spacing-artifacts.json` 与更新的 `artifacts-final.json` 记录当前产物，dumpbin 无外部 CRT；打包不表示实际安装通过。
 最新 A PID 28592 / B PID 6716 复制运行哈希均匹配当前客户端，fresh AccessKit 均为本地 21943、大厅 2 人，A VAD / 等待说话、B PTT V / 等待 V；最终仅这两个客户端与隔离服务端 PID 41416 保留，离线 fixture 45156 已正常退出。
 真实宽窗口见 [native-header-spacing-760x520.png](design/rebuild/native-header-spacing-760x520.png)，SHA-256 `3F75E23BA4C4A0616FA28BCCA0E519B011BA1F07ECE843F4A4E6A19034ED16FD`，两端证据为 `header-spacing-runtime-views.json`；没有新增性能 trace、VAD 发送或声学测量结论。
+
+### 声音独立进程本地候选（2026-10-04）
+
+UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产物后用 Inno Setup 打包；以下是本地候选，未安装或发布：
+
+| 产物 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| gouhuo.exe | 16,839,680 | D0B812433FA43C930398090B64BD5A37E9E8BD5215CEAE59C62ED1F485EB161F |
+| gouhuo-voice.exe | 1,867,776 | 70474661ADF85491797C03470228C9E902ACD9F5F634318840F403597C3DE831 |
+| gouhuo-setup-0.3.1.exe | 8,325,955 | 77ABDF1D1C49BB741FA9925B34C670B7A5C3B2C461B1C42C90A556F81CB7F0D0 |
+
+完整安装包为 **8.325955 十进制 MB**，通过现有 10 MB 回归闸和 60 MB 产品线。历史正式版实测常量保留原值，没有调整阈值。
+
+工作区回归 **581 passed / 13 ignored**，完整 Clippy、fmt、SPDX 与正式依赖边界检查通过。五个实际子进程测试使用合成设备，经过真实 TLS 与加密 UDP；生产 dist 内核也验证了 IPC 握手、按请求取消和正常退出。测试日志位于本地 target/voice-boundary-tests.log。
+
+这些检查不构成真实 WASAPI、扫描、AEC、声学延迟、CPU 或内存验收。scripts/m6-footprint.ps1 已改成统计 UI 与其声音子进程总量；拆分前的单进程数字不能作为此版本的资源结论。自动下载、签名验证、空闲激活和回滚仍未实现。

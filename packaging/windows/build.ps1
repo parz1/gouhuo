@@ -41,15 +41,20 @@ if (-not $iscc) { throw "找不到 Inno Setup 6 的 ISCC.exe。装一下：winge
 if (-not $SkipBuild) {
     # cargo 的进度写在 stderr 上；PowerShell 5.1 在 Stop 模式下会把它当成错误。
     $ErrorActionPreference = "Continue"
+    # 分开构建，避免工作区 feature 合并把音频实现链进 UI。
     cargo build --locked --profile dist -p client
+    if ($LASTEXITCODE -ne 0) { throw "client build 失败" }
+    cargo build --locked --profile dist -p voice-engine
     $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 }
 $exe = Join-Path $root "target\dist\gouhuo.exe"
 if (-not (Test-Path $exe)) { throw "没有 $exe —— 去掉 -SkipBuild 再跑一次" }
+$voiceExe = Join-Path $root "target\dist\gouhuo-voice.exe"
+if (-not (Test-Path $voiceExe)) { throw "没有 $voiceExe —— 去掉 -SkipBuild 再跑一次" }
 
 # ---- 打包 ----
-& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DOutputDir=$(Join-Path $root 'target\installer')" `
+& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DVoiceExePath=$voiceExe" "/DOutputDir=$(Join-Path $root 'target\installer')" `
     (Join-Path $PSScriptRoot "gouhuo.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
 

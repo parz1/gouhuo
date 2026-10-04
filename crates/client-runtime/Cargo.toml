@@ -6,10 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 description = "Portable client voice lifecycle and state projection, independent of a GUI or audio platform."
 
+[features]
+default = ["in-process"]
+# Disable for a frontend that obtains voice facts and controls through a proxy.
+in-process = ["dep:voice-core", "voice-core/pipeline"]
+ipc = ["dep:serde", "dep:serde_json", "voice-types/serde"]
+
+[[test]]
+name = "lifecycle"
+required-features = ["in-process"]
+
+[[test]]
+name = "call_session"
+required-features = ["in-process"]
+
 [dependencies]
 client-core.workspace = true
 protocol.workspace = true
-voice-core = { workspace = true, features = ["pipeline"] }
+voice-types.workspace = true
+voice-core = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 server = { path = "../server" }

@@ -834,6 +834,7 @@ name = "client"
 version = "0.3.1"
 dependencies = [
  "client-core",
+ "client-process",
  "client-runtime",
  "embed-resource",
  "protocol",
@@ -844,6 +845,7 @@ dependencies = [
  "slint-build",
  "transport",
  "voice-core",
+ "voice-types",
  "windows-sys 0.59.0",
 ]
 
@@ -860,14 +862,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "client-process"
+version = "0.3.1"
+dependencies = [
+ "client-runtime",
+ "sha2",
+ "voice-types",
+]
+
+[[package]]
 name = "client-runtime"
 version = "0.3.1"
 dependencies = [
  "client-core",
  "protocol",
+ "serde",
+ "serde_json",
  "server",
  "transport",
  "voice-core",
+ "voice-types",
 ]
 
 [[package]]
@@ -5759,8 +5773,30 @@ dependencies = [
  "protocol",
  "sha2",
  "sonora",
+ "voice-types",
  "windows",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "voice-engine"
+version = "0.1.0"
+dependencies = [
+ "client-core",
+ "client-process",
+ "client-runtime",
+ "protocol",
+ "server",
+ "transport",
+ "voice-core",
+ "voice-types",
+]
+
+[[package]]
+name = "voice-types"
+version = "0.3.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
