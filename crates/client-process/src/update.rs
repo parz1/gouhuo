@@ -4,7 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 pub const MAX_BINARY: u64 = 32 * 1024 * 1024;
 pub const MAX_MANIFEST: u64 = 8192;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+pub mod download;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,8 +145,26 @@ pub struct EngineStore {
     public_key: [u8; 32],
     compatibility: Compatibility,
     guard: Mutex<()>,
+    activation_allowed: AtomicBool,
 }
 impl EngineStore {
+    pub fn set_activation_allowed(&self, allowed: bool) {
+        self.activation_allowed.store(allowed, Ordering::Release);
+    }
+    pub fn validate_release(&self, manifest: &[u8], signature: &[u8; 64]) -> io::Result<Manifest> {
+        verify_manifest(manifest, signature, &self.public_key, &self.compatibility)
+    }
+
+    pub fn accepts_version(&self, version: &str) -> io::Result<bool> {
+        let _guard = self.guard.lock().expect("engine store poisoned");
+        let state = self.state()?;
+        let floor = state
+            .highest
+            .as_deref()
+            .unwrap_or(&self.compatibility.bundled);
+        Ok(Version::parse(version)? > Version::parse(floor)?
+            && Version::parse(version)? > Version::parse(&self.compatibility.bundled)?)
+    }
     pub fn has_pending(&self) -> io::Result<bool> {
         let _guard = self.guard.lock().expect("engine store poisoned");
         Ok(self.state()?.pending.is_some())
@@ -162,6 +182,7 @@ impl EngineStore {
             public_key,
             compatibility,
             guard: Mutex::new(()),
+            activation_allowed: AtomicBool::new(true),
         })
     }
 
@@ -171,6 +192,16 @@ impl EngineStore {
         manifest: &[u8],
         signature: &[u8; 64],
         binary: &Path,
+    ) -> io::Result<String> {
+        self.validate_release(manifest, signature)?;
+        self.stage_bytes(manifest, signature, &bounded_read(binary, MAX_BINARY)?)
+    }
+
+    pub fn stage_bytes(
+        &self,
+        manifest: &[u8],
+        signature: &[u8; 64],
+        bytes: &[u8],
     ) -> io::Result<String> {
         let _guard = self.guard.lock().expect("engine store poisoned");
         let release = verify_manifest(manifest, signature, &self.public_key, &self.compatibility)?;
@@ -184,8 +215,7 @@ impl EngineStore {
         {
             return Err(invalid("engine release is not newer"));
         }
-        let bytes = bounded_read(binary, MAX_BINARY)?;
-        check_binary(&bytes, &release)?;
+        check_binary(bytes, &release)?;
         fs::create_dir_all(&self.root)?;
         let destination = self.root.join(&release.version);
         if destination.exists() {
@@ -201,7 +231,7 @@ impl EngineStore {
             let temporary = self.temporary("incoming");
             fs::create_dir(&temporary)?;
             let result = (|| {
-                durable_write(&temporary.join(binary_name()), &bytes)?;
+                durable_write(&temporary.join(binary_name()), bytes)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -232,9 +262,11 @@ impl EngineStore {
         let mut state = self.state()?;
         if state.booting.take().is_some() {
             state.active = state.previous.take();
-        } else if let Some(next) = state.pending.take() {
-            state.previous = state.active.take();
-            state.active = Some(next);
+        } else if self.activation_allowed.load(Ordering::Acquire) {
+            if let Some(next) = state.pending.take() {
+                state.previous = state.active.take();
+                state.active = Some(next);
+            }
         }
         let selected = match state
             .active

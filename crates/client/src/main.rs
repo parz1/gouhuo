@@ -234,7 +234,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
 
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
-    let runtime = match engine_update::runtime() {
+    let (runtime, engine_updates) = match engine_update::runtime(stored.check_updates) {
         Ok(runtime) => runtime,
         Err(error) => {
             show_fatal(&format!("语音运行线程无法启动：{error}"));
@@ -251,6 +251,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     };
     let state = Arc::new(Mutex::new(State {
         runtime: Some(runtime.handle()),
+        engine_updates: Some(engine_updates),
         settings_writer: Some(settings_writer.handle()),
         settings: stored,
         ..State::default()
@@ -337,6 +338,9 @@ fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
         app.on_set_check_updates(move |on| {
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.check_updates = on;
+            if let Some(updates) = &locked.engine_updates {
+                updates.set_enabled(on);
+            }
             locked.persist_settings();
             if let Some(app) = weak.upgrade() {
                 app.set_check_updates(on);
@@ -502,6 +506,7 @@ struct State {
     recovery_history: std::collections::VecDeque<String>,
     /// Commands/snapshots only. The portable runtime owns and retires audio.
     runtime: Option<RuntimeHandle>,
+    engine_updates: Option<engine_update::Controller>,
     settings: Settings,
     settings_writer: Option<SettingsWriterHandle>,
     /// 下拉框里第 n 项对应哪个设备 id。第 0 项是「系统默认」，所以是 None。

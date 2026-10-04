@@ -21,4 +21,4 @@ name = "gouhuo-voice-release"
 path = "src/bin/release.rs"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinHttp"] }
