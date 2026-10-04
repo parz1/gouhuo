@@ -4,7 +4,7 @@
 
 ## 当前实现
 
-桌面安装包包含 `gouhuo.exe` 和 `gouhuo-voice.exe`。UI 通过 `client-process` 代理启动同目录的声音子进程；内核独立版本目前为 **0.1.0**，IPC 为 **1**。声音内核可单独构建，UI 正式依赖树没有 Opus、APM 或 `voice-engine`。进程与构建产物已分离，自动下载安装、签名验证和激活回滚仍待实现。
+桌面安装包包含 `gouhuo.exe` 和 `gouhuo-voice.exe`。UI 通过 `client-process` 代理启动声音子进程；内核独立版本目前为 **0.1.0**，IPC 为 **1**。声音内核可单独构建，UI 正式依赖树没有 Opus、APM 或 `voice-engine`。进程与构建产物、离线签名校验、版本暂存及安全切换已实现；自动查询和下载安装仍待接入。
 
 | 所有者 | 内容 |
 | --- | --- |
@@ -47,4 +47,31 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 资源测量脚本统计 UI 与声音子进程总开销。既有 CPU、内存和声卡性能数字来自拆分前，仍需重测。双进程本地安装包为 8,325,955 字节，通过原有 10 MB 门禁，构建记录见 [测量记录](measurements.md)。
 
-后续实现独立发布清单、可信签名、公钥固定、兼容版本选择、下载校验、版本目录、空闲激活和原子回滚。首版在通话、试麦和扫描结束后的安全空闲点切换；不承诺通话内无缝替换。
+独立发布清单、可信签名、公钥固定、兼容版本选择、版本目录、空闲激活和启动回退的实现见下节。剩余工作为独立发布查询、HTTPS 下载和网络重试。首版在通话、试麦和扫描结束后的安全空闲点切换；不承诺通话内无缝替换。
+
+## 独立发布与安全切换（后续实现）
+
+`client-process::update` 接受 Ed25519 签名的原始 manifest.json 字节；manifest.sig 为 64 字节签名的十六进制。清单固定 schema、平台、内核版本、IPC、服务器协议、UI 最低／最高版本、文件大小和 SHA-256。单清单最多 8 KiB、可执行文件最多 32 MiB，不解压归档。签名、公钥、兼容范围或哈希不匹配时不暂存、不执行。
+
+版本安装到 `%APPDATA%\gouhuo\voice-engines\<version>`，state.json 保存 active、previous、pending、booting 和最高已接纳版本。目录名只能是严格的三段数字版本。完整文件写入并同步后才重命名成版本目录；状态指针用 Windows MoveFileExW 的 replace/write-through 或 Unix rename 原子替换。每次启动重新验证签名与文件哈希。失败回退不降低版本防重放下限。
+
+UI 的编译期 `GOUHUO_VOICE_PUBLIC_KEY` 固定信任公钥；运行时配置和下载清单不能替换它。未配置公钥时使用安装包内核，不启用独立更新。packaging/windows/build.ps1 自动将随包内核版本写入编译配置，避免发布新 UI 时沿用旧基线。
+
+配置公钥的 UI 在后台观察 pending。只有 Idle、无会话、无待执行生命周期命令及设备 RPC 时才退役旧进程；通话、试麦、扫描期间保留候选。旧进程完成 kill/wait 后，新进程必须通过 IPC 和清单版本一致性检查，再以有效快照确认启动。启动未确认或子进程退出会回退；已发送语音的会话继续要求重新认证，不能把密钥重放到替代进程。
+
+离线发布工具：
+
+```powershell
+# 签名私钥由 secret manager / CI secret 注入 GOUHUO_VOICE_SIGNING_KEY，
+# 不放在命令参数、文件或仓库里。GOUHUO_VOICE_PUBLIC_KEY 为对应的 64 字符十六进制公钥。
+# 先将 voice-engine/Cargo.toml 版本改为 0.1.1 并单独构建；内核握手版本必须匹配清单。
+cargo build --profile dist -p voice-engine --bin gouhuo-voice
+cargo run -p client-process --bin gouhuo-voice-release -- sign target/dist/gouhuo-voice.exe 0.1.1 0.3.1 target/voice-release
+
+# 暂存已下载并经过签名校验的版本；已有通话和试麦不会被打断。
+cargo run -p client-process --bin gouhuo-voice-release -- stage "$env:APPDATA\gouhuo\voice-engines" $env:GOUHUO_VOICE_PUBLIC_KEY target/voice-release/gouhuo-voice-0.1.1-windows-x64.exe target/voice-release/manifest.json target/voice-release/manifest.sig 0.3.1
+```
+
+`.github/workflows/voice-release.yml` 响应 voice-v*，检查标签与内核版本、测试真实进程、只编译内核、签署清单，创建 `--latest=false` 的独立草稿。正式密钥后续配置为 GitHub secret GOUHUO_VOICE_SIGNING_KEY 与 variable GOUHUO_VOICE_PUBLIC_KEY；两者不匹配则发布构建失败。普通 UI release 使用同一公钥 variable。docker-latest 仅响应 v* 应用发布。
+
+当前完成离线签名、校验、暂存、空闲进程切换和启动回退。自动查询独立发布、HTTPS 下载及网络重试尚未接入，尚未配置正式公钥或发布实际内核版本。测试中的固定密钥仅用于 fixture。

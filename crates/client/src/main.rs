@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use call::SlintAdapter;
 use client_core::{Client, Ended, Event};
-use client_process::{RuntimeHandle, VoiceRuntime};
+use client_process::RuntimeHandle;
 use client_runtime::call::{
     AudioViewModel, CallCommand, CallController, CallState, CallViewModel, CommandResult,
 };
@@ -67,6 +67,7 @@ const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(25
 mod call;
 mod campfire;
 mod discover;
+mod engine_update;
 mod join;
 mod settings;
 mod single_instance;
@@ -233,7 +234,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
 
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
-    let runtime = match VoiceRuntime::bundled() {
+    let runtime = match engine_update::runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             show_fatal(&format!("语音运行线程无法启动：{error}"));

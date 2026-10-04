@@ -866,8 +866,14 @@ name = "client-process"
 version = "0.3.1"
 dependencies = [
  "client-runtime",
+ "ed25519-dalek",
+ "protocol",
+ "serde",
+ "serde_json",
  "sha2",
  "voice-types",
+ "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -5785,8 +5791,11 @@ dependencies = [
  "client-core",
  "client-process",
  "client-runtime",
+ "ed25519-dalek",
  "protocol",
+ "serde_json",
  "server",
+ "sha2",
  "transport",
  "voice-core",
  "voice-types",

@@ -38,6 +38,13 @@ if (-not $iscc) {
 if (-not $iscc) { throw "找不到 Inno Setup 6 的 ISCC.exe。装一下：winget install JRSoftware.InnoSetup" }
 
 # ---- exe ----
+$voiceVersion = (Select-String -Path crates/voice-engine/Cargo.toml -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
+if (-not $voiceVersion) { throw "声音内核缺少独立版本号" }
+$env:GOUHUO_BUNDLED_VOICE_VERSION = $voiceVersion
+if ($env:GOUHUO_VOICE_PUBLIC_KEY -and $env:GOUHUO_VOICE_PUBLIC_KEY -notmatch '^[a-fA-F0-9]{64}$') {
+    throw "声音发布公钥必须为 32 字节十六进制"
+}
+if (-not $env:GOUHUO_VOICE_PUBLIC_KEY) { Remove-Item Env:GOUHUO_VOICE_PUBLIC_KEY -ErrorAction SilentlyContinue }
 if (-not $SkipBuild) {
     # cargo 的进度写在 stderr 上；PowerShell 5.1 在 Stop 模式下会把它当成错误。
     $ErrorActionPreference = "Continue"

@@ -19,6 +19,124 @@ use voice_types::TransmitMode;
 
 const ENGINE: &str = env!("CARGO_BIN_EXE_gouhuo-voice");
 
+fn signed_store(
+    version: &str,
+    staged: bool,
+) -> (std::path::PathBuf, Arc<client_process::update::EngineStore>) {
+    use client_process::update::{Compatibility, EngineStore};
+    use ed25519_dalek::SigningKey;
+    static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "gouhuo-engine-activation-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let key = SigningKey::from_bytes(&[5; 32]); // Test-only signing seed.
+    let store = Arc::new(
+        EngineStore::new(
+            root.clone(),
+            key.verifying_key().to_bytes(),
+            Compatibility {
+                target: if cfg!(windows) {
+                    "windows-x64"
+                } else {
+                    "linux-x64"
+                }
+                .into(),
+                ipc: ipc::VERSION,
+                server_protocol: protocol::control::PROTOCOL_VERSION,
+                ui: "0.3.1".into(),
+                bundled: "0.0.0".into(),
+            },
+        )
+        .unwrap(),
+    );
+    if staged {
+        stage_fixture_engine(&store, version);
+    }
+    (root, store)
+}
+
+fn stage_fixture_engine(store: &client_process::update::EngineStore, version: &str) {
+    use client_process::update::{hex, Manifest};
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    let key = SigningKey::from_bytes(&[5; 32]);
+    let bytes = std::fs::read(ENGINE).unwrap();
+    let manifest = Manifest {
+        schema: 1,
+        version: version.into(),
+        target: if cfg!(windows) {
+            "windows-x64"
+        } else {
+            "linux-x64"
+        }
+        .into(),
+        ipc: ipc::VERSION,
+        server_protocol: protocol::control::PROTOCOL_VERSION,
+        min_ui: "0.3.1".into(),
+        max_ui: None,
+        size: bytes.len() as u64,
+        sha256: hex(&Sha256::digest(&bytes)),
+    };
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    store
+        .stage(
+            &manifest,
+            &key.sign(&manifest).to_bytes(),
+            std::path::Path::new(ENGINE),
+        )
+        .unwrap();
+}
+
+#[test]
+fn signed_engine_activates_only_after_mic_check_retires() {
+    let (root, store) = signed_store("0.1.0", false);
+    let runtime =
+        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    let handle = runtime.handle();
+    wait(|| handle.engine_version() == "0.1.0");
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some());
+    stage_fixture_engine(&store, "0.1.0");
+    assert!(store.has_pending().unwrap());
+    assert!(
+        !handle.activate_pending(),
+        "update retired an active mic check"
+    );
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+    let old_pid = handle.process_id();
+    assert!(handle.activate_pending());
+    wait(|| {
+        handle.process_id().is_some()
+            && handle.process_id() != old_pid
+            && handle.engine_version() == "0.1.0"
+            && handle.snapshot().stage == RuntimeStage::Idle
+    });
+    handle.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn signed_manifest_version_mismatch_rolls_back_to_bundled_engine() {
+    // A valid signature does not excuse a host advertising a different version.
+    let (root, store) = signed_store("0.1.1", true);
+    let runtime =
+        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    let handle = runtime.handle();
+    wait(|| handle.engine_version() == "0.1.0");
+    assert!(store.begin_start().unwrap().is_none());
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some());
+    handle.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn wait(mut predicate: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(5);
     while !predicate() {

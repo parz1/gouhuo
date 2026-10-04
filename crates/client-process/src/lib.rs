@@ -18,6 +18,8 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_LIMIT: usize = 8;
 
+pub mod update;
+
 struct State {
     snapshot: RuntimeSnapshot,
     volumes: BTreeMap<u32, f32>,
@@ -39,6 +41,8 @@ struct State {
     unacked_since: Option<Instant>,
     process_id: Option<u32>,
     io_failure: Option<String>,
+    updates_enabled: bool,
+    activate_requested: bool,
 }
 
 struct Shared {
@@ -72,6 +76,27 @@ impl VoiceRuntime {
 
     /// Arguments are for controlled diagnostics/tests, never session material.
     pub fn with_args(path: impl AsRef<Path>, args: Vec<String>) -> io::Result<Self> {
+        Self::launch(path.as_ref().to_owned(), args, None)
+    }
+
+    pub fn managed(bundled: impl AsRef<Path>, store: Arc<update::EngineStore>) -> io::Result<Self> {
+        Self::launch(bundled.as_ref().to_owned(), Vec::new(), Some(store))
+    }
+
+    /// Diagnostic arguments never contain authentication material.
+    pub fn managed_with_args(
+        bundled: impl AsRef<Path>,
+        args: Vec<String>,
+        store: Arc<update::EngineStore>,
+    ) -> io::Result<Self> {
+        Self::launch(bundled.as_ref().to_owned(), args, Some(store))
+    }
+
+    fn launch(
+        path: PathBuf,
+        args: Vec<String>,
+        store: Option<Arc<update::EngineStore>>,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 snapshot: RuntimeSnapshot::default(),
@@ -94,16 +119,17 @@ impl VoiceRuntime {
                 unacked_since: None,
                 process_id: None,
                 io_failure: None,
+                updates_enabled: store.is_some(),
+                activate_requested: false,
             }),
             wake: Condvar::new(),
         });
         let (done, stopped) = mpsc::channel();
         let worker = Arc::clone(&shared);
-        let path = path.as_ref().to_owned();
         std::thread::Builder::new()
             .name("voice-process-supervisor".into())
             .spawn(move || {
-                supervise(path, args, worker);
+                supervise(path, args, worker, store);
                 let _ = done.send(());
             })?;
         Ok(Self {
@@ -127,6 +153,34 @@ impl Drop for VoiceRuntime {
 }
 
 impl RuntimeHandle {
+    pub fn is_closed(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("voice proxy poisoned")
+            .closed
+    }
+
+    /// Only the idle owner can retire a process for an update. Starts racing
+    /// retirement remain subject to the normal fresh-key admission checks.
+    pub fn activate_pending(&self) -> bool {
+        let mut state = self.shared.state.lock().expect("voice proxy poisoned");
+        if !state.updates_enabled
+            || state.closed
+            || !state.ready
+            || state.snapshot.stage != RuntimeStage::Idle
+            || state.snapshot.session_id.is_some()
+            || state.pending.is_some()
+            || !state.rpc.is_empty()
+        {
+            return false;
+        }
+        state.activate_requested = true;
+        state.io_failure = Some("idle engine activation requested".into());
+        state.ready = false;
+        self.shared.wake.notify_all();
+        true
+    }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.shared
             .state
@@ -514,7 +568,12 @@ fn fingerprints(request: &StartVoice) -> [[u8; 32]; 2] {
     ]
 }
 
-fn supervise(path: PathBuf, args: Vec<String>, shared: Arc<Shared>) {
+fn supervise(
+    path: PathBuf,
+    args: Vec<String>,
+    shared: Arc<Shared>,
+    store: Option<Arc<update::EngineStore>>,
+) {
     loop {
         {
             let mut state = shared.state.lock().expect("voice proxy poisoned");
@@ -527,9 +586,32 @@ fn supervise(path: PathBuf, args: Vec<String>, shared: Arc<Shared>) {
             state.writing_since = None;
             state.unacked_since = None;
         }
-        let result = run_child(&path, &args, &shared);
+        let selected = store
+            .as_ref()
+            .and_then(|store| store.begin_start().ok())
+            .flatten();
+        let selected_path = selected.as_ref().map(|s| s.path.as_path()).unwrap_or(&path);
+        let context = selected
+            .as_ref()
+            .zip(store.as_ref())
+            .map(|(s, store)| (Arc::clone(store), s.version.clone()));
+        let result = run_child(selected_path, &args, &shared, context);
+        let (closed, activating) = {
+            let state = shared.state.lock().expect("voice proxy poisoned");
+            (state.closed, state.activate_requested)
+        };
+        if !closed && !activating {
+            if let Some((selected, store)) = selected.as_ref().zip(store.as_ref()) {
+                let _ = store.reject(&selected.version);
+            }
+        }
         let mut state = shared.state.lock().expect("voice proxy poisoned");
         state.ready = false;
+        let fallback_idle = selected.is_some()
+            && !activating
+            && state.snapshot.session_id.is_none()
+            && state.snapshot.mic.is_none()
+            && state.pending.is_none();
         for (_, reply) in state.rpc.drain() {
             let _ = reply.try_send(RpcReply::Error("语音进程已停止。".into()));
         }
@@ -552,6 +634,7 @@ fn supervise(path: PathBuf, args: Vec<String>, shared: Arc<Shared>) {
         };
         state.process_id = None;
         state.pending = restart;
+        state.activate_requested = false;
         if state.closed {
             break;
         }
@@ -566,6 +649,15 @@ fn supervise(path: PathBuf, args: Vec<String>, shared: Arc<Shared>) {
                 .map(|e| format!("语音进程无法运行：{e}"))
                 .unwrap_or_else(|| "语音进程已退出。".into()),
         );
+        if activating || fallback_idle {
+            // Seed the new host with the current lifecycle ID and intentions.
+            // An idle replacement otherwise starts at ID 0 and cannot publish
+            // snapshots matching a parent that has already retired a mic check.
+            state.pending.get_or_insert(Command::Stop);
+            state.snapshot.stage = RuntimeStage::Preparing;
+            state.snapshot.error = None;
+            continue;
+        }
         loop {
             if state.closed {
                 return;
@@ -585,7 +677,12 @@ fn supervise(path: PathBuf, args: Vec<String>, shared: Arc<Shared>) {
     }
 }
 
-fn run_child(path: &Path, args: &[String], shared: &Arc<Shared>) -> io::Result<()> {
+fn run_child(
+    path: &Path,
+    args: &[String],
+    shared: &Arc<Shared>,
+    update: Option<(Arc<update::EngineStore>, String)>,
+) -> io::Result<()> {
     let mut command = ProcessCommand::new(path);
     command
         .args(args)
@@ -603,14 +700,18 @@ fn run_child(path: &Path, args: &[String], shared: &Arc<Shared>) -> io::Result<(
         .lock()
         .expect("voice proxy poisoned")
         .process_id = Some(child.id());
-    let result = communicate(&mut child, shared);
+    let result = communicate(&mut child, shared, update);
     // Always reap before another engine may own a device or use new keys.
     let _ = child.kill();
     let _ = child.wait();
     result
 }
 
-fn communicate(child: &mut Child, shared: &Arc<Shared>) -> io::Result<()> {
+fn communicate(
+    child: &mut Child,
+    shared: &Arc<Shared>,
+    update: Option<(Arc<update::EngineStore>, String)>,
+) -> io::Result<()> {
     let input = child
         .stdin
         .take()
@@ -631,7 +732,12 @@ fn communicate(child: &mut Child, shared: &Arc<Shared>) -> io::Result<()> {
         let mut output = output;
         let result = (|| -> io::Result<()> {
             let hello: Hello = ipc::read_frame(&mut output)?;
-            if hello.protocol != ipc::VERSION || hello.engine_version.len() > 64 {
+            if hello.protocol != ipc::VERSION
+                || hello.engine_version.len() > 64
+                || update
+                    .as_ref()
+                    .is_some_and(|(_, expected)| *expected != hello.engine_version)
+            {
                 return Err(io::Error::other("incompatible voice IPC version"));
             }
             {
@@ -648,12 +754,14 @@ fn communicate(child: &mut Child, shared: &Arc<Shared>) -> io::Result<()> {
                 }
                 reader_shared.wake.notify_all();
             }
+            let mut confirmed = false;
             while !reader_end.load(Ordering::Acquire) {
                 let reply: Reply = ipc::read_frame(&mut output)?;
                 let mut state = reader_shared.state.lock().expect("voice proxy poisoned");
                 if state.generation != generation {
                     break;
                 }
+                let mut confirm = false;
                 match reply {
                     Reply::Snapshot {
                         revision,
@@ -671,6 +779,8 @@ fn communicate(child: &mut Child, shared: &Arc<Shared>) -> io::Result<()> {
                             }
                             snapshot.intent = state.snapshot.intent.clone();
                             state.snapshot = *snapshot;
+                            confirm =
+                                !requires_auth && state.snapshot.stage != RuntimeStage::Failed;
                         }
                     }
                     Reply::Rpc { rpc, reply } => {
@@ -678,6 +788,13 @@ fn communicate(child: &mut Child, shared: &Arc<Shared>) -> io::Result<()> {
                             let _ = send.try_send(reply);
                         }
                     }
+                }
+                drop(state);
+                if confirm && !confirmed {
+                    if let Some((store, version)) = &update {
+                        store.confirm(version)?;
+                    }
+                    confirmed = true;
                 }
             }
             Ok(())

@@ -21,3 +21,6 @@ client-process.workspace = true
 client-core.workspace = true
 server = { path = "../server" }
 transport.workspace = true
+ed25519-dalek.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
