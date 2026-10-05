@@ -629,3 +629,13 @@ UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产
 最终工作区回归 **595 passed / 14 ignored**，Clippy、fmt、SPDX、三个前端依赖边界通过。下载与存储测试共 10 项，覆盖签名拒绝、篡改拒绝、数字版本选择、兼容筛选、取消、超限及开关行为；7 项真实子进程测试通过。被忽略的 WinHTTP 公开发布索引测试另行运行通过。完整签名下载使用 fixture；尚无正式签名发布的端到端网络验收。
 
 首次全量测试与 dist 优化构建并行时，既有节拍器和试麦错误测试发生计时失败；停止并行构建后，voice-core 顺序复查 144 项通过，随后普通并发的全量回归全部通过。没有放宽计时阈值。日志为 target/voice-download-tests.log、voice-download-core-retest.log 与 voice-download-dist.log。以上不构成真实声卡、声学延迟或资源性能验收。
+
+### 独立版本更新演练（2026-10-06）
+
+通过 scripts/voice-update-rehearsal.ps1 在隔离源码副本中构建报告 0.1.1 的内核。保持真实仓库内核版本 0.1.0 和 UI 产物不变，使用固定测试密钥签署本地发布 fixture，并经过生产发现、签名验证、暂存与进程切换路径。成功演练目录为 target/voice-update-rehearsal/086294e5858442cba9bc8b9d9c6dc8c8，report.json 记录原内核 PID 8252、新内核 PID 24224；UI SHA-256 始终为 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`。
+
+真实子进程经过 TLS 与加密 UDP，验证通话／试麦期间延后切换、空闲后 0.1.0 → 0.1.1、新内核通话、坏可执行文件与版本握手不符均回退到 0.1.1、重启后缓存版本可用。父测试进程二进制哈希前后相同。没有启动图形 UI，也没有真实声卡或正式发布 HTTPS 验收。
+
+首次演练发现空闲更新预置的 Stop 命令会阻止启动失败后的自动恢复：状态虽已回退，监督线程却等待下一条操作。已允许这种 Stop 状态走空闲恢复路径，并加入无需独立构建即可运行的回归。脚本另使用不同的测试二进制名称，避免共享 target 目录的原版产物覆盖已缓存的新版构建。相关进程回归 8 项通过，完整演练另行通过；日志为 target/voice-update-rehearsal.log 和 voice-update-rehearsal-regression.log。本轮未重新打包，上一阶段安装包不包含此次恢复修复。
+
+复跑脚本在已有构建缓存下再次通过，证据为 target/voice-update-rehearsal/2a26860ee30e48238853d895807d09f6/report.json；原／新内核 PID 为 17572／11936，UI 哈希仍相同。更新存储与下载 10 项、HTTPS URL 单测通过，相关两个 crate 的 all-targets Clippy、fmt、SPDX 与 PowerShell 语法检查通过。

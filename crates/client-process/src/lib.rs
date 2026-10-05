@@ -607,11 +607,13 @@ fn supervise(
         }
         let mut state = shared.state.lock().expect("voice proxy poisoned");
         state.ready = false;
+        // Idle activation seeds Stop before spawning. A spawn/handshake failure
+        // must still restart the verified fallback without another user command.
         let fallback_idle = selected.is_some()
             && !activating
             && state.snapshot.session_id.is_none()
             && state.snapshot.mic.is_none()
-            && state.pending.is_none();
+            && matches!(state.pending, None | Some(Command::Stop));
         for (_, reply) in state.rpc.drain() {
             let _ = reply.try_send(RpcReply::Error("语音进程已停止。".into()));
         }

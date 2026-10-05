@@ -19,6 +19,205 @@ use voice_types::TransmitMode;
 
 const ENGINE: &str = env!("CARGO_BIN_EXE_gouhuo-voice");
 
+/// Invoked by scripts/voice-update-rehearsal.ps1 with separately built engines.
+/// Transport fixtures feed the production discovery/staging code; audio is synthetic.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires independently built 0.1.1 engine and an isolated rehearsal directory"]
+fn independent_update_rehearsal() {
+    use client_process::update::{
+        download::{check_allowed, check_and_stage, Fetch, REPO},
+        hex, Compatibility, EngineStore, Manifest,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use std::{collections::BTreeMap, fs, io, path::PathBuf};
+
+    struct ReleaseFiles(BTreeMap<String, Vec<u8>>);
+    impl Fetch for ReleaseFiles {
+        fn get(
+            &mut self,
+            url: &str,
+            maximum: usize,
+            allowed: &dyn Fn() -> bool,
+        ) -> io::Result<Vec<u8>> {
+            check_allowed(allowed)?;
+            let bytes = self
+                .0
+                .get(url)
+                .ok_or_else(|| io::Error::other("missing rehearsal asset"))?;
+            if bytes.len() > maximum {
+                return Err(io::Error::other("rehearsal asset exceeds limit"));
+            }
+            Ok(bytes.clone())
+        }
+    }
+    fn files(version: &str, binary: &[u8], key: &SigningKey) -> ReleaseFiles {
+        let manifest = serde_json::to_vec(&Manifest {
+            schema: 1,
+            version: version.into(),
+            target: "windows-x64".into(),
+            ipc: ipc::VERSION,
+            server_protocol: protocol::control::PROTOCOL_VERSION,
+            min_ui: "0.3.1".into(),
+            max_ui: None,
+            size: binary.len() as u64,
+            sha256: hex(&Sha256::digest(binary)),
+        })
+        .unwrap();
+        let signature = hex(&key.sign(&manifest).to_bytes()).into_bytes();
+        let name = format!("gouhuo-voice-{version}-windows-x64.exe");
+        let base = format!("https://github.com/{REPO}/releases/download/voice-v{version}");
+        ReleaseFiles(BTreeMap::from([
+            (format!("https://api.github.com/repos/{REPO}/releases?per_page=100"),
+             serde_json::to_vec(&serde_json::json!([{
+                 "tag_name": format!("voice-v{version}"), "draft":false, "prerelease":false,
+                 "assets":[{"name":"manifest.json","size":manifest.len()},
+                     {"name":"manifest.sig","size":signature.len()}, {"name":name,"size":binary.len()}]
+             }])).unwrap()),
+            (format!("{base}/manifest.json"), manifest),
+            (format!("{base}/manifest.sig"), signature),
+            (format!("{base}/{name}"), binary.to_vec()),
+        ]))
+    }
+    let root = PathBuf::from(std::env::var_os("GOUHUO_REHEARSAL_ROOT").expect("rehearsal root"));
+    let ui = PathBuf::from(std::env::var_os("GOUHUO_REHEARSAL_UI").expect("unchanged UI"));
+    let updated =
+        fs::read(std::env::var_os("GOUHUO_REHEARSAL_ENGINE").expect("0.1.1 engine")).unwrap();
+    let ui_before = hex(&Sha256::digest(fs::read(&ui).unwrap()));
+    let parent_before = hex(&Sha256::digest(
+        fs::read(std::env::current_exe().unwrap()).unwrap(),
+    ));
+    let key = SigningKey::from_bytes(&[5; 32]); // Public fixture seed, never a release secret.
+    let store = Arc::new(
+        EngineStore::new(
+            root.join("store"),
+            key.verifying_key().to_bytes(),
+            Compatibility {
+                target: "windows-x64".into(),
+                ipc: ipc::VERSION,
+                server_protocol: protocol::control::PROTOCOL_VERSION,
+                ui: "0.3.1".into(),
+                bundled: "0.1.0".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let runtime =
+        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    let handle = runtime.handle();
+    wait(|| handle.engine_version() == "0.1.0");
+    let original_pid = handle.process_id().unwrap();
+    let invite = server();
+    let caller = join(&invite, "update-rehearsal");
+    handle.set_mode(TransmitMode::Always);
+    handle.start_voice(request(&caller));
+    wait(|| {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|voice| voice.packets_sent >= 3)
+    });
+    assert_eq!(
+        check_and_stage(&mut files("0.1.1", &updated, &key), &store, &|| true)
+            .unwrap()
+            .as_deref(),
+        Some("0.1.1")
+    );
+    assert!(!handle.activate_pending(), "retired an active call");
+    assert_eq!(handle.process_id(), Some(original_pid));
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+    caller.disconnect();
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some());
+    assert!(!handle.activate_pending(), "retired an active mic check");
+    assert_eq!(handle.process_id(), Some(original_pid));
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+    assert!(handle.activate_pending());
+    wait(|| handle.engine_version() == "0.1.1" && handle.snapshot().stage == RuntimeStage::Idle);
+    let upgraded_pid = handle.process_id().unwrap();
+    assert_ne!(upgraded_pid, original_pid);
+    wait(|| {
+        fs::read_to_string(root.join("store/state.json")).is_ok_and(|raw| {
+            let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            state["active"] == "0.1.1" && state["booting"].is_null()
+        })
+    });
+    // Both spawn failure and a signed host lying about its version must roll back.
+    for (version, binary) in [
+        ("0.1.2", b"not a Windows executable".as_slice()),
+        ("0.1.3", updated.as_slice()),
+    ] {
+        assert_eq!(
+            check_and_stage(&mut files(version, binary, &key), &store, &|| true)
+                .unwrap()
+                .as_deref(),
+            Some(version)
+        );
+        let previous_pid = handle.process_id();
+        assert!(handle.activate_pending());
+        wait(|| {
+            handle.process_id().is_some()
+                && handle.process_id() != previous_pid
+                && handle.engine_version() == "0.1.1"
+                && handle.snapshot().stage == RuntimeStage::Idle
+        });
+        wait(|| {
+            fs::read_to_string(root.join("store/state.json")).is_ok_and(|raw| {
+                let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                state["active"] == "0.1.1"
+                    && state["booting"].is_null()
+                    && state["highest"] == version
+            })
+        });
+    }
+    let fresh = join(&invite, "updated-core-call");
+    handle.start_voice(request(&fresh));
+    wait(|| {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|voice| voice.packets_sent >= 3)
+    });
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+    fresh.disconnect();
+    handle.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    // A new supervisor still selects the verified cached version.
+    let restarted =
+        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    wait(|| restarted.handle().engine_version() == "0.1.1");
+    restarted.handle().start_mic_check(Devices::default());
+    wait(|| restarted.handle().snapshot().mic.is_some());
+    restarted.handle().shutdown();
+    assert!(restarted.wait_stopped(Duration::from_secs(3)));
+    assert_eq!(hex(&Sha256::digest(fs::read(&ui).unwrap())), ui_before);
+    assert_eq!(
+        hex(&Sha256::digest(
+            fs::read(std::env::current_exe().unwrap()).unwrap()
+        )),
+        parent_before
+    );
+    fs::write(
+        root.join("report.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "bundled":"0.1.0", "updated":"0.1.1", "rollback":"0.1.1",
+            "original_pid":original_pid, "upgraded_pid":upgraded_pid,
+            "ui_sha256":ui_before, "parent_sha256":parent_before,
+            "call_deferred":true, "mic_deferred":true, "restart_verified":true,
+            "spawn_failure_rolled_back":true, "version_mismatch_rolled_back":true,
+            "transport":"local signed release fixture", "audio":"synthetic"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn signed_store(
     version: &str,
     staged: bool,
@@ -58,11 +257,14 @@ fn signed_store(
 }
 
 fn stage_fixture_engine(store: &client_process::update::EngineStore, version: &str) {
+    stage_fixture_bytes(store, version, &std::fs::read(ENGINE).unwrap());
+}
+
+fn stage_fixture_bytes(store: &client_process::update::EngineStore, version: &str, bytes: &[u8]) {
     use client_process::update::{hex, Manifest};
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     let key = SigningKey::from_bytes(&[5; 32]);
-    let bytes = std::fs::read(ENGINE).unwrap();
     let manifest = Manifest {
         schema: 1,
         version: version.into(),
@@ -77,16 +279,41 @@ fn stage_fixture_engine(store: &client_process::update::EngineStore, version: &s
         min_ui: "0.3.1".into(),
         max_ui: None,
         size: bytes.len() as u64,
-        sha256: hex(&Sha256::digest(&bytes)),
+        sha256: hex(&Sha256::digest(bytes)),
     };
     let manifest = serde_json::to_vec(&manifest).unwrap();
     store
-        .stage(
-            &manifest,
-            &key.sign(&manifest).to_bytes(),
-            std::path::Path::new(ENGINE),
-        )
+        .stage_bytes(&manifest, &key.sign(&manifest).to_bytes(), bytes)
         .unwrap();
+}
+
+#[test]
+fn idle_update_spawn_failure_automatically_restarts_bundled_engine() {
+    let (root, store) = signed_store("0.1.1", false);
+    let runtime =
+        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    let handle = runtime.handle();
+    wait(|| handle.engine_version() == "0.1.0");
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some());
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+    stage_fixture_bytes(&store, "0.1.1", b"not an executable");
+    let old_pid = handle.process_id();
+    assert!(handle.activate_pending());
+    wait(|| {
+        handle.process_id().is_some()
+            && handle.process_id() != old_pid
+            && handle.engine_version() == "0.1.0"
+            && handle.snapshot().stage == RuntimeStage::Idle
+    });
+    assert!(!store.has_pending().unwrap());
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some());
+    handle.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
