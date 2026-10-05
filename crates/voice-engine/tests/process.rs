@@ -89,6 +89,12 @@ fn independent_update_rehearsal() {
         fs::read(std::env::current_exe().unwrap()).unwrap(),
     ));
     let key = SigningKey::from_bytes(&[5; 32]); // Public fixture seed, never a release secret.
+    let hardware = std::env::var("GOUHUO_REHEARSAL_HARDWARE").as_deref() == Ok("1");
+    let args = if hardware {
+        Vec::new()
+    } else {
+        vec!["--synthetic".into()]
+    };
     let store = Arc::new(
         EngineStore::new(
             root.join("store"),
@@ -104,21 +110,54 @@ fn independent_update_rehearsal() {
         .unwrap(),
     );
     let runtime =
-        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
-            .unwrap();
+        VoiceRuntime::managed_with_args(ENGINE, args.clone(), Arc::clone(&store)).unwrap();
     let handle = runtime.handle();
     wait(|| handle.engine_version() == "0.1.0");
+    let mut hardware_devices = serde_json::Value::Null;
+    let mut scan_results = Vec::new();
+    let devices = if hardware {
+        let (capture, render) = handle.devices().unwrap();
+        let capture = capture
+            .iter()
+            .find(|device| device.is_hardware && device.name.contains("Nova Pro"))
+            .or_else(|| capture.iter().find(|device| device.is_hardware))
+            .expect("physical microphone");
+        let render = render
+            .iter()
+            .find(|device| device.is_hardware && device.name.contains("Nova Pro"))
+            .or_else(|| render.iter().find(|device| device.is_hardware))
+            .expect("physical output");
+        hardware_devices = serde_json::json!({"capture":capture, "render":render});
+        Devices {
+            capture: Some(capture.id.clone()),
+            render: Some(render.id.clone()),
+        }
+    } else {
+        Devices::default()
+    };
     let original_pid = handle.process_id().unwrap();
     let invite = server();
     let caller = join(&invite, "update-rehearsal");
     handle.set_mode(TransmitMode::Always);
-    handle.start_voice(request(&caller));
+    handle.start_voice(StartVoice {
+        devices: devices.clone(),
+        ..request(&caller)
+    });
     wait(|| {
         handle
             .snapshot()
             .voice
             .is_some_and(|voice| voice.packets_sent >= 3)
     });
+    let before_update = handle.snapshot();
+    if hardware {
+        let voice = before_update.voice.as_ref().unwrap();
+        assert!(
+            voice.input_available && voice.render_available,
+            "hardware I/O unavailable: {voice:?}"
+        );
+        assert!(voice.capture_error.is_none() && voice.render_error.is_none());
+    }
     assert_eq!(
         check_and_stage(&mut files("0.1.1", &updated, &key), &store, &|| true)
             .unwrap()
@@ -130,10 +169,30 @@ fn independent_update_rehearsal() {
     handle.stop();
     wait(|| handle.snapshot().stage == RuntimeStage::Idle);
     caller.disconnect();
-    handle.start_mic_check(Devices::default());
-    wait(|| handle.snapshot().mic.is_some());
+    handle.start_mic_check(devices.clone());
+    wait(|| handle.snapshot().mic.is_some_and(|mic| mic.input_available));
     assert!(!handle.activate_pending(), "retired an active mic check");
     assert_eq!(handle.process_id(), Some(original_pid));
+    if hardware {
+        // Scan's Stop retires this mic check, proving the RPC has been submitted.
+        let scanner = handle.clone();
+        let scan = std::thread::spawn(move || {
+            scanner.scan(
+                Duration::from_secs(1),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        });
+        wait(|| handle.snapshot().stage == RuntimeStage::Idle);
+        assert!(
+            !handle.activate_pending(),
+            "retired an active physical-device scan"
+        );
+        assert_eq!(handle.process_id(), Some(original_pid));
+        scan_results = scan.join().unwrap().unwrap();
+        assert!(scan_results
+            .iter()
+            .any(|result| result.id == devices.capture.as_deref().unwrap()));
+    }
     handle.stop();
     wait(|| handle.snapshot().stage == RuntimeStage::Idle);
     assert!(handle.activate_pending());
@@ -175,25 +234,41 @@ fn independent_update_rehearsal() {
         });
     }
     let fresh = join(&invite, "updated-core-call");
-    handle.start_voice(request(&fresh));
+    handle.start_voice(StartVoice {
+        devices: devices.clone(),
+        ..request(&fresh)
+    });
     wait(|| {
         handle
             .snapshot()
             .voice
             .is_some_and(|voice| voice.packets_sent >= 3)
     });
+    let after_update = handle.snapshot();
+    if hardware {
+        let voice = after_update.voice.as_ref().unwrap();
+        assert!(
+            voice.input_available && voice.render_available,
+            "updated hardware I/O unavailable: {voice:?}"
+        );
+        assert!(voice.capture_error.is_none() && voice.render_error.is_none());
+    }
     handle.stop();
     wait(|| handle.snapshot().stage == RuntimeStage::Idle);
     fresh.disconnect();
     handle.shutdown();
     assert!(runtime.wait_stopped(Duration::from_secs(3)));
     // A new supervisor still selects the verified cached version.
-    let restarted =
-        VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
-            .unwrap();
+    let restarted = VoiceRuntime::managed_with_args(ENGINE, args, Arc::clone(&store)).unwrap();
     wait(|| restarted.handle().engine_version() == "0.1.1");
-    restarted.handle().start_mic_check(Devices::default());
-    wait(|| restarted.handle().snapshot().mic.is_some());
+    restarted.handle().start_mic_check(devices);
+    wait(|| {
+        restarted
+            .handle()
+            .snapshot()
+            .mic
+            .is_some_and(|mic| mic.input_available)
+    });
     restarted.handle().shutdown();
     assert!(restarted.wait_stopped(Duration::from_secs(3)));
     assert_eq!(hex(&Sha256::digest(fs::read(&ui).unwrap())), ui_before);
@@ -211,7 +286,9 @@ fn independent_update_rehearsal() {
             "ui_sha256":ui_before, "parent_sha256":parent_before,
             "call_deferred":true, "mic_deferred":true, "restart_verified":true,
             "spawn_failure_rolled_back":true, "version_mismatch_rolled_back":true,
-            "transport":"local signed release fixture", "audio":"synthetic"
+            "transport":"local signed release fixture", "audio":if hardware { "physical WASAPI" } else { "synthetic" },
+            "hardware_devices":hardware_devices, "scan_results":scan_results,
+            "scan_deferred":hardware, "before_update":before_update, "after_update":after_update
         }))
         .unwrap(),
     )

@@ -1,6 +1,6 @@
 # Build a different engine in an isolated source copy, keeping the UI unchanged.
 [CmdletBinding()]
-param()
+param([switch]$Hardware)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $rehearsal = Join-Path $repo ("target/voice-update-rehearsal/" + [Guid]::NewGuid().ToString('N'))
@@ -34,6 +34,7 @@ $previousPolicy = $env:CMAKE_POLICY_VERSION_MINIMUM
 $previousRoot = $env:GOUHUO_REHEARSAL_ROOT
 $previousEngine = $env:GOUHUO_REHEARSAL_ENGINE
 $previousUi = $env:GOUHUO_REHEARSAL_UI
+$previousHardware = $env:GOUHUO_REHEARSAL_HARDWARE
 Push-Location $repo
 try {
     $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
@@ -45,6 +46,7 @@ try {
     $env:GOUHUO_REHEARSAL_ROOT = $rehearsal
     $env:GOUHUO_REHEARSAL_ENGINE = $updated
     $env:GOUHUO_REHEARSAL_UI = $ui
+    $env:GOUHUO_REHEARSAL_HARDWARE = if ($Hardware) { '1' } else { '0' }
     & cargo test --offline --locked -p voice-engine --test process independent_update_rehearsal -- --ignored --exact --nocapture
     if ($LASTEXITCODE -ne 0) { throw "Rehearsal failed; artifacts retained in $rehearsal" }
     if ((Get-FileHash -LiteralPath $ui -Algorithm SHA256).Hash -ne $uiHash) { throw 'UI changed during rehearsal.' }
@@ -56,4 +58,5 @@ try {
     $env:GOUHUO_REHEARSAL_ROOT = $previousRoot
     $env:GOUHUO_REHEARSAL_ENGINE = $previousEngine
     $env:GOUHUO_REHEARSAL_UI = $previousUi
+    $env:GOUHUO_REHEARSAL_HARDWARE = $previousHardware
 }

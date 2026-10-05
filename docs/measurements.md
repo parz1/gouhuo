@@ -639,3 +639,11 @@ UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产
 首次演练发现空闲更新预置的 Stop 命令会阻止启动失败后的自动恢复：状态虽已回退，监督线程却等待下一条操作。已允许这种 Stop 状态走空闲恢复路径，并加入无需独立构建即可运行的回归。脚本另使用不同的测试二进制名称，避免共享 target 目录的原版产物覆盖已缓存的新版构建。相关进程回归 8 项通过，完整演练另行通过；日志为 target/voice-update-rehearsal.log 和 voice-update-rehearsal-regression.log。本轮未重新打包，上一阶段安装包不包含此次恢复修复。
 
 复跑脚本在已有构建缓存下再次通过，证据为 target/voice-update-rehearsal/2a26860ee30e48238853d895807d09f6/report.json；原／新内核 PID 为 17572／11936，UI 哈希仍相同。更新存储与下载 10 项、HTTPS URL 单测通过，相关两个 crate 的 all-targets Clippy、fmt、SPDX 与 PowerShell 语法检查通过。
+
+### 真实 WASAPI 更新功能验收（2026-10-06）
+
+`device-probe --list` 枚举 12 个输出、5 个输入端点，其中硬件输出 5 个、硬件输入 3 个；默认是 Sonar 虚拟输入／输出。没有修改默认设备。`scripts/voice-update-rehearsal.ps1 -Hardware` 明确选用 Arctis Nova Pro Wireless 物理麦克风与耳机，使用真实桌面后端，未传 `--synthetic`。
+
+完整演练通过，报告为 target/voice-update-rehearsal/785db9864e91481497a4ef08c277c5c3/report.json：原内核 PID 30148、新内核 PID 3368，实际版本 0.1.0 → 0.1.1。更新前后采集、渲染均成功且没有设备错误，UDP 保活正常；通话、试麦、真实设备扫描期间拒绝切换。扫描 5 个输入端点后空闲激活成功，无法启动和版本不符的候选均回退到 0.1.1，重启后物理试麦再次成功。UI 的 SHA-256 始终为 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`，父进程文件哈希也未变。
+
+所有扫描端点均报告仅有底噪，约 -96 dB，摄像头麦克风约 -89 dB；没有取得可辨人声。这里只验证设备生命周期和更新兼容性，不证明人工听感、AEC 效果、声学延迟或长期稳定性。没有保存音频、启动图形 UI 或使用正式签名发布。日志为 target/voice-hardware-inventory.log、voice-hardware-rehearsal.log 与 voice-hardware-regression.log；8 项普通子进程回归、相关 Clippy、fmt、SPDX 和 PowerShell 语法检查通过。本轮没有重打安装包。
