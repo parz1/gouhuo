@@ -1,12 +1,12 @@
 # Build a different engine in an isolated source copy, keeping the UI unchanged.
 [CmdletBinding()]
-param([switch]$Hardware)
+param([switch]$Hardware, [string]$UiPath = 'target/dist/gouhuo.exe')
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $rehearsal = Join-Path $repo ("target/voice-update-rehearsal/" + [Guid]::NewGuid().ToString('N'))
 $source = Join-Path $rehearsal 'source'
-$ui = Join-Path $repo 'target/dist/gouhuo.exe'
-if (-not (Test-Path -LiteralPath $ui)) { throw 'Build the client dist artifact before rehearsal.' }
+$ui = if ([IO.Path]::IsPathRooted($UiPath)) { $UiPath } else { Join-Path $repo $UiPath }
+if (-not (Test-Path -LiteralPath $ui)) { throw 'Build the client artifact before rehearsal.' }
 $uiHash = (Get-FileHash -LiteralPath $ui -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 $files = & git -C $repo ls-files
@@ -24,10 +24,13 @@ foreach ($file in $files) {
 }
 $manifest = Join-Path $source 'crates/voice-engine/Cargo.toml'
 $text = [IO.File]::ReadAllText($manifest)
-if ($text -notmatch '(?m)^version = "0\.1\.0"\r?$') { throw 'Rehearsal expects bundled engine 0.1.0.' }
-$text = $text -replace '(?m)^version = "0\.1\.0"', 'version = "0.1.1"'
-# A distinct binary name prevents the original workspace's 0.1.0 artifact from
-# overwriting this output while Cargo still considers the 0.1.1 build fresh.
+$versionMatch = [regex]::Match($text, '(?m)^version = "(\d+)\.(\d+)\.(\d+)"\r?$')
+if (-not $versionMatch.Success) { throw 'Engine version must have three numeric segments.' }
+$nextPatch = [uint64]$versionMatch.Groups[3].Value + 1
+$updatedVersion = '{0}.{1}.{2}' -f $versionMatch.Groups[1].Value, $versionMatch.Groups[2].Value, $nextPatch
+$text = $text -replace '(?m)^version = "[^"]+"', "version = `"$updatedVersion`""
+# A distinct binary name prevents the original workspace artifact from
+# overwriting this output while Cargo still considers the newer build fresh.
 $text = $text -replace '(?m)^name = "gouhuo-voice"', 'name = "gouhuo-voice-rehearsal"'
 [IO.File]::WriteAllText($manifest, $text)
 $previousPolicy = $env:CMAKE_POLICY_VERSION_MINIMUM
@@ -41,7 +44,7 @@ try {
     # The copy's lockfile alone changes; the real manifest and lock stay intact.
     & cargo build --offline --manifest-path (Join-Path $source 'Cargo.toml') --target-dir (Join-Path $repo 'target') -p voice-engine --bin gouhuo-voice-rehearsal
     if ($LASTEXITCODE -ne 0) { throw 'Independent engine build failed.' }
-    $updated = Join-Path $rehearsal 'gouhuo-voice-0.1.1.exe'
+    $updated = Join-Path $rehearsal "gouhuo-voice-$updatedVersion.exe"
     Copy-Item -LiteralPath (Join-Path $repo 'target/debug/gouhuo-voice-rehearsal.exe') -Destination $updated
     $env:GOUHUO_REHEARSAL_ROOT = $rehearsal
     $env:GOUHUO_REHEARSAL_ENGINE = $updated

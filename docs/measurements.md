@@ -647,3 +647,13 @@ UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产
 完整演练通过，报告为 target/voice-update-rehearsal/785db9864e91481497a4ef08c277c5c3/report.json：原内核 PID 30148、新内核 PID 3368，实际版本 0.1.0 → 0.1.1。更新前后采集、渲染均成功且没有设备错误，UDP 保活正常；通话、试麦、真实设备扫描期间拒绝切换。扫描 5 个输入端点后空闲激活成功，无法启动和版本不符的候选均回退到 0.1.1，重启后物理试麦再次成功。UI 的 SHA-256 始终为 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`，父进程文件哈希也未变。
 
 所有扫描端点均报告仅有底噪，约 -96 dB，摄像头麦克风约 -89 dB；没有取得可辨人声。这里只验证设备生命周期和更新兼容性，不证明人工听感、AEC 效果、声学延迟或长期稳定性。没有保存音频、启动图形 UI 或使用正式签名发布。日志为 target/voice-hardware-inventory.log、voice-hardware-rehearsal.log 与 voice-hardware-regression.log；8 项普通子进程回归、相关 Clippy、fmt、SPDX 和 PowerShell 语法检查通过。本轮没有重打安装包。
+
+### 自动化收尾与交付（2026-10-06）
+
+按用户选择先完成自动化，人工人声／听感试听稍后；正式密钥仍另行配置。进程测试和演练不再硬编码当前内核版本：读取 Cargo 版本并计算下一 patch 候选。Windows CI 接入独立更新演练，并保存报告。与 CI 相同的 `-UiPath target/debug/gouhuo.exe` 命令本地通过，证据为 target/voice-update-rehearsal/1850cc51de7f4fce9736cf9c809e941a/report.json；尚未在 GitHub runner 上执行本轮改动。
+
+最终工作区回归 **596 passed / 15 ignored**，额外 quality-probe 单测 1 项通过，完整 Clippy、fmt、SPDX、三个前端依赖边界和 PowerShell 语法检查通过。合成 AEC 的回声抑制与无回声时保留近端信号两项回归通过，不代替真实声学验收。日志为 target/voice-update-final-tests.log、voice-update-final-quality.log 与 voice-update-final-ci-rehearsal.log。
+
+使用公开 RFC 测试公钥构建启用更新器的安装包，仅验证完整更新器代码的打包体积：**8,364,113 字节 / 8.364113 十进制 MB**，SHA-256 `2DD1DFCE5F979324A4DBD0902FB7399B83C24436C686B19296ED4C99B1E5DA2E`，通过原有 10 MB 门禁。它仅保留为 target/voice-update-final/TEST-KEY-ONLY-gouhuo-setup-0.3.1.exe，不安装或发布；没有生成正式密钥。随后移除测试公钥并重新构建默认交付候选。体积与哈希机器记录保存为 target/voice-update-final/test-pin-package.json 与 artifacts.json。
+
+最终交付候选包含 8a365cd 的空闲恢复修复，未配置公钥，继续使用随包内核：UI 16,907,264 字节，SHA-256 `290AD3A3B3029EE6CC72C682B5F313EC59EF943B6BB1AE18B49FFC7BB4EBBF5A`；内核 1,867,776 字节，哈希同前。安装包 **8,346,256 字节 / 8.346256 十进制 MB**，SHA-256 `3AB51C9DA2D146DF740C9C12EDCAF582DC1CD1B6BA7BC830A413F3031A827638`，通过原有 10 MB 门禁。未安装或发布。日志为 target/voice-update-test-pin-dist.log 和 voice-update-final-dist.log。

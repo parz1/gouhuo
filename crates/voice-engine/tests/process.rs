@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Real child process, TLS authentication, encrypted UDP and no physical audio.
+//! Real processes, TLS and encrypted UDP; optional isolated hardware rehearsal.
 
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Child, Command, Stdio};
@@ -18,12 +18,23 @@ use voice_core::identity::Identity;
 use voice_types::TransmitMode;
 
 const ENGINE: &str = env!("CARGO_BIN_EXE_gouhuo-voice");
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn next_version(offset: u64) -> String {
+    let version = client_process::update::Version::parse(ENGINE_VERSION).unwrap();
+    format!(
+        "{}.{}.{}",
+        version.0,
+        version.1,
+        version.2.checked_add(offset).unwrap()
+    )
+}
 
 /// Invoked by scripts/voice-update-rehearsal.ps1 with separately built engines.
-/// Transport fixtures feed the production discovery/staging code; audio is synthetic.
+/// Transport fixtures feed production discovery/staging; hardware is opt-in.
 #[cfg(windows)]
 #[test]
-#[ignore = "requires independently built 0.1.1 engine and an isolated rehearsal directory"]
+#[ignore = "requires independently built newer engine and an isolated rehearsal directory"]
 fn independent_update_rehearsal() {
     use client_process::update::{
         download::{check_allowed, check_and_stage, Fetch, REPO},
@@ -83,11 +94,14 @@ fn independent_update_rehearsal() {
     let root = PathBuf::from(std::env::var_os("GOUHUO_REHEARSAL_ROOT").expect("rehearsal root"));
     let ui = PathBuf::from(std::env::var_os("GOUHUO_REHEARSAL_UI").expect("unchanged UI"));
     let updated =
-        fs::read(std::env::var_os("GOUHUO_REHEARSAL_ENGINE").expect("0.1.1 engine")).unwrap();
+        fs::read(std::env::var_os("GOUHUO_REHEARSAL_ENGINE").expect("updated engine")).unwrap();
     let ui_before = hex(&Sha256::digest(fs::read(&ui).unwrap()));
     let parent_before = hex(&Sha256::digest(
         fs::read(std::env::current_exe().unwrap()).unwrap(),
     ));
+    let updated_version = next_version(1);
+    let failed_spawn_version = next_version(2);
+    let mismatched_version = next_version(3);
     let key = SigningKey::from_bytes(&[5; 32]); // Public fixture seed, never a release secret.
     let hardware = std::env::var("GOUHUO_REHEARSAL_HARDWARE").as_deref() == Ok("1");
     let args = if hardware {
@@ -104,7 +118,7 @@ fn independent_update_rehearsal() {
                 ipc: ipc::VERSION,
                 server_protocol: protocol::control::PROTOCOL_VERSION,
                 ui: "0.3.1".into(),
-                bundled: "0.1.0".into(),
+                bundled: ENGINE_VERSION.into(),
             },
         )
         .unwrap(),
@@ -112,7 +126,7 @@ fn independent_update_rehearsal() {
     let runtime =
         VoiceRuntime::managed_with_args(ENGINE, args.clone(), Arc::clone(&store)).unwrap();
     let handle = runtime.handle();
-    wait(|| handle.engine_version() == "0.1.0");
+    wait(|| handle.engine_version() == ENGINE_VERSION);
     let mut hardware_devices = serde_json::Value::Null;
     let mut scan_results = Vec::new();
     let devices = if hardware {
@@ -159,10 +173,14 @@ fn independent_update_rehearsal() {
         assert!(voice.capture_error.is_none() && voice.render_error.is_none());
     }
     assert_eq!(
-        check_and_stage(&mut files("0.1.1", &updated, &key), &store, &|| true)
-            .unwrap()
-            .as_deref(),
-        Some("0.1.1")
+        check_and_stage(
+            &mut files(updated_version.as_str(), &updated, &key),
+            &store,
+            &|| true
+        )
+        .unwrap()
+        .as_deref(),
+        Some(updated_version.as_str())
     );
     assert!(!handle.activate_pending(), "retired an active call");
     assert_eq!(handle.process_id(), Some(original_pid));
@@ -196,19 +214,25 @@ fn independent_update_rehearsal() {
     handle.stop();
     wait(|| handle.snapshot().stage == RuntimeStage::Idle);
     assert!(handle.activate_pending());
-    wait(|| handle.engine_version() == "0.1.1" && handle.snapshot().stage == RuntimeStage::Idle);
+    wait(|| {
+        handle.engine_version() == updated_version.as_str()
+            && handle.snapshot().stage == RuntimeStage::Idle
+    });
     let upgraded_pid = handle.process_id().unwrap();
     assert_ne!(upgraded_pid, original_pid);
     wait(|| {
         fs::read_to_string(root.join("store/state.json")).is_ok_and(|raw| {
             let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            state["active"] == "0.1.1" && state["booting"].is_null()
+            state["active"] == updated_version.as_str() && state["booting"].is_null()
         })
     });
     // Both spawn failure and a signed host lying about its version must roll back.
     for (version, binary) in [
-        ("0.1.2", b"not a Windows executable".as_slice()),
-        ("0.1.3", updated.as_slice()),
+        (
+            failed_spawn_version.as_str(),
+            b"not a Windows executable".as_slice(),
+        ),
+        (mismatched_version.as_str(), updated.as_slice()),
     ] {
         assert_eq!(
             check_and_stage(&mut files(version, binary, &key), &store, &|| true)
@@ -221,13 +245,13 @@ fn independent_update_rehearsal() {
         wait(|| {
             handle.process_id().is_some()
                 && handle.process_id() != previous_pid
-                && handle.engine_version() == "0.1.1"
+                && handle.engine_version() == updated_version.as_str()
                 && handle.snapshot().stage == RuntimeStage::Idle
         });
         wait(|| {
             fs::read_to_string(root.join("store/state.json")).is_ok_and(|raw| {
                 let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                state["active"] == "0.1.1"
+                state["active"] == updated_version.as_str()
                     && state["booting"].is_null()
                     && state["highest"] == version
             })
@@ -260,7 +284,7 @@ fn independent_update_rehearsal() {
     assert!(runtime.wait_stopped(Duration::from_secs(3)));
     // A new supervisor still selects the verified cached version.
     let restarted = VoiceRuntime::managed_with_args(ENGINE, args, Arc::clone(&store)).unwrap();
-    wait(|| restarted.handle().engine_version() == "0.1.1");
+    wait(|| restarted.handle().engine_version() == updated_version.as_str());
     restarted.handle().start_mic_check(devices);
     wait(|| {
         restarted
@@ -281,7 +305,7 @@ fn independent_update_rehearsal() {
     fs::write(
         root.join("report.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "bundled":"0.1.0", "updated":"0.1.1", "rollback":"0.1.1",
+            "bundled":ENGINE_VERSION, "updated":updated_version.as_str(), "rollback":updated_version.as_str(),
             "original_pid":original_pid, "upgraded_pid":upgraded_pid,
             "ui_sha256":ui_before, "parent_sha256":parent_before,
             "call_deferred":true, "mic_deferred":true, "restart_verified":true,
@@ -366,23 +390,23 @@ fn stage_fixture_bytes(store: &client_process::update::EngineStore, version: &st
 
 #[test]
 fn idle_update_spawn_failure_automatically_restarts_bundled_engine() {
-    let (root, store) = signed_store("0.1.1", false);
+    let (root, store) = signed_store(&next_version(1), false);
     let runtime =
         VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
             .unwrap();
     let handle = runtime.handle();
-    wait(|| handle.engine_version() == "0.1.0");
+    wait(|| handle.engine_version() == ENGINE_VERSION);
     handle.start_mic_check(Devices::default());
     wait(|| handle.snapshot().mic.is_some());
     handle.stop();
     wait(|| handle.snapshot().stage == RuntimeStage::Idle);
-    stage_fixture_bytes(&store, "0.1.1", b"not an executable");
+    stage_fixture_bytes(&store, &next_version(1), b"not an executable");
     let old_pid = handle.process_id();
     assert!(handle.activate_pending());
     wait(|| {
         handle.process_id().is_some()
             && handle.process_id() != old_pid
-            && handle.engine_version() == "0.1.0"
+            && handle.engine_version() == ENGINE_VERSION
             && handle.snapshot().stage == RuntimeStage::Idle
     });
     assert!(!store.has_pending().unwrap());
@@ -395,15 +419,15 @@ fn idle_update_spawn_failure_automatically_restarts_bundled_engine() {
 
 #[test]
 fn signed_engine_activates_only_after_mic_check_retires() {
-    let (root, store) = signed_store("0.1.0", false);
+    let (root, store) = signed_store(ENGINE_VERSION, false);
     let runtime =
         VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
             .unwrap();
     let handle = runtime.handle();
-    wait(|| handle.engine_version() == "0.1.0");
+    wait(|| handle.engine_version() == ENGINE_VERSION);
     handle.start_mic_check(Devices::default());
     wait(|| handle.snapshot().mic.is_some());
-    stage_fixture_engine(&store, "0.1.0");
+    stage_fixture_engine(&store, ENGINE_VERSION);
     assert!(store.has_pending().unwrap());
     assert!(
         !handle.activate_pending(),
@@ -416,7 +440,7 @@ fn signed_engine_activates_only_after_mic_check_retires() {
     wait(|| {
         handle.process_id().is_some()
             && handle.process_id() != old_pid
-            && handle.engine_version() == "0.1.0"
+            && handle.engine_version() == ENGINE_VERSION
             && handle.snapshot().stage == RuntimeStage::Idle
     });
     handle.shutdown();
@@ -427,12 +451,12 @@ fn signed_engine_activates_only_after_mic_check_retires() {
 #[test]
 fn signed_manifest_version_mismatch_rolls_back_to_bundled_engine() {
     // A valid signature does not excuse a host advertising a different version.
-    let (root, store) = signed_store("0.1.1", true);
+    let (root, store) = signed_store(&next_version(1), true);
     let runtime =
         VoiceRuntime::managed_with_args(ENGINE, vec!["--synthetic".into()], Arc::clone(&store))
             .unwrap();
     let handle = runtime.handle();
-    wait(|| handle.engine_version() == "0.1.0");
+    wait(|| handle.engine_version() == ENGINE_VERSION);
     assert!(store.begin_start().unwrap().is_none());
     handle.start_mic_check(Devices::default());
     wait(|| handle.snapshot().mic.is_some());
@@ -545,7 +569,7 @@ fn child_preserves_mute_ptt_and_nonce_sequences_across_device_replacement() {
     handle.start_voice(start.clone());
     wait(|| handle.snapshot().stage == RuntimeStage::Ready);
     assert_eq!(handle.snapshot().voice.unwrap().packets_sent, 0);
-    assert_eq!(handle.engine_version(), "0.1.0");
+    assert_eq!(handle.engine_version(), ENGINE_VERSION);
     handle.set_muted(false);
     handle.set_transmitting(true);
     wait(|| {
