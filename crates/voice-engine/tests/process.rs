@@ -715,6 +715,16 @@ fn retired_process_rejects_old_keys_and_recovers_with_fresh_authentication() {
     assert_eq!(handle.snapshot().stage, RuntimeStage::Failed);
     assert!(handle.needs_reauthentication());
     assert!(handle.process_id().is_none());
+    // The supervisor asynchronously consumes the rejected request's Stop.
+    // Its cleanup must keep the authentication failure visible, not publish Idle.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(handle.snapshot().stage, RuntimeStage::Failed);
+        assert!(handle.needs_reauthentication());
+        assert!(handle.process_id().is_none());
+    }
+    handle.stop();
+    wait(|| handle.snapshot().stage == RuntimeStage::Idle);
     client.disconnect();
     let fresh = join(&invite, "fresh-session");
     handle.start_voice(request(&fresh));
