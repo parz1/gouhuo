@@ -147,15 +147,18 @@ impl CallViewModel {
         };
         let connected = connection == ConnectionState::Connected;
         let udp_failed = connected && stats.is_some_and(|s| s.udp_failed);
-        // Preserve the call page's existing priority in one GUI-free location.
+        // Confirmed UDP failure supersedes an older reconnect/probe notice.
+        let voice_notice = if udp_failed {
+            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。".into()
+        } else {
+            state.voice_notice.clone()
+        };
         let recovery_message = if !reconnecting.is_empty() {
             reconnecting.clone()
         } else if !voice_error.is_empty() {
             voice_error.clone()
-        } else if !state.voice_notice.is_empty() {
-            state.voice_notice.clone()
-        } else if udp_failed {
-            "语音通路未连通，正在自动恢复".into()
+        } else if !voice_notice.is_empty() {
+            voice_notice.clone()
         } else {
             String::new()
         };
@@ -168,7 +171,7 @@ impl CallViewModel {
             udp_failed,
             voice_error,
             reconnecting,
-            voice_notice: state.voice_notice.clone(),
+            voice_notice,
             recovery_message,
             capture: snapshot.capture.clone(),
             speaking: if connected {
@@ -606,10 +609,38 @@ mod tests {
         snapshot.voice.as_mut().unwrap().udp_failed = true;
         assert_eq!(
             CallViewModel::project_audio(&state, &snapshot, true).recovery_message,
-            "语音通路未连通，正在自动恢复"
+            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。"
         );
     }
 
+    #[test]
+    fn udp_timeout_after_reauthentication_replaces_the_stale_probe_notice() {
+        let mut state = connected_state();
+        state.set_notice("服务器已连接，正在验证语音…");
+        let mut snapshot = live_snapshot();
+        snapshot.stage = RuntimeStage::Failed;
+        let stats = snapshot.voice.as_mut().unwrap();
+        stats.udp_ok = false;
+        stats.udp_failed = true;
+        let view = CallViewModel::project_audio(&state, &snapshot, true);
+        assert_eq!(view.connection, ConnectionState::Connected);
+        assert_eq!(
+            view.voice_notice,
+            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。"
+        );
+        assert_eq!(view.recovery_message, view.voice_notice);
+        assert!(view.udp_failed && !view.udp_ok);
+        assert_eq!(state.voice_notice, "服务器已连接，正在验证语音…");
+        state.reconnecting(2, "本次控制连接已中断");
+        let reconnecting = CallViewModel::project_audio(&state, &snapshot, true);
+        assert_eq!(reconnecting.recovery_message, reconnecting.reconnecting);
+        assert!(!reconnecting.udp_failed);
+        state.connected();
+        state.set_notice("");
+        snapshot = live_snapshot();
+        let recovered = CallViewModel::project_audio(&state, &snapshot, true);
+        assert!(recovered.voice_notice.is_empty() && recovered.recovery_message.is_empty());
+    }
     #[test]
     fn structural_dtos_preserve_identity_permissions_volume_and_message_instants() {
         let state = connected_state();

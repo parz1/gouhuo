@@ -123,9 +123,9 @@ pub const GATE_E2E_MS: f64 = 100.0;
 /// 通话中 CPU 的回归闸，单核占比 %。实测 2.84（编解码 2.18 + APM 0.66）。
 pub const GATE_CPU_PCT: f64 = 4.0;
 
-/// 完整安装包的回归闸，十进制 MB。0.2.2 发布包 8.023011 MB，留约 25% 余量。
+/// 完整安装包的回归闸，十进制 MB。#44 批准 UI 预算为 20 MB；0.3.3 本地完整包实测 8.453399 MB。
 /// packaging/windows/check-size.ps1 读取此常量，release 打包超限即失败。
-pub const GATE_INSTALLER_MB: f64 = 10.0;
+pub const GATE_INSTALLER_MB: f64 = 20.0;
 
 // ===========================================================================
 // M2 实测的分段，供各探针拿去算账
@@ -259,9 +259,9 @@ pub const MEASURED_UI_COLD_START_MS: f64 = 92.0;
 /// （+0.2 MB，换来不再依赖 VCRUNTIME140.dll），到 15.01。
 pub const MEASURED_CLIENT_EXE_MB: f64 = 15.01;
 
-/// 0.2.2 正式 Release 的完整 Inno Setup 安装包：8,023,011 字节。
-/// 十进制 MB，包含客户端、打包器与静态运行库；本地重打包可能略有差异。
-pub const MEASURED_INSTALLER_MB: f64 = 8.023011;
+/// 0.3.3 本地候选的完整 Inno Setup 安装包：8,453,399 字节。
+/// 十进制 MB，包含 UI、独立声音内核、打包器与静态运行库；来源见 docs/ui-validation-0.3.3.md。
+pub const MEASURED_INSTALLER_MB: f64 = 8.453399;
 
 /// 实测的服务端可执行文件大小，MB（dist profile，strip 过）。
 ///

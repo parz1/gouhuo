@@ -240,8 +240,10 @@ fn comes_back_to_the_same_channel_after_the_network_drops() {
 
     proxy.cut();
 
-    wait_for(&alice_events, |e| matches!(e, Event::Reconnecting { .. }));
-    wait_for(&alice_events, |e| matches!(e, Event::Reconnected));
+    let waiting = wait_for(&alice_events, |e| matches!(e, Event::Reconnecting { .. }));
+    let restored = wait_for(&alice_events, |e| matches!(e, Event::Reconnected { .. }));
+    assert!(matches!(waiting, Event::Reconnecting { session, .. } if session == old_session));
+    assert!(matches!(restored, Event::Reconnected { session } if session == alice.session_id()));
 
     assert_ne!(alice.session_id(), old_session, "重连是一个新会话");
     assert_ne!(
@@ -295,7 +297,7 @@ fn keeps_trying_until_the_server_is_back() {
     assert!(!reason.is_empty(), "要告诉用户上一次为什么没成");
 
     proxy.set(PASS);
-    wait_for(&events, |e| matches!(e, Event::Reconnected));
+    wait_for(&events, |e| matches!(e, Event::Reconnected { .. }));
     eventually("回到了服务端的名单里", || {
         server.hub.user_count() == 1
     });
@@ -316,11 +318,23 @@ fn notices_a_silently_dead_connection() {
     .unwrap();
 
     proxy.set(BLACKHOLE);
-    wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let event = wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let Event::Reconnecting { cause, attempt, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(attempt, 1);
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::HeartbeatTimeout
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::LocalObservation
+    );
 
     // 网回来了
     proxy.set(PASS);
-    wait_for(&events, |e| matches!(e, Event::Reconnected));
+    wait_for(&events, |e| matches!(e, Event::Reconnected { .. }));
 }
 
 /// 重连等待中点了取消：立刻停，不用等到下一次退避到点。
@@ -369,10 +383,21 @@ fn being_displaced_is_final() {
     let ended = wait_for(&first_events, |e| {
         matches!(e, Event::Reconnecting { .. } | Event::Disconnected(_))
     });
-    let Event::Disconnected(Ended::Refused { headline, .. }) = ended else {
+    let Event::Disconnected(Ended::Refused {
+        headline, cause, ..
+    }) = ended
+    else {
         panic!("被顶号之后不该重连，也不该当成自己退出：{ended:?}");
     };
     assert!(headline.contains("别处"), "{headline}");
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::Displaced
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::ServerConfirmed
+    );
 
     // 再等几个退避周期，确认没有在背后偷偷重连把第二个顶掉
     std::thread::sleep(Duration::from_millis(600));
@@ -380,7 +405,7 @@ fn being_displaced_is_final() {
     assert!(
         first_events
             .try_iter()
-            .all(|e| !matches!(e, Event::Reconnecting { .. } | Event::Reconnected)),
+            .all(|e| !matches!(e, Event::Reconnecting { .. } | Event::Reconnected { .. })),
         "被顶下去的那端在重连"
     );
 }
@@ -484,8 +509,19 @@ fn requested_reconnect_restores_channel_and_self_state() {
     });
     let session = client.session_id();
     client.reconnect_transport();
-    wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
-    wait_for(&events, |e| matches!(e, Event::Reconnected));
+    let event = wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let Event::Reconnecting { cause, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::TransportRestartRequested
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::LocalObservation
+    );
+    wait_for(&events, |e| matches!(e, Event::Reconnected { .. }));
     assert_ne!(session, client.session_id());
     let (voice_session, addr, keys) = client.voice_endpoint_session();
     assert_eq!(voice_session, client.session_id());

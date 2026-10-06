@@ -18,6 +18,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_LIMIT: usize = 8;
 
+pub mod history;
 pub mod update;
 
 struct State {
@@ -672,7 +673,12 @@ fn supervise(
             }
             if matches!(state.pending, Some(Command::Stop)) {
                 state.pending = None;
-                state.snapshot.stage = RuntimeStage::Idle;
+                // Stop also clears a rejected request with retired voice keys.
+                // Consuming it must not hide the required reauthentication;
+                // an explicit stop clears session_id and may become Idle.
+                if !state.reauthenticate || state.snapshot.session_id.is_none() {
+                    state.snapshot.stage = RuntimeStage::Idle;
+                }
             }
             state = shared.wake.wait(state).expect("voice proxy poisoned");
         }

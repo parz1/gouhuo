@@ -109,6 +109,7 @@ pub struct Failure {
     pub advice: String,
     /// 是证书对不上。这种情况值得给一个「重新验证」的出路。
     pub certificate_changed: bool,
+    pub cause: protocol::connection::ConnectionCause,
 }
 
 /// 调试版和测试里允许 `http://127.0.0.1…` 的加入页：本机起的服务端没有 CA 证书。
@@ -198,6 +199,7 @@ pub fn run(
             address: server.address(),
             headline: e.headline(),
             advice: e.advice(),
+            cause: e.connection_cause(),
             certificate_changed: matches!(e, ConnectError::WrongCertificate(_)),
         }),
     }
@@ -222,6 +224,9 @@ fn resolve(
         headline: "这个地址用不了".into(),
         advice,
         certificate_changed: false,
+        cause: protocol::connection::ConnectionCause::local(
+            protocol::connection::ConnectionReason::InvalidInvite,
+        ),
     };
     let target =
         address::parse(text, allow_loopback_http()).map_err(|e| unusable(e.to_string()))?;
@@ -308,6 +313,7 @@ fn resolve_host(
             headline: e.headline(),
             advice: e.advice(),
             certificate_changed: false,
+            cause: e.connection_cause(),
         }),
     }
 }
@@ -359,6 +365,9 @@ fn page_failure(page: &JoinPage, error: FetchError) -> Failure {
         headline,
         advice,
         certificate_changed: false,
+        cause: protocol::connection::ConnectionCause::local(
+            protocol::connection::ConnectionReason::Unknown,
+        ),
     }
 }
 

@@ -120,6 +120,11 @@ jobs:
       - name: 安装包体积门禁边界测试
         shell: pwsh
         run: .\packaging\windows\test-size.ps1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate loopback UDP fault directions and retries
+        run: python -m unittest discover -s scripts -p test_udp_fault_relay.py -v
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -137,6 +142,26 @@ jobs:
         env:
           GOUHUO_PREVIEW_OUTPUT: target/settings-preview
         run: cargo run --locked -p client --example call_ui_preview -- --settings-only
+      - name: Validate settings keyboard entry and return focus
+        env:
+          GOUHUO_PREVIEW_OUTPUT: target/settings-keyboard-preview
+        run: cargo run --locked -p client --example call_ui_preview -- --settings-keyboard-only
+      - name: Validate call layouts and keyboard interactions
+        env:
+          GOUHUO_PREVIEW_OUTPUT: target/call-preview
+        run: cargo run --locked -p client --example call_ui_preview
+      - name: Save UI rendering evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-validation
+          path: |
+            target/settings-preview/**/*.png
+            target/settings-keyboard-preview/**/*.png
+            target/call-preview/**/*.png
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
       - name: Build unchanged rehearsal client
         run: cargo build --locked -p client
       - name: Rehearse independent signed engine update

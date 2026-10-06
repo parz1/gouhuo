@@ -21,9 +21,9 @@ function Expect-Failure([string]$Message, [string]$Config) {
 }
 try {
     $realLimits = Join-Path $PSScriptRoot '..\..\crates\voice-core\src\redline.rs'
-    Set-Size 9999999
+    Set-Size 19999999
     & $checker -InstallerPath $installer
-    Set-Size 10000000
+    Set-Size 20000000
     Expect-Failure '防回归闸' $realLimits
     Set-Size 60000000
     Expect-Failure '产品线' $realLimits

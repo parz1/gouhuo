@@ -42,6 +42,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use protocol::connection::{ConnectionCause, ConnectionReason};
 use protocol::control::{
     goodbye, server_message, Authenticate, BanUser, CreateChannel, DeleteChannel, EditChannel,
     Hello, JoinChannel, KickUser, Ping, Role, SelfState, ServerMessage, SetRole, TextMessage,
@@ -156,13 +157,17 @@ pub enum Event {
         attempt: u32,
         retry_in: Duration,
         reason: String,
+        cause: ConnectionCause,
+        session: u32,
     },
     /// 重新认证成功，恢复原频道和自身状态的命令已经排队。
     /// 名单广播随后确认服务端实际应用的状态。
     ///
     /// **会话 id、UDP 端口、语音密钥全都换了**（旧密钥的序号空间不能复用，
     /// 见 `protocol::crypto`），所以语音链路要按 [`Client`] 上的新值重起。
-    Reconnected,
+    Reconnected {
+        session: u32,
+    },
     /// 连接彻底结束了，不会再重连。
     Disconnected(Ended),
 }
@@ -173,7 +178,11 @@ pub enum Ended {
     /// 用户自己点了离开，或者在重连时点了取消。**不是错误**，界面别报错。
     ByUser,
     /// 被服务端拒之门外：顶号、被踢、被封，或者重连时碰上了再试也没用的错误。
-    Refused { headline: String, advice: String },
+    Refused {
+        headline: String,
+        advice: String,
+        cause: protocol::connection::ConnectionCause,
+    },
 }
 
 /// 一个会自己重连的连接把手。克隆出来的把手可以在任意线程上用，
@@ -206,12 +215,22 @@ struct WriterState {
     stopped: AtomicBool,
     completed: AtomicBool,
     pending_bytes: Arc<AtomicUsize>,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<LinkFailure>>,
+}
+
+#[derive(Clone, Debug)]
+struct LinkFailure {
+    message: String,
+    cause: ConnectionCause,
 }
 
 impl WriterState {
-    fn fail(&self, socket: &TcpStream, message: String) {
-        *self.error.lock().expect("writer error poisoned") = Some(message);
+    fn fail(&self, socket: &TcpStream, message: String, cause: ConnectionCause) {
+        // Keep the first cause: shutdown can produce a secondary read/write error.
+        self.error
+            .lock()
+            .expect("writer error poisoned")
+            .get_or_insert(LinkFailure { message, cause });
         self.stopped.store(true, Ordering::Release);
         let _ = socket.shutdown(std::net::Shutdown::Both);
     }
@@ -242,6 +261,7 @@ impl Link {
             self.writer_state.fail(
                 &self.shutdown_sock,
                 "控制消息超过协议长度上限，正在重新连接。".into(),
+                ConnectionCause::local(ConnectionReason::ProtocolError),
             );
             return;
         }
@@ -257,6 +277,7 @@ impl Link {
             self.writer_state.fail(
                 &self.shutdown_sock,
                 "控制消息积压过多，正在重新连接服务器。".into(),
+                ConnectionCause::local(ConnectionReason::ControlBackpressure),
             );
             return;
         }
@@ -266,10 +287,15 @@ impl Link {
             budget: Arc::clone(&self.writer_state.pending_bytes),
         };
         // try_send 不等待 TLS 锁或 socket。只有单个 writer 消费，保留调用顺序。
-        if self.writer.try_send(pending).is_err() {
+        if let Err(error) = self.writer.try_send(pending) {
+            let reason = match error {
+                mpsc::TrySendError::Full(_) => ConnectionReason::ControlBackpressure,
+                mpsc::TrySendError::Disconnected(_) => ConnectionReason::ControlQueueUnavailable,
+            };
             self.writer_state.fail(
                 &self.shutdown_sock,
                 "控制消息队列不可用，正在重新连接服务器。".into(),
+                ConnectionCause::local(reason),
             );
         }
     }
@@ -325,6 +351,7 @@ fn writer_loop(
             state.fail(
                 &socket,
                 format!("控制消息发送失败：{error}。正在重新连接服务器。"),
+                ConnectionCause::local(ConnectionReason::WriteError),
             );
             return;
         }
@@ -657,7 +684,12 @@ impl Client {
     /// Rebuild a failing voice session using the existing reconnect policy and credentials.
     pub fn reconnect_transport(&self) {
         if !self.shared.closing() {
-            self.shared.link().shutdown();
+            let link = self.shared.link();
+            link.writer_state.fail(
+                &link.shutdown_sock,
+                "正在重新建立连接。".into(),
+                ConnectionCause::local(ConnectionReason::TransportRestartRequested),
+            );
         }
     }
 
@@ -683,7 +715,7 @@ enum Outcome {
     /// 服务端说了再见。不重连。
     Goodbye(Ended),
     /// 连接断了，原因能直接显示。可能要重连。
-    Lost(String),
+    Lost(LinkFailure),
 }
 
 /// 读线程的一生：读到断，决定重不重连，重连上了接着读。
@@ -730,7 +762,11 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     let reason = goodbye::Reason::try_from(bye.reason)
                         .unwrap_or(goodbye::Reason::Unspecified);
                     let (headline, advice) = farewell(reason, &bye.detail);
-                    return Outcome::Goodbye(Ended::Refused { headline, advice });
+                    return Outcome::Goodbye(Ended::Refused {
+                        headline,
+                        advice,
+                        cause: crate::error::farewell_cause(reason),
+                    });
                 }
                 for event in apply(&shared.roster, message) {
                     if tx.send(event).is_err() {
@@ -738,13 +774,29 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     }
                 }
             }
-            Ok(None) => return Outcome::Lost(lost_reason(shared, "服务器关闭了连接".to_string())),
-            Err(e) => return Outcome::Lost(lost_reason(shared, format!("连接断了：{e}"))),
+            Ok(None) => {
+                return Outcome::Lost(lost_reason(
+                    shared,
+                    LinkFailure {
+                        message: "服务器关闭了连接".into(),
+                        cause: ConnectionCause::local(ConnectionReason::RemoteClosed),
+                    },
+                ))
+            }
+            Err(e) => {
+                return Outcome::Lost(lost_reason(
+                    shared,
+                    LinkFailure {
+                        message: format!("连接断了：{e}"),
+                        cause: ConnectionCause::local(ConnectionReason::ReadError),
+                    },
+                ))
+            }
         }
     }
 }
 
-fn lost_reason(shared: &Shared, fallback: String) -> String {
+fn lost_reason(shared: &Shared, fallback: LinkFailure) -> LinkFailure {
     shared
         .link()
         .writer_state
@@ -775,7 +827,7 @@ fn backoff(attempt: u32, first: Duration, max: Duration) -> Duration {
 /// 断了之后一直试到连上、碰上不该再试的错误、或者用户取消。
 ///
 /// 连上了返回新的 [`Reader`]；返回 `None` 时 `Disconnected` 已经发过了。
-fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: String) -> Option<Reader> {
+fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: LinkFailure) -> Option<Reader> {
     // 断之前在哪个频道。按「id 和名字都对得上」去找 —— 服务器要是重启过，
     // 频道还没持久化，同一个 id 可能已经是别的频道了。
     let wanted = {
@@ -795,7 +847,9 @@ fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: String) -> Op
         let notice = Event::Reconnecting {
             attempt,
             retry_in,
-            reason: reason.clone(),
+            reason: reason.message.clone(),
+            cause: reason.cause,
+            session: shared.link().session_id,
         };
         if tx.send(notice).is_err() {
             shared.closing.store(true, Ordering::SeqCst);
@@ -815,15 +869,27 @@ fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: String) -> Op
                     return None;
                 }
                 install(shared, link, &welcome, wanted.as_ref());
-                if tx.send(Event::Reconnected).is_err() || tx.send(Event::RosterChanged).is_err() {
+                if tx
+                    .send(Event::Reconnected {
+                        session: welcome.session_id,
+                    })
+                    .is_err()
+                    || tx.send(Event::RosterChanged).is_err()
+                {
                     shared.closing.store(true, Ordering::SeqCst);
                     return None;
                 }
                 return Some(reader);
             }
-            Err(e) if e.is_retryable() => reason = e.headline(),
+            Err(e) if e.is_retryable() => {
+                reason = LinkFailure {
+                    message: e.headline(),
+                    cause: e.connection_cause(),
+                }
+            }
             Err(e) => {
                 let ended = Ended::Refused {
+                    cause: e.connection_cause(),
                     headline: e.headline(),
                     advice: e.advice(),
                 };
@@ -897,7 +963,11 @@ fn heartbeat(shared: Arc<Shared>) {
         if shared.silent_for() > shared.options.liveness_timeout {
             // 掐掉 socket，阻塞在 read 上的读线程会醒过来走重连。
             // 重连期间这里会反复掐那条早就死了的旧连接，无害。
-            link.shutdown();
+            link.writer_state.fail(
+                &link.shutdown_sock,
+                "连接长时间没有响应，正在重新连接。".into(),
+                ConnectionCause::local(ConnectionReason::HeartbeatTimeout),
+            );
             continue;
         }
         link.send(
@@ -1587,7 +1657,32 @@ mod shutdown_tests {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|e| e.contains("队列")));
+            .is_some_and(|e| e.message.contains("队列")));
+        assert_eq!(
+            link.writer_state
+                .error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .cause,
+            ConnectionCause::local(ConnectionReason::ControlBackpressure)
+        );
+        link.writer_state.fail(
+            &link.shutdown_sock,
+            "secondary write failure".into(),
+            ConnectionCause::local(ConnectionReason::WriteError),
+        );
+        assert_eq!(
+            link.writer_state
+                .error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .cause,
+            ConnectionCause::local(ConnectionReason::ControlBackpressure)
+        );
         assert_eq!(*client.shared.self_state.lock().unwrap(), (true, true));
         assert!(link.writer_state.pending_bytes.load(Ordering::Acquire) <= WRITE_QUEUE_BYTES);
         client.disconnect();
@@ -1614,7 +1709,7 @@ mod shutdown_tests {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|e| e.contains("积压")));
+            .is_some_and(|e| e.message.contains("积压")));
         assert!(link.writer_state.pending_bytes.load(Ordering::Acquire) <= WRITE_QUEUE_BYTES);
         client.disconnect();
         drop(guard);

@@ -11,8 +11,10 @@ description = "客户端与服务端共享的唯一一份协议定义：包格�
 [features]
 default = ["crypto"]
 crypto = ["dep:chacha20poly1305"]
+connection-serde = ["dep:serde"]
 
 [dependencies]
+serde = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 # 证书指纹和邀请码校验和要用。RustCrypto 的纯 Rust 实现，无外部依赖 ——
 # 这个 crate 要能被任何人照着实现，依赖越少越好。

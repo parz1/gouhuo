@@ -191,6 +191,16 @@ impl Fixture {
         fixture
     }
 
+    /// Advance the same production scene for offline renderer cost isolation.
+    /// This fixture never opens audio devices or network connections.
+    // The static software snapshot example shares this fixture but never animates.
+    #[allow(dead_code)]
+    pub fn advance_scene(&self, dt: f32) {
+        if let Some(app) = self.app.upgrade() {
+            app.set_campfire_backdrop(self.stage.borrow_mut().advance(dt));
+        }
+    }
+
     // Simulated view-model output for these preview fixtures. There is no
     // presentation policy in CallPage: every command updates the supplied view.
     fn refresh_presentation(app: &App) {

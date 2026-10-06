@@ -69,6 +69,7 @@ export component CallPage inherits Rectangle {
     callback set-role(int, int);
     callback toggle-mute();
     callback toggle-deafen();
+    in property <int> settings-focus: 0;
     callback toggle-settings();
     callback set-ptt-mode(bool);
     callback rebind-ptt();
@@ -112,7 +113,7 @@ export component CallPage inherits Rectangle {
     background: CallTokens.bg;
     forward-focus: page-keys;
     page-keys := FocusScope {
-        init => { if (root.preview-enabled) { self.focus(); } }
+        init => { if (root.preview-enabled && root.settings-focus == 0) { self.focus(); } }
         key-pressed(event) => {
             if (root.preview-enabled) {
                 if (event.text == Key.F1) { root.preview-key(1); return accept; }
@@ -192,7 +193,7 @@ export component CallPage inherits Rectangle {
                 }
             }
             dock := SelfDock {
-                nick: root.nick; identity-image: root.seats.length > 0 ? root.seats[0].stone : @image-url("../icons/flame.svg"); input-available: root.input-available; input-level: root.input-level; vad-level: root.vad-level; ptt-mode: root.ptt-mode; ptt-label: root.ptt-label; rebinding: root.rebinding; status: root.self-status; transmitting: root.transmitting; muted: root.self-muted; deafened: root.self-deafened; focus-epoch: root.dock-focus; mode-focus: root.mode-focus; identity-focus: root.identity-focus;
+                nick: root.nick; identity-image: root.seats.length > 0 ? root.seats[0].stone : @image-url("../icons/flame.svg"); input-available: root.input-available; input-level: root.input-level; vad-level: root.vad-level; ptt-mode: root.ptt-mode; ptt-label: root.ptt-label; rebinding: root.rebinding; status: root.self-status; transmitting: root.transmitting; muted: root.self-muted; deafened: root.self-deafened; focus-epoch: root.dock-focus; mode-focus: root.mode-focus; identity-focus: root.identity-focus; settings-focus: root.settings-focus;
                 identity-details => { root.close-overlay(false); root.overlay = 4; }
                 mode-menu => { root.close-overlay(false); root.overlay = 3; }
                 rebind => { root.close-overlay(false); root.rebind-ptt(); }

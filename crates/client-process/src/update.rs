@@ -410,7 +410,7 @@ fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()
 }
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;

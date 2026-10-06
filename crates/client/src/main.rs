@@ -68,6 +68,7 @@ mod call;
 mod campfire;
 mod discover;
 mod engine_update;
+mod history_view;
 mod join;
 mod settings;
 mod single_instance;
@@ -249,7 +250,20 @@ fn run(instance_key: &str) -> Result<(), Failure> {
             return Ok(());
         }
     };
+    let history_writer = Settings::path()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_owned()))
+        .and_then(
+            |directory| match client_process::history::Writer::start(directory) {
+                Ok(writer) => Some(writer),
+                Err(_) => {
+                    eprintln!("连接历史后台线程无法启动；通话仍可继续。");
+                    None
+                }
+            },
+        );
     let state = Arc::new(Mutex::new(State {
+        history: history_writer.as_ref().map(|writer| writer.handle()),
         runtime: Some(runtime.handle()),
         engine_updates: Some(engine_updates),
         settings_writer: Some(settings_writer.handle()),
@@ -325,6 +339,12 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     }
     if !settings_writer.wait_stopped(std::time::Duration::from_secs(3)) {
         eprintln!("设置写入仍未完成，退出等待已结束。");
+    }
+    state.lock().expect("state poisoned").history.take();
+    if let Some(writer) = history_writer {
+        if !writer.finish(std::time::Duration::from_secs(2)) {
+            eprintln!("连接历史写入未结束，退出等待已结束。");
+        }
     }
     result.map_err(Failure::EventLoop)?;
     Ok(())
@@ -552,6 +572,12 @@ fn dark_titlebar(_app: &App) {}
 
 #[derive(Default)]
 struct State {
+    history: Option<client_process::history::Handle>,
+    history_journey: Option<client_process::history::Journey>,
+    history_generation: u64,
+    history_attempt: u32,
+    history_operation: Option<std::sync::mpsc::Receiver<client_process::history::OperationResult>>,
+    history_view_version: Option<(u64, u64, u64, bool)>,
     client: Option<Client>,
     call: CallState,
     recovery: client_runtime::health::CallHealth,
@@ -587,6 +613,31 @@ struct State {
 }
 
 impl State {
+    fn record_connection(
+        &mut self,
+        phase: client_process::history::Phase,
+        cause: Option<protocol::connection::ConnectionCause>,
+        session: Option<u32>,
+        retry_in: Option<std::time::Duration>,
+    ) {
+        if let (Some(handle), Some(journey)) = (&self.history, &mut self.history_journey) {
+            journey.record(
+                handle,
+                client_process::history::Transition {
+                    phase,
+                    cause,
+                    session,
+                    retry_in,
+                    generation: self.history_generation,
+                    attempt: self.history_attempt,
+                },
+            );
+        }
+        if phase == client_process::history::Phase::Ended {
+            self.history_journey = None;
+        }
+    }
+
     /// Queue a complete preference snapshot; disk I/O belongs to the writer.
     fn persist_settings(&self) {
         if let Some(writer) = &self.settings_writer {
@@ -770,6 +821,15 @@ fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<State>>) {
             let Some(app) = weak.upgrade() else { return };
             {
                 let mut locked = state.lock().expect("state poisoned");
+                locked.record_connection(
+                    client_process::history::Phase::Ended,
+                    Some(protocol::connection::ConnectionCause {
+                        reason: protocol::connection::ConnectionReason::JoinCancelled,
+                        source: protocol::connection::EvidenceSource::UserAction,
+                    }),
+                    None,
+                    None,
+                );
                 // 后台那次连接掐不掉，只能不认它的结果，见 State::join_generation。
                 locked.join_generation += 1;
                 locked.pending = None;
@@ -907,6 +967,13 @@ fn begin_join(
     let (generation, saved) = {
         let mut locked = state.lock().expect("state poisoned");
         locked.join_generation += 1;
+        locked.history_journey = locked
+            .history
+            .as_ref()
+            .and_then(|handle| handle.new_journey().ok());
+        locked.history_generation = 0;
+        locked.history_attempt = 0;
+        locked.record_connection(client_process::history::Phase::Preparing, None, None, None);
         locked.pending = None;
         locked.last_request = Some(request.clone());
         locked.hero = Some(hero);
@@ -980,6 +1047,12 @@ fn finish_join(
             server,
         } => on_connected(app, state, client, events, nick, server),
         join::Outcome::ConfirmFingerprint(server) => {
+            state.lock().expect("state poisoned").record_connection(
+                client_process::history::Phase::AwaitingTrust,
+                None,
+                None,
+                None,
+            );
             app.set_trust_fingerprint(server.invite.cert.to_grouped_hex().into());
             app.set_home_mode(3);
             let mut locked = state.lock().expect("state poisoned");
@@ -987,6 +1060,14 @@ fn finish_join(
             locked.pending = Some(server);
         }
         join::Outcome::NeedCode { server, rejected } => {
+            state.lock().expect("state poisoned").record_connection(
+                client_process::history::Phase::AwaitingCode,
+                Some(protocol::connection::ConnectionCause::server(
+                    protocol::connection::ConnectionReason::InviteRequired,
+                )),
+                None,
+                None,
+            );
             app.set_join_code("".into());
             app.set_code_rejected(rejected);
             app.set_home_mode(2);
@@ -995,6 +1076,12 @@ fn finish_join(
             locked.pending = Some(server);
         }
         join::Outcome::Failed(failure) => {
+            state.lock().expect("state poisoned").record_connection(
+                client_process::history::Phase::Ended,
+                Some(failure.cause),
+                None,
+                None,
+            );
             app.set_error_headline(failure.headline.into());
             app.set_error_advice(failure.advice.into());
             app.set_error_can_reverify(failure.certificate_changed);
@@ -1139,6 +1226,13 @@ fn on_connected(
         // 不管是粘链接、输域名还是输 IP 核对指纹进来的，存下来都是同一种东西
         // （地址 + 固定的指纹 + 加入码），下次从首页一点就进。
         let mut locked = state.lock().expect("state poisoned");
+        locked.history_generation = 1;
+        locked.record_connection(
+            client_process::history::Phase::Connected,
+            None,
+            Some(client.session_id()),
+            None,
+        );
         locked.client = Some(client.clone());
         locked.call.connected();
         locked.call.set_notice("");
@@ -1493,6 +1587,27 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
             text.push('\n');
         }
     }
+    if let Some(history) = &locked.history {
+        let snapshot = history.snapshot();
+        text.push_str(&format!("默认连接历史：{} 条 / UTC Unix 毫秒 / 保留 7 天\n队列丢弃事件 {} / 磁盘故障次数 {} / 损坏文件 {} / 清除失败 {}\n",
+            snapshot.records.len(), snapshot.dropped_queue_records, snapshot.disk_failures,
+            snapshot.invalid_disk_documents, snapshot.clear_failed));
+        for record in snapshot.records.iter().rev().take(20).rev() {
+            text.push_str(&format!(
+                "{} UTC / {:?} → {:?} / 代次 {} / 重试 {} / 会话 {:?} / 原因 {} / 来源 {:?}\n",
+                record.utc_unix_ms,
+                record.previous,
+                record.phase,
+                record.generation,
+                record.attempt,
+                record.session,
+                record.cause.map(|c| c.reason.code()).unwrap_or("none"),
+                record.cause.map(|c| c.source)
+            ));
+        }
+    } else {
+        text.push_str("默认连接历史不可用；通话仍可继续。\n");
+    }
     text.push_str("本地 UI 阶段（事件处理耗时，非整帧耗时）：\n");
     for phase in ui_timing::snapshot() {
         text.push_str(&phase);
@@ -1679,11 +1794,51 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
     {
         let weak = app.as_weak();
         let state = Arc::clone(state);
+        app.on_refresh_history(move || {
+            if let Some(app) = weak.upgrade() {
+                refresh_history(&app, &state);
+            }
+        });
+    }
+    for clear in [false, true] {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        let action = move || {
+            if let Some(app) = weak.upgrade() {
+                begin_history_operation(&app, &state, clear);
+            }
+        };
+        if clear {
+            app.on_clear_history(action);
+        } else {
+            app.on_export_history(action);
+        }
+    }
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_settings_category_changed(move |category| {
+            let Some(app) = weak.upgrade() else { return };
+            if category == 0 {
+                start_mic_check(&app, &state);
+            } else {
+                stop_mic_check(&state);
+                sync_audio(&app, &state);
+            }
+            if category == 4 {
+                refresh_history(&app, &state);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
         app.on_toggle_settings(move || {
             let Some(app) = weak.upgrade() else { return };
             let opening = !app.get_show_settings();
             app.set_show_settings(opening);
-            if opening {
+            if opening && app.get_settings_tab() == 0 {
                 // 没连服务器也要能看电平、能试听 —— 这正是连不上时最想知道的事。
                 start_mic_check(&app, &state);
             } else {
@@ -1784,6 +1939,91 @@ fn transmit_mode(settings: &Settings) -> TransmitMode {
     }
 }
 
+fn refresh_history(app: &App, state: &Mutex<State>) {
+    let handle = state.lock().expect("state poisoned").history.clone();
+    let Some(handle) = handle else {
+        app.set_history_available(false);
+        app.set_history_summary("连接历史暂不可用".into());
+        app.set_history_report("无法启动历史记录线程，通话仍可继续。".into());
+        return;
+    };
+    let version = handle.view_version();
+    let view = history_view::project(&handle.snapshot());
+    app.set_history_available(true);
+    app.set_history_summary(view.summary.into());
+    app.set_history_report(view.report.into());
+    app.set_history_warning(view.warning.into());
+    state.lock().expect("state poisoned").history_view_version = Some(version);
+}
+
+fn begin_history_operation(app: &App, state: &Mutex<State>, clear: bool) {
+    let mut locked = state.lock().expect("state poisoned");
+    if locked.history_operation.is_some() {
+        return;
+    }
+    let reply = locked.history.as_ref().and_then(|handle| {
+        if clear {
+            handle.request_clear()
+        } else {
+            handle.request_export()
+        }
+    });
+    if let Some(reply) = reply {
+        locked.history_operation = Some(reply);
+        app.set_history_busy(true);
+        app.set_history_status(
+            if clear {
+                "正在清除…"
+            } else {
+                "正在导出…"
+            }
+            .into(),
+        );
+    } else {
+        app.set_history_status("操作未排入队列，请稍后再试。".into());
+    }
+}
+
+fn poll_history(app: &App, state: &Mutex<State>) {
+    use client_process::history::OperationResult;
+    use std::sync::mpsc::TryRecvError;
+    let (result, changed) = {
+        let mut locked = state.lock().expect("state poisoned");
+        let result =
+            locked
+                .history_operation
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(Ok(result)),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(())),
+                });
+        if result.is_some() {
+            locked.history_operation = None;
+        }
+        let changed = app.get_show_settings()
+            && app.get_settings_tab() == 4
+            && locked
+                .history
+                .as_ref()
+                .is_some_and(|handle| Some(handle.view_version()) != locked.history_view_version);
+        (result, changed)
+    };
+    let completed = result.is_some();
+    if let Some(result) = result {
+        app.set_history_busy(false);
+        app.set_history_status(match result {
+            Ok(OperationResult::Cleared) => "本机连接历史已清除。".into(),
+            Ok(OperationResult::Exported(path)) => format!("已导出到 {}", path.display()).into(),
+            Ok(OperationResult::Failed) => "操作未完成，请检查保存位置是否可写。".into(),
+            Err(()) => "操作结果未确认，请重新查看历史。".into(),
+        });
+    }
+    if completed || changed {
+        refresh_history(app, state);
+    }
+}
+
 /// 定时把音频状态搬到界面上。**整个程序只有一个**，连着和没连着都靠它。
 ///
 /// 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，省掉一次跨线程投递，
@@ -1792,6 +2032,7 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, VOICE_POLL, move || {
         let Some(app) = weak.upgrade() else { return };
+        poll_history(&app, &state);
         let (runtime, client, ptt_bound, call) = {
             let locked = state.lock().expect("state poisoned");
             (
@@ -1970,8 +2211,22 @@ fn pump_events(
                 }
                 match event {
                     Event::Reconnecting {
-                        attempt, reason, ..
+                        attempt,
+                        reason,
+                        cause,
+                        retry_in,
+                        session,
                     } => {
+                        {
+                            let mut locked = state.lock().expect("state poisoned");
+                            locked.history_attempt = attempt;
+                            locked.record_connection(
+                                client_process::history::Phase::ReconnectWaiting,
+                                Some(cause),
+                                Some(session),
+                                Some(retry_in),
+                            );
+                        }
                         ui_timing::mark_frame(ui_timing::FramePhase::Reconnecting);
                         record_recovery(
                             &state,
@@ -1996,7 +2251,17 @@ fn pump_events(
                         }
                         sync_audio(&app, &state);
                     }
-                    Event::Reconnected => {
+                    Event::Reconnected { session } => {
+                        {
+                            let mut locked = state.lock().expect("state poisoned");
+                            locked.history_generation += 1;
+                            locked.record_connection(
+                                client_process::history::Phase::Restored,
+                                None,
+                                Some(session),
+                                None,
+                            );
+                        }
                         ui_timing::mark_frame(ui_timing::FramePhase::Reconnected);
                         record_recovery(&state, "TCP connected; waiting for voice probe");
                         {
@@ -2021,6 +2286,19 @@ fn pump_events(
                         start_voice(&app, &state, &client);
                     }
                     Event::Disconnected(ended) => {
+                        let cause = match &ended {
+                            Ended::Refused { cause, .. } => *cause,
+                            Ended::ByUser => protocol::connection::ConnectionCause {
+                                reason: protocol::connection::ConnectionReason::UserLeft,
+                                source: protocol::connection::EvidenceSource::UserAction,
+                            },
+                        };
+                        state.lock().expect("state poisoned").record_connection(
+                            client_process::history::Phase::Ended,
+                            Some(cause),
+                            Some(client.session_id()),
+                            None,
+                        );
                         if matches!(&ended, Ended::Refused { .. }) {
                             connection_notice(&state, false);
                         }
@@ -2050,7 +2328,9 @@ fn pump_events(
                         match ended {
                             // 自己走的不是错误，别在首页上挂一条报错。
                             Ended::ByUser => clear_join_error(&app),
-                            Ended::Refused { headline, advice } => {
+                            Ended::Refused {
+                                headline, advice, ..
+                            } => {
                                 app.set_error_headline(headline.into());
                                 app.set_error_advice(advice.into());
                                 app.set_error_can_reverify(false);
@@ -2636,6 +2916,23 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_leave(move || {
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                let reason = if locked.call.connection() == ConnectionState::Reconnecting {
+                    protocol::connection::ConnectionReason::ReconnectCancelled
+                } else {
+                    protocol::connection::ConnectionReason::UserLeft
+                };
+                locked.record_connection(
+                    client_process::history::Phase::Ended,
+                    Some(protocol::connection::ConnectionCause {
+                        reason,
+                        source: protocol::connection::EvidenceSource::UserAction,
+                    }),
+                    None,
+                    None,
+                );
+            }
             cancel_scan(&state);
             dispatch_call(&state, CallCommand::Leave);
             {
@@ -2751,6 +3048,15 @@ fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
 /// 真的退出：先离开频道（服务端和别人那边马上看到你走了，而不是等 30 秒超时），
 /// 再停掉事件循环。
 fn quit_app(state: &Arc<Mutex<State>>) {
+    state.lock().expect("state poisoned").record_connection(
+        client_process::history::Phase::Ended,
+        Some(protocol::connection::ConnectionCause {
+            reason: protocol::connection::ConnectionReason::ApplicationExit,
+            source: protocol::connection::EvidenceSource::UserAction,
+        }),
+        None,
+        None,
+    );
     cancel_scan(state);
     let client = {
         let locked = state.lock().expect("state poisoned");
