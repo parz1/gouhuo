@@ -23,12 +23,16 @@ pub fn project(snapshot: &Snapshot) -> View {
         "还没有连接记录".into()
     };
     let warning = if snapshot.dropped_queue_records > 0
+        || snapshot.rejected_commands > 0
         || snapshot.disk_failures > 0
         || snapshot.invalid_disk_documents > 0
+        || snapshot.clear_failed
     {
         format!(
-            "部分记录可能缺失：队列丢弃 {} 条，磁盘故障 {} 次，损坏文件 {} 份。",
-            snapshot.dropped_queue_records, snapshot.disk_failures, snapshot.invalid_disk_documents
+            "部分记录或操作未完成：队列丢弃 {} 条，操作拒绝 {} 次，磁盘故障 {} 次，损坏文件 {} 份。{}",
+            snapshot.dropped_queue_records, snapshot.rejected_commands,
+            snapshot.disk_failures, snapshot.invalid_disk_documents,
+            if snapshot.clear_failed { "历史清除失败，原记录可能仍然保留。" } else { "" }
         )
     } else {
         String::new()
@@ -164,5 +168,20 @@ mod tests {
         assert!(view.warning.contains("丢弃 2 条"));
         assert_eq!(reason(Reason::Unknown), "原因未确定");
         assert!(phase(Phase::Restored).contains("语音待确认"));
+    }
+
+    #[test]
+    fn rejected_operations_and_failed_clear_are_visible_without_record_loss() {
+        let rejected = project(&Snapshot {
+            rejected_commands: 1,
+            ..Snapshot::default()
+        });
+        assert!(rejected.warning.contains("操作拒绝 1 次"));
+        let failed_clear = project(&Snapshot {
+            clear_failed: true,
+            ..Snapshot::default()
+        });
+        assert!(failed_clear.warning.contains("历史清除失败"));
+        assert!(project(&Snapshot::default()).warning.is_empty());
     }
 }
