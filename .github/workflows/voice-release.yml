@@ -34,7 +34,7 @@ jobs:
           GOUHUO_VOICE_SIGNING_KEY: ${{ secrets.GOUHUO_VOICE_SIGNING_KEY }}
           GOUHUO_VOICE_PUBLIC_KEY: ${{ vars.GOUHUO_VOICE_PUBLIC_KEY }}
         run: |
-          cargo run --locked -p client-process --bin gouhuo-voice-release -- sign target/dist/gouhuo-voice.exe $env:VOICE_VERSION 0.3.1 target/voice-release
+          cargo run --locked -p client-process --bin gouhuo-voice-release -- sign target/dist/gouhuo-voice.exe $env:VOICE_VERSION 0.3.2 target/voice-release
           if ($LASTEXITCODE -ne 0) { throw 'Voice release signing failed' }
       - name: Create independent draft without replacing latest UI release
         shell: pwsh
