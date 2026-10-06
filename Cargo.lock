@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "client-core",
  "client-process",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "client-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "prost",
  "protocol",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "client-process"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "client-runtime",
  "ed25519-dalek",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "client-runtime"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "client-core",
  "protocol",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "device-probe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "voice-core",
 ]
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "latency-probe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "opus",
  "protocol",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chacha20poly1305",
  "prost",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "getrandom 0.3.4",
  "polling",
@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "test-bot"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "client-core",
  "client-runtime",
@@ -5554,7 +5554,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "protocol",
  "rcgen",
@@ -5770,7 +5770,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
@@ -5803,7 +5803,7 @@ dependencies = [
 
 [[package]]
 name = "voice-types"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
 ]
