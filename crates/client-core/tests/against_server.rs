@@ -465,10 +465,21 @@ fn logging_in_again_disconnects_the_old_client() {
     let (second, _second_events) = Client::connect(&link, &second_identity, "阿狸").unwrap();
 
     let ended = wait_for(&first_events, |e| matches!(e, Event::Disconnected(_)));
-    let Event::Disconnected(Ended::Refused { headline, .. }) = ended else {
+    let Event::Disconnected(Ended::Refused {
+        headline, cause, ..
+    }) = ended
+    else {
         panic!("被顶号要说明原因，不能当成自己走的：{ended:?}");
     };
     assert!(headline.contains("别处"), "{headline}");
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::Displaced
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::ServerConfirmed
+    );
     assert_eq!(server.hub.user_count(), 1, "顶号顶成了两个人");
     assert_eq!(second.roster().users.len(), 1);
 }

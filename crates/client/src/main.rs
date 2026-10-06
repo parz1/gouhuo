@@ -2050,7 +2050,9 @@ fn pump_events(
                         match ended {
                             // 自己走的不是错误，别在首页上挂一条报错。
                             Ended::ByUser => clear_join_error(&app),
-                            Ended::Refused { headline, advice } => {
+                            Ended::Refused {
+                                headline, advice, ..
+                            } => {
                                 app.set_error_headline(headline.into());
                                 app.set_error_advice(advice.into());
                                 app.set_error_can_reverify(false);

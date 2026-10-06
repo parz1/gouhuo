@@ -369,10 +369,21 @@ fn being_displaced_is_final() {
     let ended = wait_for(&first_events, |e| {
         matches!(e, Event::Reconnecting { .. } | Event::Disconnected(_))
     });
-    let Event::Disconnected(Ended::Refused { headline, .. }) = ended else {
+    let Event::Disconnected(Ended::Refused {
+        headline, cause, ..
+    }) = ended
+    else {
         panic!("被顶号之后不该重连，也不该当成自己退出：{ended:?}");
     };
     assert!(headline.contains("别处"), "{headline}");
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::Displaced
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::ServerConfirmed
+    );
 
     // 再等几个退避周期，确认没有在背后偷偷重连把第二个顶掉
     std::thread::sleep(Duration::from_millis(600));

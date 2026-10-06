@@ -110,14 +110,26 @@ fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
 }
 
 /// 结束的方式要是「被拒之门外」，而且之后不许偷偷重连。
-fn assert_refused_for_good(events: &Receiver<Event>, headline_has: &str) {
+fn assert_refused_for_good(
+    events: &Receiver<Event>,
+    headline_has: &str,
+    expected: protocol::connection::ConnectionReason,
+) {
     let ended = wait_for(events, |e| {
         matches!(e, Event::Disconnected(_) | Event::Reconnecting { .. })
     });
-    let Event::Disconnected(Ended::Refused { headline, .. }) = &ended else {
+    let Event::Disconnected(Ended::Refused {
+        headline, cause, ..
+    }) = &ended
+    else {
         panic!("被请出去之后不该重连，也不该当成自己走的：{ended:?}");
     };
     assert!(headline.contains(headline_has), "{headline}");
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::ServerConfirmed
+    );
+    assert_eq!(cause.reason, expected);
     std::thread::sleep(Duration::from_millis(400));
     assert!(
         events
@@ -170,7 +182,11 @@ fn kick_ban_and_unban_from_the_client() {
 
     // 踢：波波停下来，不自动重连；但他自己再连是可以的
     alice.kick(bob_session, "去隔壁吵");
-    assert_refused_for_good(&bob_events, "请出");
+    assert_refused_for_good(
+        &bob_events,
+        "请出",
+        protocol::connection::ConnectionReason::Kicked,
+    );
     let (bob, bob_events) = join(&server.link(), &bob_identity, "波波");
 
     // 封：停下来，而且再也进不来
@@ -179,7 +195,11 @@ fn kick_ban_and_unban_from_the_client() {
         admin.roster().users.contains_key(&bob_session)
     });
     admin.ban(bob_session, "刷屏");
-    assert_refused_for_good(&bob_events, "封");
+    assert_refused_for_good(
+        &bob_events,
+        "封",
+        protocol::connection::ConnectionReason::Banned,
+    );
     eventually("封禁名单里有波波", || {
         admin
             .roster()

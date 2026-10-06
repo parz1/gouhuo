@@ -36,6 +36,40 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
+    /// Metadata for history/export; contains no address, invitation or remote detail.
+    pub fn connection_cause(&self) -> protocol::connection::ConnectionCause {
+        use protocol::connection::{ConnectionCause as Cause, ConnectionReason as Reason};
+        use protocol::control::rejected::Reason as Rejection;
+        let reason = match self {
+            Self::BadInvite(_) => Reason::InvalidInvite,
+            Self::Unreachable { source, .. } => match source.kind() {
+                std::io::ErrorKind::TimedOut => Reason::ConnectionTimeout,
+                std::io::ErrorKind::ConnectionRefused => Reason::ConnectionRefused,
+                _ => Reason::NetworkError,
+            },
+            Self::WrongCertificate(_) => Reason::CertificateMismatch,
+            Self::Tls(_) => Reason::TlsError,
+            Self::NotAGouhuoServer => Reason::ProtocolError,
+            Self::Io(source) => match source.kind() {
+                std::io::ErrorKind::TimedOut => Reason::ConnectionTimeout,
+                std::io::ErrorKind::UnexpectedEof => Reason::ReadError,
+                _ => Reason::NetworkError,
+            },
+            Self::Rejected { reason, .. } => {
+                return Cause::server(match reason {
+                    Rejection::InviteRequired => Reason::InviteRequired,
+                    Rejection::Full => Reason::ServerFull,
+                    Rejection::Banned => Reason::Banned,
+                    Rejection::VersionMismatch => Reason::VersionMismatch,
+                    Rejection::BadSignature => Reason::AuthenticationFailed,
+                    Rejection::Internal => Reason::ServerInternal,
+                    Rejection::Unspecified => Reason::Unknown,
+                })
+            }
+        };
+        Cause::local(reason)
+    }
+
     /// 一句话说清楚出了什么事。
     pub fn headline(&self) -> String {
         use protocol::control::rejected::Reason;
@@ -132,6 +166,20 @@ impl ConnectError {
     }
 }
 
+/// Preserve server evidence independently of the localized farewell text.
+pub fn farewell_cause(
+    reason: protocol::control::goodbye::Reason,
+) -> protocol::connection::ConnectionCause {
+    use protocol::connection::{ConnectionCause, ConnectionReason};
+    use protocol::control::goodbye::Reason;
+    ConnectionCause::server(match reason {
+        Reason::Displaced => ConnectionReason::Displaced,
+        Reason::Kicked => ConnectionReason::Kicked,
+        Reason::Banned => ConnectionReason::Banned,
+        Reason::Unspecified => ConnectionReason::Unknown,
+    })
+}
+
 /// 服务端说了 `Goodbye` 之后，给用户看的两行字：`(发生了什么, 现在该做什么)`。
 ///
 /// 跟 [`ConnectError`] 同一个规矩：两件事都要说到。
@@ -188,6 +236,45 @@ impl From<std::io::Error> for ConnectError {
 mod tests {
     use super::*;
     use protocol::control::rejected::Reason;
+
+    #[test]
+    fn local_failures_do_not_claim_a_remote_diagnosis() {
+        use protocol::connection::{ConnectionReason as R, EvidenceSource as S};
+        for (kind, expected) in [
+            (std::io::ErrorKind::TimedOut, R::ConnectionTimeout),
+            (std::io::ErrorKind::ConnectionRefused, R::ConnectionRefused),
+            (std::io::ErrorKind::ConnectionReset, R::NetworkError),
+        ] {
+            let error = ConnectError::Unreachable {
+                host: "private-host.invalid".into(),
+                port: 20800,
+                source: kind.into(),
+            };
+            let cause = error.connection_cause();
+            assert_eq!(cause.reason, expected);
+            assert_eq!(cause.source, S::LocalObservation);
+            assert!(!format!("{cause:?}").contains("private-host"));
+        }
+        let cause = ConnectError::Io(std::io::ErrorKind::UnexpectedEof.into()).connection_cause();
+        assert_eq!(cause.reason, R::ReadError);
+    }
+
+    #[test]
+    fn arbitrary_server_detail_does_not_change_or_leak_the_cause() {
+        use protocol::connection::{ConnectionReason as R, EvidenceSource as S};
+        let error = ConnectError::Rejected {
+            reason: Reason::Unspecified,
+            detail: "被踢 banned certificate gouhuo://secret".into(),
+        };
+        let cause = error.connection_cause();
+        assert_eq!(cause.reason, R::Unknown);
+        assert_eq!(cause.source, S::ServerConfirmed);
+        assert!(!format!("{cause:?}").contains("secret"));
+        assert_eq!(
+            farewell_cause(protocol::control::goodbye::Reason::Unspecified).reason,
+            R::Unknown
+        );
+    }
 
     /// 每一条错误都必须**既说发生了什么，又说该做什么**。
     ///

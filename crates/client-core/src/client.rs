@@ -173,7 +173,11 @@ pub enum Ended {
     /// 用户自己点了离开，或者在重连时点了取消。**不是错误**，界面别报错。
     ByUser,
     /// 被服务端拒之门外：顶号、被踢、被封，或者重连时碰上了再试也没用的错误。
-    Refused { headline: String, advice: String },
+    Refused {
+        headline: String,
+        advice: String,
+        cause: protocol::connection::ConnectionCause,
+    },
 }
 
 /// 一个会自己重连的连接把手。克隆出来的把手可以在任意线程上用，
@@ -730,7 +734,11 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     let reason = goodbye::Reason::try_from(bye.reason)
                         .unwrap_or(goodbye::Reason::Unspecified);
                     let (headline, advice) = farewell(reason, &bye.detail);
-                    return Outcome::Goodbye(Ended::Refused { headline, advice });
+                    return Outcome::Goodbye(Ended::Refused {
+                        headline,
+                        advice,
+                        cause: crate::error::farewell_cause(reason),
+                    });
                 }
                 for event in apply(&shared.roster, message) {
                     if tx.send(event).is_err() {
@@ -824,6 +832,7 @@ fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: String) -> Op
             Err(e) if e.is_retryable() => reason = e.headline(),
             Err(e) => {
                 let ended = Ended::Refused {
+                    cause: e.connection_cause(),
                     headline: e.headline(),
                     advice: e.advice(),
                 };

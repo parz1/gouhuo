@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod base32;
+pub mod connection;
 pub mod control;
 #[cfg(feature = "crypto")]
 mod crypto;
