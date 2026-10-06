@@ -155,6 +155,7 @@ component CallActions inherits Rectangle {
     in property <bool> deafened;
     in property <bool> compact;
     in property <int> focus-epoch;
+    in property <int> settings-focus;
     callback mute();
     callback deafen();
     callback settings();
@@ -192,6 +193,8 @@ component CallActions inherits Rectangle {
             height: 40px;
             icon: @image-url("icons/settings.svg");
             accessible-label: "设置";
+            focus-epoch: root.settings-focus;
+            init => { if (root.settings-focus > 0) { self.focus(); } }
             clicked => { root.settings(); }
             focused => { root.focused(); }
         }
@@ -215,6 +218,7 @@ export component SelfDock inherits Rectangle {
     in property <int> focus-epoch: 0;
     in property <int> mode-focus: 0;
     in property <int> identity-focus: 0;
+    in property <int> settings-focus: 0;
     out property <bool> compact: self.width < 736px;
     callback identity-details();
     callback mode-menu();
@@ -238,7 +242,7 @@ export component SelfDock inherits Rectangle {
             Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
             TalkStatus { min-width: 128px; height: 40px; horizontal-stretch: 1; ptt: root.ptt-mode; key-label: root.ptt-label; rebinding: root.rebinding; focus-epoch: root.mode-focus; status: root.status; sending: root.transmitting; change-mode => { root.mode-menu(); } bind-key => { root.rebind(); } cancel-bind => { root.cancel-rebind(); } focused => { root.focused(); } }
             Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
-            CallActions { width: 260px; height: 40px; muted: root.muted; deafened: root.deafened; compact: false; focus-epoch: root.focus-epoch; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
+            CallActions { width: 260px; height: 40px; muted: root.muted; deafened: root.deafened; compact: false; focus-epoch: root.focus-epoch; settings-focus: root.settings-focus; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
         }
         if root.compact: VerticalLayout {
             padding-left: 12px;
@@ -255,7 +259,7 @@ export component SelfDock inherits Rectangle {
                 Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
                 TalkStatus { preferred-width: 140px; height: 40px; min-width: 0; horizontal-stretch: 1.2; ptt: root.ptt-mode; key-label: root.ptt-label; rebinding: root.rebinding; focus-epoch: root.mode-focus; status: root.status; sending: root.transmitting; change-mode => { root.mode-menu(); } bind-key => { root.rebind(); } cancel-bind => { root.cancel-rebind(); } focused => { root.focused(); } }
             }
-            CallActions { height: 40px; muted: root.muted; deafened: root.deafened; compact: true; focus-epoch: root.focus-epoch; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
+            CallActions { height: 40px; muted: root.muted; deafened: root.deafened; compact: true; focus-epoch: root.focus-epoch; settings-focus: root.settings-focus; mute => { root.toggle-mute(); } deafen => { root.toggle-deafen(); } settings => { root.settings(); } focused => { root.focused(); } }
         }
     }
 }

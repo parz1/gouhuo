@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $root
+$targetDir = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR) } else { Join-Path $root 'target' }
 
 # ---- 版本号 ----
 $inWorkspace = $false
@@ -55,15 +56,15 @@ if (-not $SkipBuild) {
     $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 }
-$exe = Join-Path $root "target\dist\gouhuo.exe"
+$exe = Join-Path $targetDir "dist\gouhuo.exe"
 if (-not (Test-Path $exe)) { throw "没有 $exe —— 去掉 -SkipBuild 再跑一次" }
-$voiceExe = Join-Path $root "target\dist\gouhuo-voice.exe"
+$voiceExe = Join-Path $targetDir "dist\gouhuo-voice.exe"
 if (-not (Test-Path $voiceExe)) { throw "没有 $voiceExe —— 去掉 -SkipBuild 再跑一次" }
 
 # ---- 打包 ----
-& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DVoiceExePath=$voiceExe" "/DOutputDir=$(Join-Path $root 'target\installer')" `
+& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DVoiceExePath=$voiceExe" "/DOutputDir=$(Join-Path $targetDir 'installer')" `
     (Join-Path $PSScriptRoot "gouhuo.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
 
-$setup = Join-Path $root "target\installer\gouhuo-setup-$version.exe"
+$setup = Join-Path $targetDir "installer\gouhuo-setup-$version.exe"
 & (Join-Path $PSScriptRoot 'check-size.ps1') -InstallerPath $setup

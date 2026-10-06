@@ -93,15 +93,25 @@ impl CallController {
                 if name.trim().is_empty() {
                     return CommandResult::Ignored(IgnoreReason::EmptyText);
                 }
-                {
+                let parent = {
                     let roster = client.roster();
+                    // The desktop passes zero for the root, matching Client's API.
+                    let parent = if parent == 0 {
+                        let Some(root) = roster.root() else {
+                            return CommandResult::Ignored(IgnoreReason::MissingChannel);
+                        };
+                        root
+                    } else {
+                        parent
+                    };
                     if !roster.channels.contains_key(&parent) {
                         return CommandResult::Ignored(IgnoreReason::MissingChannel);
                     }
                     if !roster.can_create_channel() {
                         return CommandResult::Ignored(IgnoreReason::NotPermitted);
                     }
-                }
+                    parent
+                };
                 client.create_channel(&name, parent);
                 CommandResult::Applied
             }
@@ -481,6 +491,35 @@ mod tests {
                 percent: 0
             }),
             CommandResult::Ignored(IgnoreReason::MissingMember)
+        );
+    }
+
+    #[test]
+    fn desktop_create_channel_resolves_zero_to_the_actual_root() {
+        let fixture = Fixture::new();
+        let root = fixture.client.roster().root().unwrap();
+        assert_ne!(root, 0, "exercise the desktop root sentinel");
+        assert_eq!(
+            fixture.dispatch(CallCommand::CreateChannel {
+                name: "desktop-room".into(),
+                parent: 0,
+            }),
+            CommandResult::Applied
+        );
+        wait(|| {
+            fixture
+                .client
+                .roster()
+                .channels
+                .values()
+                .any(|channel| channel.name == "desktop-room" && channel.parent_id == root)
+        });
+        assert_eq!(
+            fixture.dispatch(CallCommand::CreateChannel {
+                name: "missing-parent-room".into(),
+                parent: u32::MAX,
+            }),
+            CommandResult::Ignored(IgnoreReason::MissingChannel)
         );
     }
 

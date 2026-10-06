@@ -111,7 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var_os("GOUHUO_PREVIEW_OUTPUT").unwrap_or_else(|| "docs/design/rebuild".into()),
     );
     std::fs::create_dir_all(&folder)?;
-    if std::env::args().any(|arg| arg == "--settings-only") {
+    let settings_keyboard_only = std::env::args().any(|arg| arg == "--settings-keyboard-only");
+    if settings_keyboard_only || std::env::args().any(|arg| arg == "--settings-only") {
         let downloads = Rc::new(std::cell::Cell::new(0));
         let count = downloads.clone();
         app.on_download_update(move || count.set(count.get() + 1));
@@ -124,101 +125,207 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Rc::new(slint::VecModel::from(vec!["系统默认扬声器".into()])).into(),
         );
         app.set_capture_in_use("系统默认麦克风".into());
-        for (w, h) in [(400, 360), (760, 520), (1000, 720)] {
-            for tab in 0..4 {
-                app.set_settings_tab(tab);
-                render(
-                    &window,
-                    w,
-                    h,
-                    1.0,
-                    &folder.join(format!("settings-{tab}-{w}.png")),
-                );
-            }
-            app.set_settings_tab(3);
-            for status in 0..5 {
-                app.set_update_status(status);
-                app.set_update_checked(status == 2 || status == 3);
-                app.set_update_version(if status == 3 { "0.4.0" } else { "" }.into());
-                app.set_update_error(
-                    if status == 4 {
-                        "暂时无法连接发布服务，请检查网络后重试。"
-                    } else {
-                        ""
-                    }
-                    .into(),
-                );
-                render(
-                    &window,
-                    w,
-                    h,
-                    1.0,
-                    &folder.join(format!("update-{status}-{w}.png")),
-                );
-            }
-            app.set_update_status(3);
-            app.set_update_version("0.4.0".into());
-            app.set_update_error("".into());
-            app.set_update_source("官方更新源".into());
-            app.set_update_notes("改善设置页与更新提醒。\n新增官方更新源，失败时自动切换 GitHub。\n安装后保留原有身份和偏好设置。".into());
-            app.set_update_has_download(true);
-            app.set_show_update_dialog(true);
+        if settings_keyboard_only {
+            app.set_settings_tab(0);
             render(
                 &window,
-                w,
-                h,
+                400,
+                360,
                 1.0,
-                &folder.join(format!("update-dialog-{w}.png")),
+                &folder.join("keyboard-navigation-before.png"),
             );
-            let dialog_w = (w as f32 - 32.0).min(440.0);
-            let dialog_h = (h as f32 - 32.0).min(520.0);
-            let button_x =
-                (w as f32 - dialog_w) / 2.0 + 24.0 + (dialog_w - 64.0) / 3.0 * 2.5 + 16.0;
-            let button_y = (h as f32 - dialog_h) / 2.0 + dialog_h - 42.0;
-            let before = downloads.get();
-            click(&app, button_x, button_y);
+            click(&app, 80.0, 122.0);
+            key(&app, slint::platform::Key::Tab);
+            key(&app, " ");
             assert_eq!(
-                downloads.get(),
-                before + 1,
-                "installer button must dispatch its own action"
+                app.get_settings_tab(),
+                1,
+                "Tab from the audio category must reach notifications and Space must activate it"
             );
-            key(&app, slint::platform::Key::Escape);
-            assert!(
-                !app.get_show_update_dialog(),
-                "Escape must close the update dialog"
-            );
+            key(&app, slint::platform::Key::Tab);
+            key(&app, slint::platform::Key::Return);
             assert_eq!(
-                app.get_update_version(),
-                "0.4.0",
-                "dismissal preserves release information"
-            );
-            app.set_show_update_dialog(true);
-            render(
-                &window,
-                w,
-                h,
-                1.0,
-                &folder.join(format!("update-dialog-keyboard-{w}.png")),
+                app.get_settings_tab(),
+                2,
+                "Tab and Return must reach general settings"
             );
             key(&app, slint::platform::Key::Tab);
             key(&app, " ");
-            assert!(
-                !app.get_show_update_dialog(),
-                "the close button must work with Tab and Space"
+            assert_eq!(
+                app.get_settings_tab(),
+                3,
+                "Tab and Space must reach updates"
             );
-            app.set_show_update_dialog(true);
             render(
                 &window,
-                w,
-                h,
+                400,
+                360,
                 1.0,
-                &folder.join(format!("update-dialog-backdrop-{w}.png")),
+                &folder.join("keyboard-navigation-after.png"),
             );
-            click(&app, 2.0, 2.0);
-            assert!(
-                !app.get_show_update_dialog(),
-                "the backdrop must dismiss the dialog"
-            );
+            for (width, height, gear_x, gear_y) in
+                [(400, 360, 370.0, 331.0), (760, 520, 730.0, 487.0)]
+            {
+                app.set_show_settings(false);
+                app.set_settings_tab(0);
+                render(
+                    &window,
+                    width,
+                    height,
+                    1.0,
+                    &folder.join(format!("settings-trigger-{width}.png")),
+                );
+                click(&app, gear_x, gear_y);
+                assert!(
+                    app.get_show_settings(),
+                    "the real settings trigger must open settings"
+                );
+                render(
+                    &window,
+                    width,
+                    height,
+                    1.0,
+                    &folder.join(format!("settings-entry-focus-{width}.png")),
+                );
+                key(&app, slint::platform::Key::Tab);
+                key(&app, " ");
+                assert_eq!(
+                    app.get_settings_tab(),
+                    1,
+                    "opening settings must focus the selected audio category"
+                );
+                click(&app, 24.0, 38.0);
+                assert!(!app.get_show_settings());
+                render(
+                    &window,
+                    width,
+                    height,
+                    1.0,
+                    &folder.join(format!("settings-return-focus-{width}.png")),
+                );
+                key(&app, " ");
+                assert!(
+                    app.get_show_settings(),
+                    "returning from settings must restore focus to its trigger"
+                );
+                render(
+                    &window,
+                    width,
+                    height,
+                    1.0,
+                    &folder.join(format!("settings-reopened-{width}.png")),
+                );
+                click(&app, 24.0, 38.0);
+                render(
+                    &window,
+                    width,
+                    height,
+                    1.0,
+                    &folder.join(format!("settings-closed-{width}.png")),
+                );
+            }
+            println!("Settings category keyboard traversal passed.");
+            return Ok(());
+        }
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let folder = folder.join(format!("settings-{}pct", (scale * 100.0) as u32));
+            std::fs::create_dir_all(&folder)?;
+            for (w, h) in [(400, 360), (760, 520), (1000, 720)] {
+                for tab in 0..4 {
+                    app.set_settings_tab(tab);
+                    render(
+                        &window,
+                        w,
+                        h,
+                        scale,
+                        &folder.join(format!("settings-{tab}-{w}.png")),
+                    );
+                }
+                app.set_settings_tab(3);
+                for status in 0..5 {
+                    app.set_update_status(status);
+                    app.set_update_checked(status == 2 || status == 3);
+                    app.set_update_version(if status == 3 { "0.4.0" } else { "" }.into());
+                    app.set_update_error(
+                        if status == 4 {
+                            "暂时无法连接发布服务，请检查网络后重试。"
+                        } else {
+                            ""
+                        }
+                        .into(),
+                    );
+                    render(
+                        &window,
+                        w,
+                        h,
+                        scale,
+                        &folder.join(format!("update-{status}-{w}.png")),
+                    );
+                }
+                app.set_update_status(3);
+                app.set_update_version("0.4.0".into());
+                app.set_update_error("".into());
+                app.set_update_source("官方更新源".into());
+                app.set_update_notes("改善设置页与更新提醒。\n新增官方更新源，失败时自动切换 GitHub。\n安装后保留原有身份和偏好设置。".into());
+                app.set_update_has_download(true);
+                app.set_show_update_dialog(true);
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("update-dialog-{w}.png")),
+                );
+                let dialog_w = (w as f32 - 32.0).min(440.0);
+                let dialog_h = (h as f32 - 32.0).min(520.0);
+                let button_x =
+                    (w as f32 - dialog_w) / 2.0 + 24.0 + (dialog_w - 64.0) / 3.0 * 2.5 + 16.0;
+                let button_y = (h as f32 - dialog_h) / 2.0 + dialog_h - 42.0;
+                let before = downloads.get();
+                click(&app, button_x, button_y);
+                assert_eq!(
+                    downloads.get(),
+                    before + 1,
+                    "installer button must dispatch its own action"
+                );
+                key(&app, slint::platform::Key::Escape);
+                assert!(
+                    !app.get_show_update_dialog(),
+                    "Escape must close the update dialog"
+                );
+                assert_eq!(
+                    app.get_update_version(),
+                    "0.4.0",
+                    "dismissal preserves release information"
+                );
+                app.set_show_update_dialog(true);
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("update-dialog-keyboard-{w}.png")),
+                );
+                key(&app, slint::platform::Key::Tab);
+                key(&app, " ");
+                assert!(
+                    !app.get_show_update_dialog(),
+                    "the close button must work with Tab and Space"
+                );
+                app.set_show_update_dialog(true);
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("update-dialog-backdrop-{w}.png")),
+                );
+                click(&app, 2.0, 2.0);
+                assert!(
+                    !app.get_show_update_dialog(),
+                    "the backdrop must dismiss the dialog"
+                );
+            }
         }
         app.set_settings_tab(0);
         render(
@@ -234,6 +341,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             3,
             "update tab must respond to pointer input"
         );
+        // Regression: switching categories must discard the previous scroll offset.
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            app.set_ptt_mode(false);
+            app.set_settings_tab(3);
+            let suffix = (scale * 100.0) as u32;
+            render(
+                &window,
+                400,
+                360,
+                scale,
+                &folder.join(format!("category-before-scroll-{suffix}.png")),
+            );
+            app.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(300.0, 220.0),
+                delta_x: 0.0,
+                delta_y: -250.0,
+            });
+            render(
+                &window,
+                400,
+                360,
+                scale,
+                &folder.join(format!("category-scrolled-{suffix}.png")),
+            );
+            click(&app, 80.0, 122.0);
+            assert_eq!(app.get_settings_tab(), 0);
+            render(
+                &window,
+                400,
+                360,
+                scale,
+                &folder.join(format!("category-reset-{suffix}.png")),
+            );
+            click(&app, 310.0, 186.0);
+            assert!(app.get_ptt_mode(), "switching categories after scrolling must leave the new mode control reachable ({scale}x DPI)");
+        }
         println!(
             "Settings sections and update states rendered; navigation and dialog dismissal passed."
         );

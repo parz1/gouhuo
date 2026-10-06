@@ -17,6 +17,7 @@ component NavigationItem inherits Rectangle {
     accessible-label: root.label + (root.badge ? "，有新版本" : "");
     accessible-action-default => { root.clicked(); }
     forward-focus: keyboard;
+    init => { if (root.selected) { keyboard.focus(); } }
     keyboard := FocusScope {
         key-pressed(event) => {
             if (event.text == " " || event.text == Key.Return) { root.clicked(); return accept; }

@@ -13,11 +13,15 @@
 .\packaging\windows\build.ps1 -SkipBuild   # exe 已经编好了，只打包
 ```
 
-打包结束自动检查完整安装包：防回归闸 **< 10 MB**，产品线 **< 60 MB**，
+打包结束自动检查完整安装包：防回归闸 **< 20 MB**，产品线 **< 60 MB**，
 MB = 1,000,000 字节。阈值只定义在 `crates/voice-core/src/redline.rs`，
 超限会使脚本失败；release.yml 调用此脚本，因此失败时不会上传 Windows 发布资产。
 已有包可单独检查：`./packaging/windows/check-size.ps1 -InstallerPath target/installer/gouhuo-setup-0.2.2.exe`。
 调整回归闸需重新测量并更新实测记录。
+
+#44 的 20 MB 预算、候选包来源和验收进度见 [0.3.3 验收记录](../../docs/ui-validation-0.3.3.md)。
+设置 CARGO_TARGET_DIR 后，构建和安装包输出均使用该目录。
+隔离实际安装／升级可使用 scripts/install-validation-package.ps1；资源对照使用 scripts/measure-client-resources.ps1。
 
 ## 几个不能随手改的地方
 

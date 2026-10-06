@@ -217,6 +217,7 @@ export component App inherits Window {
         root.diagnostics-open = false;
         root.draft = "";
         root.member-id = -1;
+        root.settings-return-focus = 0;
     }
     changed chat-count => {
         if (root.chat-open) {
@@ -246,6 +247,7 @@ export component App inherits Window {
     // ---- 设置 ----
     in-out property <bool> show-settings: false;
     in-out property <int> settings-tab: 0;
+    property <int> settings-return-focus: 0;
     property <length> settings-sidebar-width: root.width < 600px ? 112px : 196px;
     in-out property <bool> ptt-mode: false;
     /// 按住说话绑的键，给人看的名字。空表示还没绑。
@@ -442,6 +444,7 @@ export component App inherits Window {
     // =======================================================================
     if root.connected && !root.show-settings: CallPage {
         preview-enabled: root.preview-enabled;
+        settings-focus: root.settings-return-focus;
         preview-key(key) => { root.preview-key(key); }
         server-name: root.server-name;
         channel-name: root.channel-name;
@@ -516,11 +519,17 @@ export component App inherits Window {
             selected: root.settings-tab;
             version: root.current-version;
             has-update: root.update-version != "";
-            select(index) => { root.settings-tab = index; }
-            back => { root.toggle-settings(); }
+            select(index) => {
+                if (root.settings-tab != index) {
+                    settings-scroll.content-y = 0px;
+                    settings-scroll.content-x = 0px;
+                    root.settings-tab = index;
+                }
+            }
+            back => { root.toggle-settings(); if (root.connected) { root.settings-return-focus += 1; } }
         }
         Rectangle { width: 1px; background: Theme.line; }
-        ScrollView {
+        settings-scroll := ScrollView {
             vertical-stretch: 1;
             HorizontalLayout {
                 alignment: center;

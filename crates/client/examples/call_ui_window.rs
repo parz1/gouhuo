@@ -16,6 +16,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let app = App::new()?;
     let fixture = fixture::Fixture::install(&app);
     app.window().set_size(slint::LogicalSize::new(760.0, 520.0));
+    app.set_current_version(env!("CARGO_PKG_VERSION").into());
+    if std::env::args().any(|arg| arg == "--minimum") {
+        app.window().set_size(slint::LogicalSize::new(400.0, 360.0));
+    }
+    if std::env::args().any(|arg| arg == "--settings") {
+        app.set_show_settings(true);
+    }
     let state = Rc::new(Cell::new(0usize));
     let weak = app.as_weak();
     let preview = fixture.clone();
