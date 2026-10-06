@@ -35,6 +35,8 @@ pub enum ConnectionReason {
     CertificateMismatch,
     ProtocolError,
     ControlBackpressure,
+    ControlQueueUnavailable,
+    TransportRestartRequested,
 }
 
 impl ConnectionReason {
@@ -64,6 +66,8 @@ impl ConnectionReason {
             Self::CertificateMismatch => "certificate_mismatch",
             Self::ProtocolError => "protocol_error",
             Self::ControlBackpressure => "control_backpressure",
+            Self::ControlQueueUnavailable => "control_queue_unavailable",
+            Self::TransportRestartRequested => "transport_restart_requested",
         }
     }
 }

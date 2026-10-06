@@ -316,7 +316,19 @@ fn notices_a_silently_dead_connection() {
     .unwrap();
 
     proxy.set(BLACKHOLE);
-    wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let event = wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let Event::Reconnecting { cause, attempt, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(attempt, 1);
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::HeartbeatTimeout
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::LocalObservation
+    );
 
     // 网回来了
     proxy.set(PASS);
@@ -495,7 +507,18 @@ fn requested_reconnect_restores_channel_and_self_state() {
     });
     let session = client.session_id();
     client.reconnect_transport();
-    wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let event = wait_for(&events, |e| matches!(e, Event::Reconnecting { .. }));
+    let Event::Reconnecting { cause, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        cause.reason,
+        protocol::connection::ConnectionReason::TransportRestartRequested
+    );
+    assert_eq!(
+        cause.source,
+        protocol::connection::EvidenceSource::LocalObservation
+    );
     wait_for(&events, |e| matches!(e, Event::Reconnected));
     assert_ne!(session, client.session_id());
     let (voice_session, addr, keys) = client.voice_endpoint_session();
