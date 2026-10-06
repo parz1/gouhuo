@@ -134,7 +134,7 @@ fn assert_refused_for_good(
     assert!(
         events
             .try_iter()
-            .all(|e| !matches!(e, Event::Reconnecting { .. } | Event::Reconnected)),
+            .all(|e| !matches!(e, Event::Reconnecting { .. } | Event::Reconnected { .. })),
         "被请出去的人在背后重连"
     );
 }

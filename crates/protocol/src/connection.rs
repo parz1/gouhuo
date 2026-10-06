@@ -4,6 +4,11 @@
 //! A local timeout describes an observation, never a diagnosis of the remote host.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "connection-serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(feature = "connection-serde", serde(rename_all = "snake_case"))]
 pub enum EvidenceSource {
     LocalObservation,
     ServerConfirmed,
@@ -11,9 +16,16 @@ pub enum EvidenceSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "connection-serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(feature = "connection-serde", serde(rename_all = "snake_case"))]
 pub enum ConnectionReason {
     Unknown,
     UserLeft,
+    JoinCancelled,
+    ApplicationExit,
     ReconnectCancelled,
     Kicked,
     Banned,
@@ -45,6 +57,8 @@ impl ConnectionReason {
         match self {
             Self::Unknown => "unknown",
             Self::UserLeft => "user_left",
+            Self::JoinCancelled => "join_cancelled",
+            Self::ApplicationExit => "application_exit",
             Self::ReconnectCancelled => "reconnect_cancelled",
             Self::Kicked => "kicked",
             Self::Banned => "banned",
@@ -73,6 +87,12 @@ impl ConnectionReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "connection-serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(feature = "connection-serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "connection-serde", serde(deny_unknown_fields))]
 pub struct ConnectionCause {
     pub reason: ConnectionReason,
     pub source: EvidenceSource,

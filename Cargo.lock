@@ -869,6 +869,7 @@ version = "0.3.3"
 dependencies = [
  "client-runtime",
  "ed25519-dalek",
+ "getrandom 0.3.4",
  "protocol",
  "serde",
  "serde_json",
@@ -4172,6 +4173,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "serde",
  "sha2",
 ]
 

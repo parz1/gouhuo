@@ -18,6 +18,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_LIMIT: usize = 8;
 
+pub mod history;
 pub mod update;
 
 struct State {

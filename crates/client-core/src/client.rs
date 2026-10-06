@@ -158,13 +158,16 @@ pub enum Event {
         retry_in: Duration,
         reason: String,
         cause: ConnectionCause,
+        session: u32,
     },
     /// 重新认证成功，恢复原频道和自身状态的命令已经排队。
     /// 名单广播随后确认服务端实际应用的状态。
     ///
     /// **会话 id、UDP 端口、语音密钥全都换了**（旧密钥的序号空间不能复用，
     /// 见 `protocol::crypto`），所以语音链路要按 [`Client`] 上的新值重起。
-    Reconnected,
+    Reconnected {
+        session: u32,
+    },
     /// 连接彻底结束了，不会再重连。
     Disconnected(Ended),
 }
@@ -846,6 +849,7 @@ fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: LinkFailure) 
             retry_in,
             reason: reason.message.clone(),
             cause: reason.cause,
+            session: shared.link().session_id,
         };
         if tx.send(notice).is_err() {
             shared.closing.store(true, Ordering::SeqCst);
@@ -865,7 +869,13 @@ fn reconnect(shared: &Arc<Shared>, tx: &Sender<Event>, mut reason: LinkFailure) 
                     return None;
                 }
                 install(shared, link, &welcome, wanted.as_ref());
-                if tx.send(Event::Reconnected).is_err() || tx.send(Event::RosterChanged).is_err() {
+                if tx
+                    .send(Event::Reconnected {
+                        session: welcome.session_id,
+                    })
+                    .is_err()
+                    || tx.send(Event::RosterChanged).is_err()
+                {
                     shared.closing.store(true, Ordering::SeqCst);
                     return None;
                 }

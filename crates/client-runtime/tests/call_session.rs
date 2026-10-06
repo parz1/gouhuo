@@ -551,7 +551,7 @@ fn real_tls_udp_call_lifecycle_and_projection() {
                         assert!(stale.members.iter().all(|m| !m.speaking));
                         assert!(stale.rows.iter().all(|r| !r.speaking));
                     }
-                    Event::Reconnected => {
+                    Event::Reconnected { .. } => {
                         assert!(saw_reconnecting, "reconnected before interruption event");
                         member.call.connected();
                         member.handle().clear_volumes();

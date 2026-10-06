@@ -208,7 +208,7 @@ pub fn run_bot(
                             json!({"event":"tcp_reconnecting", "bot":index + 1, "elapsed_ms":epoch.elapsed().as_millis() as u64, "attempt":attempt, "reason":reason}),
                         )?;
                     }
-                    Event::Reconnected => {
+                    Event::Reconnected { .. } => {
                         proxy = Some(start(&client, &handle, &cfg, epoch, index)?);
                         generation += 1;
                         reconnecting = false;
