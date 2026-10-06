@@ -187,7 +187,7 @@ PTT 后续接收验收改用有界 `gouhuo-bot --silent`，只接收并记录统
 
 下一步先在原渲染器上对静态成员/导航等子树缓存进行对照，验证收益、状态变化与内存代价；软件渲染的收益不直接作为替换默认渲染器的依据。Slint 的 [缓存提示说明](https://docs.slint.dev/latest/docs/slint/reference/common/#cache-rendering-hint) 明确指出缓存有内存代价、且不是所有后端都支持；因此需实际对照。
 
-完整 UI 改造前的官方 0.2.2 安装包已下载，8,023,011 字节及官方 SHA-256 `F22A2203BC26219191F280EE7D3DB123808488CB1A0296B7620950DD92F7BCDA` 核对一致，证据在 `target/issue-44/baseline/pre-ui/download-verified.json`。该版本仍未执行，不将下载核验计作历史性能对照完成。
+完整 UI 改造前的官方 0.2.2 安装包已下载，8,023,011 字节及官方 SHA-256 `F22A2203BC26219191F280EE7D3DB123808488CB1A0296B7620950DD92F7BCDA` 核对一致，证据在 `target/issue-44/baseline/pre-ui/download-verified.json`。随后已执行隔离安装及两个基线样本，范围和未完成项见文末；未完成完整历史性能对照。
 
 
 ## 用户桌面启动及静态缓存对照补充
@@ -224,3 +224,15 @@ PTT 后续接收验收改用有界 `gouhuo-bot --silent`，只接收并记录统
 动态成本主要在 UI 线程。本轮未复现此前约 2% 的静态开销，不将此前静态开销归因为固定后台线程，亦不将跨轮差值当作修复收益。持续前台、遮挡和可访问性激活时刻仍未独立验证；所有数字属于离线 fixture，不替代通话资源验收。原始报告、日志及二进制/报告 SHA-256 为 `target/issue-44/render-cost/thread-cpu-default.*`、`thread-cpu-inputs.json`。
 
 526cd2b 的 CI 37456516794 在 Windows 全仓 all-targets Clippy 失败：静态 call_ui_preview 也引用 fixture，但不用 advance_scene，触发 dead_code；其后测试与界面验证没有执行。此前本地仅单个原生示例 Clippy 通过，不能代表全目标通过。现为仅由动态示例使用的方法标注明确的预期用途，修复静态示例严格检查；不放宽全仓警告规则。原始失败日志保留在 GitHub Actions，后续修正必须以全仓 all-targets 检查结果为依据。
+
+## 验证范围收敛（2026-10-06）
+
+停止追加离线渲染与历史性能实验，后续开发转入 #47；#44 保持开放，不将剩余人工验收当成完成。当前正式发布仍为 0.3.2，交付候选为 0.3.3。0.2.2 仅作为 UI 改造前的历史测试基线。
+
+历史包安装在 `target/issue-44/resources/pre-ui/baseline-installed`，使用独立 APPDATA。安装退出码为 0，安装位置、显示版本和协议注册均已恢复，证据为该目录旁 `install/registration-restored.json`。测试程序已正常离开并退出，随后重新启动原隔离配置下的 0.3.3 候选及其语音子进程。
+
+旧版单进程包含语音处理；30 秒前台/最小化样本总单核 CPU 分别为 7.316% / 2.265%，工作集均值分别约 104.25 MB / 89.51 MB。原始文件为 `baseline-foreground.json`、`baseline-minimized.json`。未完成旧版托盘和相同条件的新候选配对，不能据此计算 UI 改造收益或判定产品线通过。
+
+安装与采样脚本显式增加 `-InProcessBaseline`，仅接受 0.2.2 单进程布局；默认仍要求独立语音引擎。两份脚本语法检查通过，历史分支已实际执行；当前候选默认分支完成 5 秒功能检查，错误布局明确拒绝。该功能检查不纳入性能验收。
+
+剩余验收：真实 Windows 系统 DPI / 跨屏缩放、PTT 长按及有效语音操作、完整前后资源配对、同屏全屏应用覆盖下动画暂停，以及依赖实现合入后的 milestone 收尾。真人音质、完整游戏帧时间和专用延迟 runner 继续由 #35、#12、#13 跟进，不扩入本任务。当前修正提交 79b4bb5 的 CI 37459032532 仍在运行，不能宣称通过。
