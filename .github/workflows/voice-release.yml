@@ -3,6 +3,12 @@ name: voice-release
 on:
   push:
     tags: ["voice-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing voice-v* tag to build with this workflow
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -10,19 +16,26 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  VOICE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          if ($env:VOICE_TAG -notmatch '^voice-v\d+\.\d+\.\d+$') { throw 'Invalid voice release tag' }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VOICE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Validate independent version
         shell: pwsh
         run: |
-          $version = (Select-String crates/voice-engine/Cargo.toml '^version = "([^"]+)"$').Matches[0].Groups[1].Value
-          if ("${{ github.ref_name }}" -ne "voice-v$version") { throw 'Voice tag/version mismatch' }
+          $version = (Select-String -Path crates/voice-engine/Cargo.toml -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
+          if ($env:VOICE_TAG -ne "voice-v$version") { throw 'Voice tag/version mismatch' }
           "VOICE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Test process host
         run: cargo test --locked -p voice-engine --test process
@@ -41,5 +54,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" --draft --verify-tag --latest=false --title "声音内核 $env:VOICE_VERSION" --notes '独立声音内核。先验证签名与兼容性，再在安全空闲点激活。' target/voice-release/*
+          gh release create "$env:VOICE_TAG" --draft --verify-tag --latest=false --title "声音内核 $env:VOICE_VERSION" --notes '独立声音内核。先验证签名与兼容性，再在安全空闲点激活。' target/voice-release/*
           if ($LASTEXITCODE -ne 0) { throw 'Voice draft release failed' }

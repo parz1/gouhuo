@@ -13,8 +13,8 @@ permissions:
 
 jobs:
   latest:
-    # 预发布版不挪 latest，想试的人自己写死版本号。
-    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
+    # voice-v* 也以 v 开头，必须显式排除独立内核；预发布版也不挪 latest。
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') && !startsWith(github.event.release.tag_name, 'voice-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: docker/setup-buildx-action@v3

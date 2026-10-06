@@ -4,7 +4,7 @@
 
 ## 当前实现
 
-桌面安装包包含 `gouhuo.exe` 和 `gouhuo-voice.exe`。UI 通过 `client-process` 代理启动声音子进程；内核独立版本目前为 **0.1.0**，IPC 为 **1**。声音内核可单独构建，UI 正式依赖树没有 Opus、APM 或 `voice-engine`。已实现独立发布查询、HTTPS 下载、签名校验、版本暂存、空闲切换和启动回退。2026-10-06 已配置 GitHub 正式签名 Secret 与公钥 Variable；尚未公开发布独立内核。
+桌面安装包包含 `gouhuo.exe` 和 `gouhuo-voice.exe`。UI 通过 `client-process` 代理启动声音子进程；客户端 v0.3.2 随包内核为 **0.1.0**，正式独立内核为 **0.1.1**，IPC 为 **1**。声音内核可单独构建，UI 正式依赖树没有 Opus、APM 或 `voice-engine`。已实现独立发布查询、HTTPS 下载、签名校验、版本暂存、空闲切换和启动回退。2026-10-06 已完成正式签名配置、客户端与独立内核公开发布，以及真实 HTTPS 下载验收，见 [发布记录](release-0.3.2.md)。
 
 | 所有者 | 内容 |
 | --- | --- |
@@ -47,7 +47,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 资源测量脚本统计 UI 与声音子进程总开销。既有 CPU、内存和声卡性能数字来自拆分前，仍需重测。当前带正式公钥的双进程本地安装包为 8,364,816 字节，通过原有 10 MB 门禁，构建记录见 [测量记录](measurements.md)。
 
-独立发布清单、可信签名、公钥固定、兼容版本选择、版本目录、空闲激活和启动回退的实现见下节。正式密钥配置和真实声卡功能验收已完成；剩余为实际签名发布的 HTTPS 验收与人工人声／听感验收。首版在通话、试麦和扫描结束后的安全空闲点切换；不承诺通话内无缝替换。
+独立发布清单、可信签名、公钥固定、兼容版本选择、版本目录、空闲激活和启动回退的实现见下节。正式密钥配置、真实声卡设备生命周期与正式发布 HTTPS 验收已完成；人工人声／听感及真实声学 AEC 仍待后续验收。首版在通话、试麦和扫描结束后的安全空闲点切换；不承诺通话内无缝替换。
 
 ## 独立发布与安全切换
 
@@ -66,13 +66,13 @@ UI 的编译期 `GOUHUO_VOICE_PUBLIC_KEY` 固定信任公钥；运行时配置�
 # 不放在命令参数、文件或仓库里。GOUHUO_VOICE_PUBLIC_KEY 为对应的 64 字符十六进制公钥。
 # 先将 voice-engine/Cargo.toml 版本改为 0.1.1 并单独构建；内核握手版本必须匹配清单。
 cargo build --profile dist -p voice-engine --bin gouhuo-voice
-cargo run -p client-process --bin gouhuo-voice-release -- sign target/dist/gouhuo-voice.exe 0.1.1 0.3.1 target/voice-release
+cargo run -p client-process --bin gouhuo-voice-release -- sign target/dist/gouhuo-voice.exe 0.1.1 0.3.2 target/voice-release
 
 # 暂存已下载并经过签名校验的版本；已有通话和试麦不会被打断。
-cargo run -p client-process --bin gouhuo-voice-release -- stage "$env:APPDATA\gouhuo\voice-engines" $env:GOUHUO_VOICE_PUBLIC_KEY target/voice-release/gouhuo-voice-0.1.1-windows-x64.exe target/voice-release/manifest.json target/voice-release/manifest.sig 0.3.1
+cargo run -p client-process --bin gouhuo-voice-release -- stage "$env:APPDATA\gouhuo\voice-engines" $env:GOUHUO_VOICE_PUBLIC_KEY target/voice-release/gouhuo-voice-0.1.1-windows-x64.exe target/voice-release/manifest.json target/voice-release/manifest.sig 0.3.2
 ```
 
-`.github/workflows/voice-release.yml` 响应 voice-v*，检查标签与内核版本、测试真实进程、只编译内核、签署清单，创建 `--latest=false` 的独立草稿。正式密钥后续配置为 GitHub secret GOUHUO_VOICE_SIGNING_KEY 与 variable GOUHUO_VOICE_PUBLIC_KEY；两者不匹配则发布构建失败。普通 UI release 使用同一公钥 variable。docker-latest 仅响应 v* 应用发布。
+`.github/workflows/voice-release.yml` 响应 voice-v*，也支持通过 workflow_dispatch 指定现有内核标签重跑；检查标签与内核版本、测试真实进程、只编译内核、签署清单，创建 `--latest=false` 的独立草稿。正式密钥已配置为 GitHub secret GOUHUO_VOICE_SIGNING_KEY 与 variable GOUHUO_VOICE_PUBLIC_KEY；两者不匹配则发布构建失败。普通 UI release 使用同一公钥 variable；客户端构建和 docker-latest 显式排除 voice-v*。
 
 ### 自动发现与下载
 
@@ -82,7 +82,7 @@ Windows 使用 WinHTTP 的系统证书与代理。每跳都限制 HTTPS 和 GitH
 
 设置中的「检查更新」同时控制查询、下载和激活。关闭时取消正在进行的任务；快速关闭再打开也会使旧任务失效。已暂存候选保留，关闭期间重启也不激活它；已验证的当前内核仍可启动。重新开启后恢复查询与空闲激活。未配置公钥时不创建网络更新任务。
 
-下载测试覆盖数字版本排序、兼容性筛选、签名拒绝、内容篡改、内存限制、取消和设置关闭后的候选保留；真实 WinHTTP 已验证公开发布索引读取。完整签名下载链路使用测试 fixture，真实子进程测试覆盖暂存后的切换与回退。正式密钥已配置，实际签名内核尚未公开发布；固定测试密钥仅用于 fixture。
+下载测试覆盖数字版本排序、兼容性筛选、签名拒绝、内容篡改、内存限制、取消和设置关闭后的候选保留；真实子进程测试覆盖暂存后的切换与回退。公开发布后另行运行 published_release_updates_idle_bundled_engine，通过真实 WinHTTP 下载正式签名内核，验证 0.1.0 → 0.1.1 空闲切换和更新后合成试麦。固定测试密钥仅用于 fixture。
 
 ### 可重复更新演练
 
@@ -94,7 +94,7 @@ Windows 使用 WinHTTP 的系统证书与代理。每跳都限制 HTTPS 和 GitH
 
 ### 正式启用与人工验收
 
-正式密钥已配置到 GitHub secret `GOUHUO_VOICE_SIGNING_KEY` 与 variable `GOUHUO_VOICE_PUBLIC_KEY`。仍需发布一次带固定公钥的 UI；之后发布兼容的 `voice-v*` 内核即可。生产私钥不得使用 fixture seed，生产公钥不能取自测试向量。发布时复核 CI 生成的草稿与签名，首个正式签名发布的实际 HTTPS 下载链路需在隔离用户目录复验。
+正式密钥已配置到 GitHub secret `GOUHUO_VOICE_SIGNING_KEY` 与 variable `GOUHUO_VOICE_PUBLIC_KEY`。客户端 v0.3.2 已固定正式公钥并公开发布；之后发布兼容的 `voice-v*` 内核即可。生产私钥不得使用 fixture seed，生产公钥不能取自测试向量。发布时复核 CI 生成的草稿与签名，实际 HTTPS 下载链路在隔离更新存储目录复验；首个正式发布 voice-v0.1.1 已完成该验证。
 
 首次配置工具为 `./scripts/configure-voice-signing.ps1`，需要 Windows、PowerShell 7、Node.js、已认证的 gh，以及已构建的签名工具和 dist 内核。它生成 Ed25519 正式密钥，先验证 DPAPI 加密备份、Rust 签名及独立 Node 验签，再以标准输入上传私钥 Secret，并读取确认公钥 Variable。检测到已有任一配置就停止，不自动覆盖或轮换。私钥不输出、不进命令参数、不保存为明文文件或进入仓库；加密备份位于当前用户 `%LOCALAPPDATA%\gouhuo-release-signing\parz1-gouhuo\voice-signing-key.dpapi`，目录仅授予当前用户访问。
 
