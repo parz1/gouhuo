@@ -87,6 +87,44 @@ fn multiple_identities_exchange_real_encrypted_audio() {
 }
 
 #[test]
+fn keepalive_only_does_not_report_a_voice_sender() {
+    let (invite, hub) = server();
+    let mut receiver = config(&invite, 3);
+    receiver.silent = true;
+    let reports = run(vec![receiver], &hub);
+    let finished = reports.iter().find(|r| r["event"] == "finished").unwrap();
+    assert_eq!(finished["udp_ok"], true);
+    assert!(finished["received"].as_u64().unwrap() > 0);
+    assert_eq!(finished["speaking_sessions"], serde_json::json!([]));
+}
+
+#[test]
+fn encrypted_silent_voice_still_reports_the_actual_sender() {
+    let (invite, hub) = server();
+    let mut sender = config(&invite, 3);
+    sender.gain = 0.0;
+    let mut receiver = config(&invite, 3);
+    receiver.silent = true;
+    let reports = run(vec![sender, receiver], &hub);
+    let sender_session = reports
+        .iter()
+        .find(|r| r["event"] == "connected" && r["bot"] == 1)
+        .unwrap()["session"]
+        .as_u64()
+        .unwrap();
+    let samples: Vec<_> = reports
+        .iter()
+        .filter(|r| r["event"] == "sample" && r["bot"] == 2)
+        .collect();
+    assert!(samples.iter().any(|r| r["speaking_sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_u64() == Some(sender_session))));
+    assert!(samples.iter().all(|r| r["audible_frames"] == 0));
+}
+
+#[test]
 fn echo_returns_audio_to_the_original_sender() {
     let (invite, hub) = server();
     let mut echo = config(&invite, 3);
