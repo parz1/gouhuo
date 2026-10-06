@@ -6,12 +6,20 @@ param(
     [Parameter(Mandatory = $true)][int]$ClientPid,
     [Parameter(Mandatory = $true)][string]$State,
     [Parameter(Mandatory = $true)][string]$OutFile,
-    [ValidateRange(5, 300)][int]$Seconds = 30
+    [ValidateRange(5, 300)][int]$Seconds = 30,
+    [switch]$InProcessBaseline
 )
 $ErrorActionPreference = 'Stop'
 $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ClientPid AND Name='gouhuo-voice.exe'")
-if ($children.Count -ne 1) { throw 'Expected one stable voice child.' }
-$processes = @((Get-Process -Id $ClientPid), (Get-Process -Id $children[0].ProcessId))
+$clientProcess = Get-Process -Id $ClientPid
+if ($InProcessBaseline) {
+    if ($children.Count -ne 0) { throw 'In-process baseline unexpectedly has a voice child.' }
+    if ($clientProcess.FileVersion -notmatch '^0\.2\.2(?:\.0)?$') { throw 'In-process sampling is only valid for the official 0.2.2 baseline.' }
+    $processes = @($clientProcess)
+} else {
+    if ($children.Count -ne 1) { throw 'Expected one stable voice child.' }
+    $processes = @($clientProcess, (Get-Process -Id $children[0].ProcessId))
+}
 $startTimes = @($processes | ForEach-Object { $_.StartTime.ToUniversalTime().ToString('o') })
 $imagePaths = @($processes | ForEach-Object { $_.Path })
 $imageHashes = @($imagePaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
@@ -37,7 +45,7 @@ for ($i = 0; $i -lt $Seconds; $i++) {
 $clock.Stop()
 # Verify both endpoints of the measurement. This does not claim continuous child inventory.
 $finalChildren = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ClientPid AND Name='gouhuo-voice.exe'")
-if ($finalChildren.Count -ne 1 -or $finalChildren[0].ProcessId -ne $children[0].ProcessId) {
+if ($finalChildren.Count -ne $children.Count -or (-not $InProcessBaseline -and $finalChildren[0].ProcessId -ne $children[0].ProcessId)) {
     throw 'Voice child inventory changed; measurement invalid.'
 }
 for ($n = 0; $n -lt $processes.Count; $n++) {
@@ -51,24 +59,24 @@ for ($n = 0; $n -lt $processes.Count; $n++) {
 }
 $cpu = @()
 # Use CPU values from the timed last sample, excluding verification overhead.
-$lastSampleCpu = @($samples[-1].ui_cpu_s, $samples[-1].engine_cpu_s)
+$lastSampleCpu = if ($InProcessBaseline) { @($samples[-1].ui_cpu_s) } else { @($samples[-1].ui_cpu_s, $samples[-1].engine_cpu_s) }
 for ($n = 0; $n -lt $processes.Count; $n++) { $cpu += ($lastSampleCpu[$n] - $initialCpu[$n]) / $clock.Elapsed.TotalSeconds * 100 }
 $ws = @($samples | ForEach-Object { $_.ui_working_set_bytes + $_.engine_working_set_bytes })
 $private = @($samples | ForEach-Object { $_.ui_private_bytes + $_.engine_private_bytes })
 $machineCpu = Get-CimInstance Win32_Processor | Select-Object Name,NumberOfLogicalProcessors
 $machineOs = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize
 $result = [ordered]@{
-    schema = 2; state = $State; started_utc = $started.ToString('o'); elapsed_s = $clock.Elapsed.TotalSeconds
+    schema = 3; process_layout = $(if ($InProcessBaseline) { 'in-process-baseline' } else { 'split-process' }); state = $State; started_utc = $started.ToString('o'); elapsed_s = $clock.Elapsed.TotalSeconds
     environment = [ordered]@{ processors = @($machineCpu); os = $machineOs }
-    cpu_basis = 'single core percent; UI plus one unchanged child; no normalization by logical CPUs'
-    ui_cpu_percent = $cpu[0]; engine_cpu_percent = $cpu[1]; total_cpu_percent = $cpu[0] + $cpu[1]
+    cpu_basis = $(if ($InProcessBaseline) { 'single core percent; entire client including in-process voice; no normalization by logical CPUs' } else { 'single core percent; UI plus one unchanged child; no normalization by logical CPUs' })
+    ui_cpu_percent = $cpu[0]; engine_cpu_percent = $(if ($InProcessBaseline) { $null } else { $cpu[1] }); total_cpu_percent = ($cpu | Measure-Object -Sum).Sum
     total_working_set_mean_bytes = ($ws | Measure-Object -Average).Average
     total_working_set_peak_bytes = ($ws | Measure-Object -Maximum).Maximum
     total_private_mean_bytes = ($private | Measure-Object -Average).Average
     total_private_peak_bytes = ($private | Measure-Object -Maximum).Maximum
     verification = [ordered]@{
         executable_hashes_unchanged = $true
-        child_inventory_at_start_and_end = 'one same voice child'
+        child_inventory_at_start_and_end = $(if ($InProcessBaseline) { 'no voice child' } else { 'one same voice child' })
         comparison_scope = 'individual sample; matching UI state, settings, engine and accessibility conditions must be established separately'
     }
     processes = @(for ($n = 0; $n -lt $processes.Count; $n++) {

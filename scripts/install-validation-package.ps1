@@ -5,7 +5,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$Installer,
     [Parameter(Mandatory=$true)][string]$AppDir,
-    [Parameter(Mandatory=$true)][string]$EvidenceDir
+    [Parameter(Mandatory=$true)][string]$EvidenceDir,
+    [switch]$InProcessBaseline
 )
 $ErrorActionPreference='Stop'
 $package=(Resolve-Path -LiteralPath $Installer).Path
@@ -33,12 +34,19 @@ try {
     if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
     $installed=Get-ItemProperty ('Registry::'+$uninstall)
     if ($installed.InstallLocation.TrimEnd('\') -ne $testDir) { throw 'Installer did not honor the isolated directory.' }
-    $files=@('gouhuo.exe','gouhuo-voice.exe','LICENSE.txt') | ForEach-Object {
+    if ($InProcessBaseline -and $installed.DisplayVersion -ne '0.2.2') {
+        throw 'In-process baseline mode is only valid for the official 0.2.2 baseline.'
+    }
+    if ($InProcessBaseline -and (Test-Path -LiteralPath (Join-Path $testDir 'gouhuo-voice.exe'))) {
+        throw 'The in-process baseline directory contains an unexpected voice engine.'
+    }
+    $requiredFiles=if ($InProcessBaseline) { @('gouhuo.exe','LICENSE.txt') } else { @('gouhuo.exe','gouhuo-voice.exe','LICENSE.txt') }
+    $files=$requiredFiles | ForEach-Object {
         $path=Join-Path $testDir $_
         $item=Get-Item -LiteralPath $path
         [ordered]@{name=$item.Name;bytes=$item.Length;sha256=(Get-FileHash -LiteralPath $path).Hash;version=$item.VersionInfo.FileVersion}
     }
-    [ordered]@{schema=1;installer_sha256=(Get-FileHash -LiteralPath $package).Hash;exit_code=$setup.ExitCode;display_version=$installed.DisplayVersion;files=$files} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'installed.json') -Encoding utf8
+    [ordered]@{schema=2;process_layout=$(if ($InProcessBaseline) { 'in-process-baseline' } else { 'split-process' });installer_sha256=(Get-FileHash -LiteralPath $package).Hash;exit_code=$setup.ExitCode;display_version=$installed.DisplayVersion;files=$files} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'installed.json') -Encoding utf8
 } finally {
     foreach ($backup in $backups) {
         if ($backup.exists) { & reg.exe import $backup.file | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'Registry restoration failed; backup retained.' } }

@@ -11,6 +11,8 @@ mod campfire;
 #[allow(dead_code)]
 #[path = "../src/call/fixture.rs"]
 mod fixture;
+#[path = "support/render_cost.rs"]
+mod render_cost;
 
 fn main() -> Result<(), slint::PlatformError> {
     let app = App::new()?;
@@ -40,5 +42,6 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
     });
+    let _measurement = render_cost::install(&app, fixture);
     app.run()
 }
