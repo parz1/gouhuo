@@ -20,6 +20,62 @@ use voice_types::TransmitMode;
 const ENGINE: &str = env!("CARGO_BIN_EXE_gouhuo-voice");
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a public signed release, formal public key and isolated verification root"]
+fn published_release_updates_idle_bundled_engine() {
+    use client_process::update::{
+        download::{check_and_stage, https::Https},
+        unhex, Compatibility, EngineStore,
+    };
+    use std::{fs, path::PathBuf};
+    let root =
+        PathBuf::from(std::env::var_os("GOUHUO_RELEASE_VERIFY_ROOT").expect("isolated root"));
+    let bundled = std::env::var_os("GOUHUO_RELEASE_BUNDLED_ENGINE").expect("frozen bundled engine");
+    let public = std::env::var("GOUHUO_RELEASE_PUBLIC_KEY").expect("formal public key");
+    let store = Arc::new(
+        EngineStore::new(
+            root.join("store"),
+            unhex::<32>(&public).unwrap(),
+            Compatibility {
+                target: "windows-x64".into(),
+                ipc: ipc::VERSION,
+                server_protocol: protocol::control::PROTOCOL_VERSION,
+                ui: "0.3.2".into(),
+                bundled: "0.1.0".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let runtime =
+        VoiceRuntime::managed_with_args(bundled, vec!["--synthetic".into()], Arc::clone(&store))
+            .unwrap();
+    let handle = runtime.handle();
+    wait(|| handle.engine_version() == "0.1.0");
+    let original_pid = handle.process_id();
+    let version = check_and_stage(&mut Https, &store, &|| true)
+        .unwrap()
+        .expect("new signed release");
+    assert_eq!(version, "0.1.1");
+    assert!(handle.activate_pending());
+    wait(|| {
+        handle.engine_version() == version
+            && handle.process_id().is_some()
+            && handle.process_id() != original_pid
+            && handle.snapshot().stage == RuntimeStage::Idle
+    });
+    handle.start_mic_check(Devices::default());
+    wait(|| handle.snapshot().mic.is_some_and(|mic| mic.input_available));
+    let updated_pid = handle.process_id();
+    handle.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    fs::write(root.join("report.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "transport":"real system HTTPS to public GitHub release", "signature":"formal Ed25519 key",
+        "bundled":"0.1.0", "updated":version, "original_pid":original_pid,
+        "updated_pid":updated_pid, "activation":"idle", "audio":"synthetic", "mic_after_update":true
+    })).unwrap()).unwrap();
+}
+
 fn next_version(offset: u64) -> String {
     let version = client_process::update::Version::parse(ENGINE_VERSION).unwrap();
     format!(
