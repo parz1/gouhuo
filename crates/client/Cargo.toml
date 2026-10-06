@@ -18,6 +18,8 @@ client-runtime.workspace = true
 client-process.workspace = true
 voice-types.workspace = true
 protocol.workspace = true
+serde_json = "1"
+url = "2"
 # Only identity/global hotkeys remain here; audio lives in gouhuo-voice.
 voice-core.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06"] }

@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { Theme, Btn } from "theme.slint";
+
+component NavigationItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected;
+    in property <bool> compact;
+    in property <bool> badge;
+    callback clicked();
+    height: 44px;
+    border-radius: 8px;
+    background: root.selected ? #25334b : touch.has-hover ? Theme.hover : transparent;
+    border-width: keyboard.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    accessible-role: button;
+    accessible-label: root.label + (root.badge ? "，有新版本" : "");
+    accessible-action-default => { root.clicked(); }
+    forward-focus: keyboard;
+    keyboard := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+    if root.selected: Rectangle {
+        x: 0; y: 12px; width: 3px; height: 20px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    HorizontalLayout {
+        padding-left: root.compact ? 10px : 14px;
+        padding-right: 10px;
+        spacing: 10px;
+        if !root.compact: Image {
+            width: 18px; height: 18px;
+            y: (parent.height - self.height) / 2;
+            source: root.icon;
+            colorize: root.selected ? #97baff : Theme.dim;
+        }
+        Text {
+            text: root.label;
+            color: root.selected ? #c5d9ff : Theme.dim;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if root.badge: Rectangle {
+            width: 5px; height: 5px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 3px;
+            background: Theme.accent;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { keyboard.focus(); root.clicked(); }
+    }
+}
+
+export component SettingsSidebar inherits Rectangle {
+    in property <int> selected;
+    in property <string> version;
+    in property <bool> has-update;
+    callback select(int);
+    callback back();
+    property <bool> compact: root.width < 160px;
+    background: Theme.panel;
+    HorizontalLayout {
+        x: root.compact ? 8px : 16px;
+        y: 20px;
+        width: parent.width - self.x * 2;
+        height: 36px;
+        spacing: 10px;
+        Btn { width: 32px; label: "←"; accessible-label: "返回"; clicked => { root.back(); } }
+        Text { text: "设置"; color: Theme.text; font-size: 18px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+    }
+    Text { x: 16px; y: 76px; text: "偏好设置"; color: Theme.faint; font-size: 11px; }
+    for title[i] in ["音频与说话", "通知", "常规", "版本更新"]: NavigationItem {
+        x: root.compact ? 8px : 12px;
+        y: 100px + i * 48px;
+        width: parent.width - self.x * 2;
+        label: title;
+        icon: i == 0 ? @image-url("call/icons/mic.svg") : i == 1 ? @image-url("icons/bell.svg") : i == 2 ? @image-url("call/icons/settings.svg") : @image-url("icons/update.svg");
+        selected: root.selected == i;
+        compact: root.compact;
+        badge: i == 3 && root.has-update;
+        clicked => { root.select(i); }
+    }
+    VerticalLayout {
+        x: 16px; y: parent.height - 52px;
+        width: parent.width - 32px;
+        height: 36px;
+        spacing: 5px;
+        Text { text: "更改自动保存"; color: Theme.dim; font-size: 11px; }
+        Text { text: "篝火  v" + root.version; color: Theme.faint; font-size: 10px; overflow: elide; }
+    }
+}

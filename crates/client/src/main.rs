@@ -332,6 +332,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
 
 /// 检查更新：开关、「去下载」，以及启动时查一次。
 fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
+    app.set_current_version(env!("CARGO_PKG_VERSION").into());
     {
         let state = Arc::clone(state);
         let weak = app.as_weak();
@@ -347,22 +348,74 @@ fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
             }
         });
     }
-    // 查到的发布页地址。只有检查更新那条路会写它，而且只写 GitHub 上本仓库的地址。
-    let url = Arc::new(Mutex::new(String::new()));
+    // 检查结果提供的发布页与安装包地址；官方清单要求它们与更新源同源。
+    let url = Arc::new(Mutex::new((String::new(), String::new())));
     {
         let url = Arc::clone(&url);
-        app.on_open_update(move || open_in_browser(&url.lock().expect("url poisoned")));
+        app.on_open_update(move || open_in_browser(&url.lock().expect("url poisoned").0));
     }
-    if !state.lock().expect("state poisoned").settings.check_updates {
-        return;
+    {
+        let url = Arc::clone(&url);
+        app.on_download_update(move || open_in_browser(&url.lock().expect("url poisoned").1));
     }
-    let weak = app.as_weak();
-    update::check_in_background(move |available| {
-        let _ = weak.upgrade_in_event_loop(move |app| {
-            *url.lock().expect("url poisoned") = available.url;
-            app.set_update_version(available.version.into());
-        });
-    });
+    let start: Rc<dyn Fn(bool)> = {
+        let weak = app.as_weak();
+        Rc::new(move |manual| {
+            let Some(app) = weak.upgrade() else { return };
+            if app.get_update_status() == 1 {
+                return;
+            }
+            app.set_update_status(1);
+            app.set_update_error("".into());
+            let weak = weak.clone();
+            let url = url.clone();
+            update::check_in_background(manual, move |result| {
+                let _ = weak.upgrade_in_event_loop(move |app| match result {
+                    update::CheckResult::Available(available) => {
+                        app.set_update_has_download(!available.download_url.is_empty());
+                        app.set_update_notes(available.notes.into());
+                        app.set_update_source(available.source.into());
+                        *url.lock().expect("url poisoned") =
+                            (available.url, available.download_url);
+                        app.set_update_version(available.version.clone().into());
+                        app.set_update_reminder_version(available.version.into());
+                        app.set_update_status(3);
+                        app.set_update_checked(true);
+                        if manual {
+                            app.set_show_update_dialog(true);
+                        }
+                    }
+                    update::CheckResult::Current => {
+                        app.set_update_status(2);
+                        app.set_update_checked(true);
+                        app.set_update_version("".into());
+                        app.set_update_reminder_version("".into());
+                        app.set_show_update_dialog(false);
+                        *url.lock().expect("url poisoned") = (String::new(), String::new());
+                        app.set_update_has_download(false);
+                        app.set_update_notes("".into());
+                    }
+                    update::CheckResult::Failed => {
+                        app.set_update_status(if app.get_update_version().is_empty() {
+                            4
+                        } else {
+                            3
+                        });
+                        app.set_update_error("暂时无法连接发布服务，请检查网络后重试。".into());
+                    }
+                });
+            });
+        })
+    };
+    {
+        let start = start.clone();
+        app.on_check_update_now(move || start(true));
+    }
+    if state.lock().expect("state poisoned").settings.check_updates
+        && update::automatic_check_enabled()
+    {
+        start(false);
+    }
 }
 
 #[cfg(windows)]

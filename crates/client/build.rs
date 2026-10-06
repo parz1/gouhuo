@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=GOUHUO_UPDATE_BASE_URL");
     // fluent-dark 只影响 std-widgets 里那几个控件（这里用到的是 ScrollView）。
     // 别的都是自己画的，见 ui/theme.slint。
     let config = slint_build::CompilerConfiguration::new().with_style("fluent-dark".into());

@@ -22,12 +22,15 @@ mod fixture;
 struct PreviewPlatform {
     window: Rc<MinimalSoftwareWindow>,
 }
+thread_local! {
+    static PREVIEW_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(1)) };
+}
 impl Platform for PreviewPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
         Ok(self.window.clone())
     }
     fn duration_since_start(&self) -> Duration {
-        Duration::from_secs(1)
+        PREVIEW_TIME.with(|time| time.get())
     }
 }
 
@@ -39,6 +42,8 @@ fn render(window: &MinimalSoftwareWindow, w: u32, h: u32, scale: f32, path: &std
     let physical = window.size();
     // First draw resolves layout callbacks and prepares the official scene fixture.
     for iteration in 0..3 {
+        PREVIEW_TIME.with(|time| time.set(time.get() + Duration::from_millis(200)));
+        slint::platform::update_timers_and_animations();
         let mut pixels =
             slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(physical.width, physical.height);
         window.request_redraw();
@@ -102,8 +107,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::new()?;
     let fixture = fixture::Fixture::install(&app);
     app.show()?;
-    let folder = std::path::Path::new("docs/design/rebuild");
-    std::fs::create_dir_all(folder)?;
+    let folder = std::path::PathBuf::from(
+        std::env::var_os("GOUHUO_PREVIEW_OUTPUT").unwrap_or_else(|| "docs/design/rebuild".into()),
+    );
+    std::fs::create_dir_all(&folder)?;
+    if std::env::args().any(|arg| arg == "--settings-only") {
+        let downloads = Rc::new(std::cell::Cell::new(0));
+        let count = downloads.clone();
+        app.on_download_update(move || count.set(count.get() + 1));
+        app.set_show_settings(true);
+        app.set_current_version(env!("CARGO_PKG_VERSION").into());
+        app.set_capture_devices(
+            Rc::new(slint::VecModel::from(vec!["系统默认麦克风".into()])).into(),
+        );
+        app.set_render_devices(
+            Rc::new(slint::VecModel::from(vec!["系统默认扬声器".into()])).into(),
+        );
+        app.set_capture_in_use("系统默认麦克风".into());
+        for (w, h) in [(400, 360), (760, 520), (1000, 720)] {
+            for tab in 0..4 {
+                app.set_settings_tab(tab);
+                render(
+                    &window,
+                    w,
+                    h,
+                    1.0,
+                    &folder.join(format!("settings-{tab}-{w}.png")),
+                );
+            }
+            app.set_settings_tab(3);
+            for status in 0..5 {
+                app.set_update_status(status);
+                app.set_update_checked(status == 2 || status == 3);
+                app.set_update_version(if status == 3 { "0.4.0" } else { "" }.into());
+                app.set_update_error(
+                    if status == 4 {
+                        "暂时无法连接发布服务，请检查网络后重试。"
+                    } else {
+                        ""
+                    }
+                    .into(),
+                );
+                render(
+                    &window,
+                    w,
+                    h,
+                    1.0,
+                    &folder.join(format!("update-{status}-{w}.png")),
+                );
+            }
+            app.set_update_status(3);
+            app.set_update_version("0.4.0".into());
+            app.set_update_error("".into());
+            app.set_update_source("官方更新源".into());
+            app.set_update_notes("改善设置页与更新提醒。\n新增官方更新源，失败时自动切换 GitHub。\n安装后保留原有身份和偏好设置。".into());
+            app.set_update_has_download(true);
+            app.set_show_update_dialog(true);
+            render(
+                &window,
+                w,
+                h,
+                1.0,
+                &folder.join(format!("update-dialog-{w}.png")),
+            );
+            let dialog_w = (w as f32 - 32.0).min(440.0);
+            let dialog_h = (h as f32 - 32.0).min(520.0);
+            let button_x =
+                (w as f32 - dialog_w) / 2.0 + 24.0 + (dialog_w - 64.0) / 3.0 * 2.5 + 16.0;
+            let button_y = (h as f32 - dialog_h) / 2.0 + dialog_h - 42.0;
+            let before = downloads.get();
+            click(&app, button_x, button_y);
+            assert_eq!(
+                downloads.get(),
+                before + 1,
+                "installer button must dispatch its own action"
+            );
+            key(&app, slint::platform::Key::Escape);
+            assert!(
+                !app.get_show_update_dialog(),
+                "Escape must close the update dialog"
+            );
+            assert_eq!(
+                app.get_update_version(),
+                "0.4.0",
+                "dismissal preserves release information"
+            );
+            app.set_show_update_dialog(true);
+            render(
+                &window,
+                w,
+                h,
+                1.0,
+                &folder.join(format!("update-dialog-keyboard-{w}.png")),
+            );
+            key(&app, slint::platform::Key::Tab);
+            key(&app, " ");
+            assert!(
+                !app.get_show_update_dialog(),
+                "the close button must work with Tab and Space"
+            );
+            app.set_show_update_dialog(true);
+            render(
+                &window,
+                w,
+                h,
+                1.0,
+                &folder.join(format!("update-dialog-backdrop-{w}.png")),
+            );
+            click(&app, 2.0, 2.0);
+            assert!(
+                !app.get_show_update_dialog(),
+                "the backdrop must dismiss the dialog"
+            );
+        }
+        app.set_settings_tab(0);
+        render(
+            &window,
+            760,
+            520,
+            1.0,
+            &folder.join("settings-navigation.png"),
+        );
+        click(&app, 80.0, 266.0);
+        assert_eq!(
+            app.get_settings_tab(),
+            3,
+            "update tab must respond to pointer input"
+        );
+        println!(
+            "Settings sections and update states rendered; navigation and dialog dismissal passed."
+        );
+        return Ok(());
+    }
     let quick = std::env::args().any(|arg| arg == "--quick");
     if !quick {
         for (w, h) in [

@@ -44,6 +44,19 @@ export component Btn inherits Rectangle {
     accessible-label: root.label;
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: keyboard;
+    border-width: keyboard.has-focus ? 2px : 0px;
+    border-color: Theme.accent-hover;
+    keyboard := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return || event.text == "\n") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
 
     height: 36px;
     border-radius: Theme.radius;
@@ -59,6 +72,7 @@ export component Btn inherits Rectangle {
         color: root.enabled ? (root.primary ? #ffffff : Theme.text) : Theme.faint;
         font-family: Theme.font;
         font-size: 14px;
+        overflow: elide;
         horizontal-alignment: center;
         vertical-alignment: center;
         width: 100%;
@@ -68,7 +82,7 @@ export component Btn inherits Rectangle {
     touch := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        clicked => { keyboard.focus(); root.clicked(); }
     }
 }
 
