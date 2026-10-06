@@ -657,3 +657,11 @@ UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产
 使用公开 RFC 测试公钥构建启用更新器的安装包，仅验证完整更新器代码的打包体积：**8,364,113 字节 / 8.364113 十进制 MB**，SHA-256 `2DD1DFCE5F979324A4DBD0902FB7399B83C24436C686B19296ED4C99B1E5DA2E`，通过原有 10 MB 门禁。它仅保留为 target/voice-update-final/TEST-KEY-ONLY-gouhuo-setup-0.3.1.exe，不安装或发布；没有生成正式密钥。随后移除测试公钥并重新构建默认交付候选。体积与哈希机器记录保存为 target/voice-update-final/test-pin-package.json 与 artifacts.json。
 
 最终交付候选包含 8a365cd 的空闲恢复修复，未配置公钥，继续使用随包内核：UI 16,907,264 字节，SHA-256 `290AD3A3B3029EE6CC72C682B5F313EC59EF943B6BB1AE18B49FFC7BB4EBBF5A`；内核 1,867,776 字节，哈希同前。安装包 **8,346,256 字节 / 8.346256 十进制 MB**，SHA-256 `3AB51C9DA2D146DF740C9C12EDCAF582DC1CD1B6BA7BC830A413F3031A827638`，通过原有 10 MB 门禁。未安装或发布。日志为 target/voice-update-test-pin-dist.log 和 voice-update-final-dist.log。
+
+### 正式签名配置与公钥安装包（2026-10-06）
+
+用户明确授权后，通过 scripts/configure-voice-signing.ps1 生成全新 Ed25519 正式密钥。生成前确认 parz1/gouhuo 没有同名配置，随后设置 Actions Secret GOUHUO_VOICE_SIGNING_KEY 与 Variable GOUHUO_VOICE_PUBLIC_KEY。公钥为 `bb1e9c9b6be7a377c0ee5505c9e8d4c54493fd6254829bfa2b1515bd7a4571c9`；私钥未输出、未写明文文件或进入仓库，Secret 通过标准输入上传。
+
+当前 Windows 用户的 LocalAppData/gouhuo-release-signing/parz1-gouhuo/voice-signing-key.dpapi 保存 DPAPI 加密备份，已验证解密一致性，目录 ACL 仅当前用户 FullControl，禁止继承。此备份绑定用户，需要另行安全迁移才能用于换机恢复。正式私钥经已有 Rust 工具签署内核清单，Node 独立验签通过；签名样本保留在 target/voice-production-key-check/6a63c36f3a8740739cd4ded9879900bd，仅用于本地验证，未发布。GitHub Secret 名称与公钥值已确认；再次运行脚本被拒绝，Secret 更新时间与公钥保持不变。
+
+从 GitHub Variable 读取正式公钥重新打包：UI **16,962,048 字节**，SHA-256 `06112ADD2BEA1559F506E296143F44729911003DEAFB4B1F3CC102EF967042C2`；内核 1,867,776 字节，哈希同前。完整安装包 **8,364,816 字节 / 8.364816 十进制 MB**，SHA-256 `38B61970F5E395FDD50B33FA939C2CCFE4AAC5ED9E937E8353BF2F408B3A73ED`，通过原有 10 MB 门禁。新包已启用独立更新器，但没有实际签名独立内核公开发布；未安装或发布此包，人工试听仍待后续安排。构建日志与机器记录为 target/voice-production-key-dist.log、voice-production-key-artifacts.json。此轮新增配置脚本完成语法与实际配置验证，没有改动声音算法或重复全量回归。
