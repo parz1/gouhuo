@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { Theme, Btn } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component HistoryPanel inherits VerticalLayout {
+    in property <string> summary;
+    in property <string> report;
+    in property <string> warning;
+    in property <string> status;
+    in property <bool> busy;
+    in property <bool> available;
+    in property <int> focus-epoch;
+    changed focus-epoch => { clear-button.focus(); }
+    callback refresh();
+    callback export();
+    callback clear();
+    spacing: 12px;
+    Text { text: root.summary; color: Theme.text; font-size: 15px; wrap: word-wrap; }
+    Text { text: "连接状态自动保存在本机，不包含聊天、音频或邀请链接。"; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
+    HorizontalLayout {
+        spacing: 8px;
+        Btn { label: "刷新"; width: 56px; clicked => { root.refresh(); } }
+        Btn { label: "导出脱敏记录"; enabled: root.available && !root.busy; primary: true; clicked => { root.export(); } }
+    }
+    clear-button := Btn { label: "清除历史…"; enabled: root.available && !root.busy; clicked => { root.clear(); } }
+    if root.status != "": Text { text: root.status; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
+    if root.warning != "": Text { text: root.warning; color: Theme.warn; font-size: 12px; wrap: word-wrap; }
+    ScrollView {
+        height: 320px;
+        VerticalLayout {
+            padding: 12px;
+            Text { text: root.report; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+        }
+    }
+}
+
+export component ClearHistoryDialog inherits Rectangle {
+    callback dismiss();
+    callback confirm();
+    background: #000000b0;
+    property <bool> confirm-focused: false;
+    forward-focus: dialog-focus;
+    dialog-focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Tab) {
+                root.confirm-focused = !root.confirm-focused;
+                if (root.confirm-focused) { confirm-button.focus(); } else { cancel.focus(); }
+                return accept;
+            }
+            if (event.text == Key.Escape) { root.dismiss(); return accept; }
+            return reject;
+        }
+        TouchArea { clicked => { root.dismiss(); } }
+        dialog := Rectangle {
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            width: min(420px, root.width - 24px);
+            height: min(280px, root.height - 24px);
+            background: Theme.panel;
+            border-radius: 12px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+                Text { text: "清除连接历史？"; color: Theme.text; font-size: 18px; font-weight: 600; }
+                Text { text: "本机历史和恢复副本将被清除。之后的新连接仍会记录，已导出的文件会保留。"; color: Theme.dim; font-size: 13px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    cancel := Btn { label: "保留记录"; clicked => { root.dismiss(); } }
+                    confirm-button := Btn { label: "确认清除"; clicked => { root.confirm(); } }
+                }
+            }
+        }
+    }
+    init => { cancel.focus(); }
+}

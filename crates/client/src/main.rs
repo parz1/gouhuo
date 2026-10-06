@@ -68,6 +68,7 @@ mod call;
 mod campfire;
 mod discover;
 mod engine_update;
+mod history_view;
 mod join;
 mod settings;
 mod single_instance;
@@ -575,6 +576,8 @@ struct State {
     history_journey: Option<client_process::history::Journey>,
     history_generation: u64,
     history_attempt: u32,
+    history_operation: Option<std::sync::mpsc::Receiver<client_process::history::OperationResult>>,
+    history_view_version: Option<(u64, u64, u64, bool)>,
     client: Option<Client>,
     call: CallState,
     recovery: client_runtime::health::CallHealth,
@@ -1791,11 +1794,51 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
     {
         let weak = app.as_weak();
         let state = Arc::clone(state);
+        app.on_refresh_history(move || {
+            if let Some(app) = weak.upgrade() {
+                refresh_history(&app, &state);
+            }
+        });
+    }
+    for clear in [false, true] {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        let action = move || {
+            if let Some(app) = weak.upgrade() {
+                begin_history_operation(&app, &state, clear);
+            }
+        };
+        if clear {
+            app.on_clear_history(action);
+        } else {
+            app.on_export_history(action);
+        }
+    }
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_settings_category_changed(move |category| {
+            let Some(app) = weak.upgrade() else { return };
+            if category == 0 {
+                start_mic_check(&app, &state);
+            } else {
+                stop_mic_check(&state);
+                sync_audio(&app, &state);
+            }
+            if category == 4 {
+                refresh_history(&app, &state);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
         app.on_toggle_settings(move || {
             let Some(app) = weak.upgrade() else { return };
             let opening = !app.get_show_settings();
             app.set_show_settings(opening);
-            if opening {
+            if opening && app.get_settings_tab() == 0 {
                 // 没连服务器也要能看电平、能试听 —— 这正是连不上时最想知道的事。
                 start_mic_check(&app, &state);
             } else {
@@ -1896,6 +1939,91 @@ fn transmit_mode(settings: &Settings) -> TransmitMode {
     }
 }
 
+fn refresh_history(app: &App, state: &Mutex<State>) {
+    let handle = state.lock().expect("state poisoned").history.clone();
+    let Some(handle) = handle else {
+        app.set_history_available(false);
+        app.set_history_summary("连接历史暂不可用".into());
+        app.set_history_report("无法启动历史记录线程，通话仍可继续。".into());
+        return;
+    };
+    let version = handle.view_version();
+    let view = history_view::project(&handle.snapshot());
+    app.set_history_available(true);
+    app.set_history_summary(view.summary.into());
+    app.set_history_report(view.report.into());
+    app.set_history_warning(view.warning.into());
+    state.lock().expect("state poisoned").history_view_version = Some(version);
+}
+
+fn begin_history_operation(app: &App, state: &Mutex<State>, clear: bool) {
+    let mut locked = state.lock().expect("state poisoned");
+    if locked.history_operation.is_some() {
+        return;
+    }
+    let reply = locked.history.as_ref().and_then(|handle| {
+        if clear {
+            handle.request_clear()
+        } else {
+            handle.request_export()
+        }
+    });
+    if let Some(reply) = reply {
+        locked.history_operation = Some(reply);
+        app.set_history_busy(true);
+        app.set_history_status(
+            if clear {
+                "正在清除…"
+            } else {
+                "正在导出…"
+            }
+            .into(),
+        );
+    } else {
+        app.set_history_status("操作未排入队列，请稍后再试。".into());
+    }
+}
+
+fn poll_history(app: &App, state: &Mutex<State>) {
+    use client_process::history::OperationResult;
+    use std::sync::mpsc::TryRecvError;
+    let (result, changed) = {
+        let mut locked = state.lock().expect("state poisoned");
+        let result =
+            locked
+                .history_operation
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(Ok(result)),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(())),
+                });
+        if result.is_some() {
+            locked.history_operation = None;
+        }
+        let changed = app.get_show_settings()
+            && app.get_settings_tab() == 4
+            && locked
+                .history
+                .as_ref()
+                .is_some_and(|handle| Some(handle.view_version()) != locked.history_view_version);
+        (result, changed)
+    };
+    let completed = result.is_some();
+    if let Some(result) = result {
+        app.set_history_busy(false);
+        app.set_history_status(match result {
+            Ok(OperationResult::Cleared) => "本机连接历史已清除。".into(),
+            Ok(OperationResult::Exported(path)) => format!("已导出到 {}", path.display()).into(),
+            Ok(OperationResult::Failed) => "操作未完成，请检查保存位置是否可写。".into(),
+            Err(()) => "操作结果未确认，请重新查看历史。".into(),
+        });
+    }
+    if completed || changed {
+        refresh_history(app, state);
+    }
+}
+
 /// 定时把音频状态搬到界面上。**整个程序只有一个**，连着和没连着都靠它。
 ///
 /// 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，省掉一次跨线程投递，
@@ -1904,6 +2032,7 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, VOICE_POLL, move || {
         let Some(app) = weak.upgrade() else { return };
+        poll_history(&app, &state);
         let (runtime, client, ptt_bound, call) = {
             let locked = state.lock().expect("state poisoned");
             (

@@ -125,6 +125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Rc::new(slint::VecModel::from(vec!["系统默认扬声器".into()])).into(),
         );
         app.set_capture_in_use("系统默认麦克风".into());
+        app.set_history_available(true);
+        app.set_history_summary("最近状态：等待重连 · 2026-10-06 08:30:02 UTC".into());
+        app.set_history_report("2026-10-06 08:30:02 UTC\n等待重连 · 本机连接 9ab1a4c0 · 第 1 代\n重连第 2 次，等待 2.0 秒\n长时间未收到服务器响应 · 本机观测\n\n2026-10-06 08:20:00 UTC\n服务器已连接 · 本机连接 9ab1a4c0 · 第 1 代".into());
+        let clears = Rc::new(std::cell::Cell::new(0));
+        let count = clears.clone();
+        app.on_clear_history(move || count.set(count.get() + 1));
         if settings_keyboard_only {
             app.set_settings_tab(0);
             render(
@@ -156,6 +162,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 3,
                 "Tab and Space must reach updates"
             );
+            key(&app, slint::platform::Key::Tab);
+            key(&app, " ");
+            assert_eq!(
+                app.get_settings_tab(),
+                4,
+                "keyboard must reach history in a minimum-size window"
+            );
+            app.set_connected(false);
+            render(&window, 400, 360, 1.0, &folder.join("history-offline.png"));
+            assert!(app.get_show_settings());
+            assert_eq!(app.get_settings_tab(), 4);
+            app.set_show_clear_history(true);
+            render(
+                &window,
+                400,
+                360,
+                1.0,
+                &folder.join("history-clear-confirmation.png"),
+            );
+            key(&app, slint::platform::Key::Escape);
+            assert!(!app.get_show_clear_history());
+            assert_eq!(clears.get(), 0, "Escape must not clear history");
+            key(&app, " ");
+            assert!(
+                app.get_show_clear_history(),
+                "dismissal must restore clear-button focus"
+            );
+            key(&app, slint::platform::Key::Tab);
+            key(&app, slint::platform::Key::Tab);
+            key(&app, " ");
+            assert!(
+                !app.get_show_clear_history(),
+                "Tab must cycle within the confirmation dialog"
+            );
+            assert_eq!(clears.get(), 0);
+            key(&app, " ");
+            assert!(app.get_show_clear_history());
+            key(&app, slint::platform::Key::Tab);
+            key(&app, slint::platform::Key::Return);
+            assert_eq!(
+                clears.get(),
+                1,
+                "only explicit confirmation may request clear"
+            );
+            assert!(!app.get_show_clear_history());
+
             render(
                 &window,
                 400,
@@ -163,6 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 1.0,
                 &folder.join("keyboard-navigation-after.png"),
             );
+            app.set_connected(true);
             for (width, height, gear_x, gear_y) in
                 [(400, 360, 370.0, 331.0), (760, 520, 730.0, 487.0)]
             {
@@ -231,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let folder = folder.join(format!("settings-{}pct", (scale * 100.0) as u32));
             std::fs::create_dir_all(&folder)?;
             for (w, h) in [(400, 360), (760, 520), (1000, 720)] {
-                for tab in 0..4 {
+                for tab in 0..5 {
                     app.set_settings_tab(tab);
                     render(
                         &window,

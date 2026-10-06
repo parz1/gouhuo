@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import { HistoryPanel, ClearHistoryDialog } from "settings-history.slint";
 
 import { Theme, Btn, Field, Dot, LevelBar } from "theme.slint";
 import { ScrollView, Slider, ComboBox } from "std-widgets.slint";
@@ -247,6 +248,18 @@ export component App inherits Window {
     // ---- 设置 ----
     in-out property <bool> show-settings: false;
     in-out property <int> settings-tab: 0;
+    in property <string> history-summary;
+    in property <string> history-report;
+    in property <string> history-warning;
+    in property <string> history-status;
+    in property <bool> history-busy;
+    in property <bool> history-available;
+    in-out property <bool> show-clear-history: false;
+    property <int> history-focus-epoch: 0;
+    callback refresh-history();
+    callback export-history();
+    callback clear-history();
+    callback settings-category-changed(int);
     property <int> settings-return-focus: 0;
     property <length> settings-sidebar-width: root.width < 600px ? 112px : 196px;
     in-out property <bool> ptt-mode: false;
@@ -524,6 +537,7 @@ export component App inherits Window {
                     settings-scroll.content-y = 0px;
                     settings-scroll.content-x = 0px;
                     root.settings-tab = index;
+                    root.settings-category-changed(index);
                 }
             }
             back => { root.toggle-settings(); if (root.connected) { root.settings-return-focus += 1; } }
@@ -541,13 +555,13 @@ export component App inherits Window {
                         spacing: 20px;
                         alignment: start;
                         Text {
-                            text: root.settings-tab == 0 ? "让每一句话都清楚" : root.settings-tab == 1 ? "频道通知" : root.settings-tab == 2 ? "使用偏好" : "版本更新";
+                            text: root.settings-tab == 0 ? "让每一句话都清楚" : root.settings-tab == 1 ? "频道通知" : root.settings-tab == 2 ? "使用偏好" : root.settings-tab == 3 ? "版本更新" : "连接历史";
                             color: Theme.text;
                             font-size: 24px;
                             font-weight: 700;
                         }
                         Text {
-                            text: root.settings-tab == 0 ? "选择设备、调整说话方式，实时确认麦克风输入。" : root.settings-tab == 1 ? "按你的习惯设置提示音和语音播报。" : root.settings-tab == 2 ? "让篝火按你习惯的方式运行。设置会自动保存。" : "查看当前版本，检查并获取篝火的最新发布。";
+                            text: root.settings-tab == 0 ? "选择设备、调整说话方式，实时确认麦克风输入。" : root.settings-tab == 1 ? "按你的习惯设置提示音和语音播报。" : root.settings-tab == 2 ? "让篝火按你习惯的方式运行。设置会自动保存。" : root.settings-tab == 3 ? "查看当前版本，检查并获取篝火的最新发布。" : "回看断线原因和重连结果，离线时也能查看。";
                             color: Theme.dim;
                             font-size: 13px;
                             wrap: word-wrap;
@@ -900,6 +914,19 @@ export component App inherits Window {
                             set-automatic(on) => { root.set-check-updates(on); }
                         }
 
+                        if root.settings-tab == 4: HistoryPanel {
+                            focus-epoch: root.history-focus-epoch;
+                            summary: root.history-summary;
+                            report: root.history-report;
+                            warning: root.history-warning;
+                            status: root.history-status;
+                            busy: root.history-busy;
+                            available: root.history-available;
+                            refresh => { root.refresh-history(); }
+                            export => { root.export-history(); }
+                            clear => { root.show-clear-history = true; }
+                        }
+
                         // 选了按住说话却没绑键 = 一个字都发不出去。必须说出来。
                         if root.settings-tab == 0 && root.ptt-mode && root.ptt-label == "": Rectangle {
                             background: #2a2417;
@@ -920,6 +947,13 @@ export component App inherits Window {
         }
     }
 
+
+    if root.show-clear-history: ClearHistoryDialog {
+        width: root.width;
+        height: root.height;
+        dismiss => { root.show-clear-history = false; root.history-focus-epoch += 1; }
+        confirm => { root.show-clear-history = false; root.history-focus-epoch += 1; root.clear-history(); }
+    }
 
     if root.show-update-dialog && root.update-version != "": UpdateDialog {
         width: root.width;

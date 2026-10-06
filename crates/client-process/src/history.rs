@@ -53,6 +53,7 @@ pub struct Record {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub records: VecDeque<Record>,
+    pub revision: u64,
     pub loading: bool,
     pub dropped_queue_records: u64,
     pub rejected_commands: u64,
@@ -69,8 +70,16 @@ struct Shared {
 
 enum Command {
     Record(Record),
-    Clear,
+    Clear(Option<mpsc::SyncSender<OperationResult>>),
+    Export(mpsc::SyncSender<OperationResult>),
     Barrier(mpsc::SyncSender<()>),
+}
+
+#[derive(Debug)]
+pub enum OperationResult {
+    Cleared,
+    Exported(PathBuf),
+    Failed,
 }
 
 #[derive(Clone)]
@@ -151,7 +160,28 @@ impl Handle {
 
     /// Accepted means queued, not saved. Snapshot exposes asynchronous failures.
     pub fn clear(&self) -> bool {
-        self.enqueue(Command::Clear)
+        self.enqueue(Command::Clear(None))
+    }
+
+    pub fn request_clear(&self) -> Option<mpsc::Receiver<OperationResult>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.enqueue(Command::Clear(Some(tx))).then_some(rx)
+    }
+
+    pub fn request_export(&self) -> Option<mpsc::Receiver<OperationResult>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.enqueue(Command::Export(tx)).then_some(rx)
+    }
+
+    /// Cheap observation for UI polling; does not clone the record collection.
+    pub fn view_version(&self) -> (u64, u64, u64, bool) {
+        let snapshot = self.shared.snapshot.lock().expect("history poisoned");
+        (
+            snapshot.revision,
+            self.shared.dropped.load(Ordering::Relaxed),
+            self.shared.rejected.load(Ordering::Relaxed),
+            snapshot.loading,
+        )
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -328,6 +358,46 @@ fn persist(
     )
 }
 
+#[derive(Serialize)]
+struct ExportDocument<'a> {
+    schema: u32,
+    exported_at_utc_unix_ms: u64,
+    scope: &'static str,
+    history: &'a Snapshot,
+}
+
+fn export(directory: &Path, snapshot: &Snapshot) -> io::Result<PathBuf> {
+    let folder = directory.join("connection-history-exports");
+    fs::create_dir_all(&folder)?;
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).map_err(|e| io::Error::other(e.to_string()))?;
+    let suffix: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    let target = folder.join(format!("connection-history-{}-{suffix}.json", utc_ms()));
+    let temporary = target.with_extension("partial");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let result = (|| {
+        let bytes = serde_json::to_vec_pretty(&ExportDocument {
+            schema: SCHEMA,
+            exported_at_utc_unix_ms: utc_ms(),
+            scope: "client_control_lifecycle_only",
+            history: snapshot,
+        })
+        .map_err(io::Error::other)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &target)?;
+        Ok(target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn worker(directory: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) {
     let mut snapshot = Snapshot::default();
     let mut loaded: Option<Document> = None;
@@ -356,6 +426,7 @@ fn worker(directory: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Sha
     if persist(&directory, &snapshot.records, &snapshot.records, sequence).is_err() {
         snapshot.disk_failures += 1;
     }
+    snapshot.revision = sequence;
     *shared.snapshot.lock().expect("history poisoned") = snapshot.clone();
     loop {
         let command = match receiver.recv_timeout(Duration::from_secs(60)) {
@@ -374,7 +445,7 @@ fn worker(directory: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Sha
                     snapshot.disk_failures += 1;
                 }
             }
-            Some(Command::Clear) => {
+            Some(Command::Clear(reply)) => {
                 snapshot.records.clear();
                 sequence = sequence.saturating_add(1);
                 // Both generations must be empty to prevent clear/restart resurrection.
@@ -383,6 +454,34 @@ fn worker(directory: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Sha
                 if snapshot.clear_failed {
                     snapshot.disk_failures += 1;
                 }
+                snapshot.revision = sequence;
+                *shared.snapshot.lock().expect("history poisoned") = snapshot.clone();
+                if let Some(reply) = reply {
+                    let _ = reply.try_send(if snapshot.clear_failed {
+                        OperationResult::Failed
+                    } else {
+                        OperationResult::Cleared
+                    });
+                }
+                continue;
+            }
+            Some(Command::Export(reply)) => {
+                sequence = sequence.saturating_add(1);
+                let mut exported = snapshot.clone();
+                exported.dropped_queue_records = shared.dropped.load(Ordering::Relaxed);
+                exported.rejected_commands = shared.rejected.load(Ordering::Relaxed);
+                retain(&mut exported.records, utc_ms());
+                let result = match export(&directory, &exported) {
+                    Ok(path) => OperationResult::Exported(path),
+                    Err(_) => {
+                        snapshot.disk_failures += 1;
+                        OperationResult::Failed
+                    }
+                };
+                snapshot.revision = sequence;
+                *shared.snapshot.lock().expect("history poisoned") = snapshot.clone();
+                let _ = reply.try_send(result);
+                continue;
             }
             Some(Command::Barrier(tx)) => {
                 let _ = tx.send(());
@@ -399,6 +498,7 @@ fn worker(directory: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Sha
                 }
             }
         }
+        snapshot.revision = sequence;
         *shared.snapshot.lock().expect("history poisoned") = snapshot.clone();
     }
 }
@@ -528,9 +628,113 @@ mod tests {
         assert!(!journey.record(&handle, transition(Phase::Connected, 1)));
         assert!(!handle.clear());
         assert_eq!(handle.snapshot().dropped_queue_records, 1);
-        assert_eq!(handle.snapshot().rejected_commands, 1);
+        assert!(handle.request_clear().is_none());
+        assert!(handle.request_export().is_none());
+        assert_eq!(handle.snapshot().rejected_commands, 3);
         receiver.try_recv().unwrap();
         assert!(journey.record(&handle, transition(Phase::Ended, 1)));
+    }
+
+    #[test]
+    fn clear_reply_confirms_both_disk_generations_before_success() {
+        let directory = Directory::new();
+        let writer = Writer::start(directory.0.clone()).unwrap();
+        let handle = writer.handle();
+        let mut journey = handle.new_journey().unwrap();
+        assert!(journey.record(&handle, transition(Phase::Connected, 1)));
+        let reply = handle.request_clear().unwrap();
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(5)).unwrap(),
+            OperationResult::Cleared
+        ));
+        for path in [paths(&directory.0).0, paths(&directory.0).1] {
+            let document: Document = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert!(document.records.is_empty());
+        }
+        assert!(handle.snapshot().records.is_empty());
+        assert!(!handle.snapshot().clear_failed);
+        drop(handle);
+        assert!(writer.finish(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn operations_report_disk_failure_without_claiming_success() {
+        let directory = Directory::new();
+        fs::write(&directory.0, b"not a directory").unwrap();
+        let writer = Writer::start(directory.0.clone()).unwrap();
+        let handle = writer.handle();
+        assert!(handle.flush(Duration::from_secs(5)));
+        let before = handle.view_version();
+        for reply in [
+            handle.request_clear().unwrap(),
+            handle.request_export().unwrap(),
+        ] {
+            assert!(matches!(
+                reply.recv_timeout(Duration::from_secs(5)).unwrap(),
+                OperationResult::Failed
+            ));
+        }
+        assert!(handle.snapshot().clear_failed);
+        assert!(handle.view_version().0 > before.0);
+        drop(handle);
+        assert!(writer.finish(Duration::from_secs(5)));
+        fs::remove_file(&directory.0).unwrap();
+    }
+
+    #[test]
+    fn export_reply_contains_all_retained_events_and_completed_unique_files() {
+        let directory = Directory::new();
+        fs::create_dir_all(&directory.0).unwrap();
+        let records: VecDeque<_> = (0..MAX_RECORDS)
+            .map(|index| {
+                let mut item = record(utc_ms(), index as u64);
+                item.cause = Some(ConnectionCause::local(ConnectionReason::HeartbeatTimeout));
+                item
+            })
+            .collect();
+        write_document(
+            &paths(&directory.0).0,
+            &Document {
+                schema: SCHEMA,
+                sequence: 5,
+                records: records.clone(),
+            },
+        )
+        .unwrap();
+        let writer = Writer::start(directory.0.clone()).unwrap();
+        let handle = writer.handle();
+        handle.shared.dropped.store(3, Ordering::Relaxed);
+        let mut exported_paths = Vec::new();
+        for _ in 0..2 {
+            let reply = handle.request_export().unwrap();
+            let OperationResult::Exported(path) =
+                reply.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("export failed")
+            };
+            assert_eq!(
+                path.parent().unwrap(),
+                directory.0.join("connection-history-exports")
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(value["scope"], "client_control_lifecycle_only");
+            let exported: VecDeque<Record> =
+                serde_json::from_value(value["history"]["records"].clone()).unwrap();
+            assert_eq!(exported, records);
+            assert_eq!(value["history"]["dropped_queue_records"], 3);
+            assert!(!path.with_extension("partial").exists());
+            exported_paths.push(path);
+        }
+        assert_ne!(exported_paths[0], exported_paths[1]);
+        assert_eq!(
+            fs::read_dir(directory.0.join("connection-history-exports"))
+                .unwrap()
+                .count(),
+            2
+        );
+        drop(handle);
+        assert!(writer.finish(Duration::from_secs(5)));
     }
 
     #[test]
