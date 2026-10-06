@@ -14,10 +14,10 @@ const WARMUP: Duration = Duration::from_secs(2);
 const SAMPLE: Duration = Duration::from_secs(10);
 
 #[cfg(windows)]
-fn cpu_seconds() -> Option<f64> {
+fn cpu_seconds(ui_thread: bool) -> Option<f64> {
     use windows_sys::Win32::{
         Foundation::FILETIME,
-        System::Threading::{GetCurrentProcess, GetProcessTimes},
+        System::Threading::{GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes},
     };
     let mut created = FILETIME {
         dwLowDateTime: 0,
@@ -26,16 +26,26 @@ fn cpu_seconds() -> Option<f64> {
     let mut exited = created;
     let mut kernel = created;
     let mut user = created;
-    // SAFETY: pseudo handle refers to this process, and all four output pointers
-    // are valid writable FILETIME values. This never reads another app's state.
+    // SAFETY: both pseudo handles refer to our own process/current event-loop
+    // thread. All output pointers are valid writable FILETIME values.
     let ok = unsafe {
-        GetProcessTimes(
-            GetCurrentProcess(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
+        if ui_thread {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        } else {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        }
     };
     let seconds = |time: FILETIME| {
         ((u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)) as f64
@@ -45,7 +55,7 @@ fn cpu_seconds() -> Option<f64> {
 }
 
 #[cfg(not(windows))]
-fn cpu_seconds() -> Option<f64> {
+fn cpu_seconds(_ui_thread: bool) -> Option<f64> {
     None
 }
 
@@ -82,25 +92,28 @@ pub fn install(app: &App, fixture: Rc<Fixture>) -> Option<slint::Timer> {
         let Some(app) = weak.upgrade() else { return };
         let now = Instant::now();
         if measurement.is_none() && now.duration_since(mode_started) >= WARMUP {
-            measurement = Some((now, cpu_seconds(), draws.get(), fire_updates, meter_updates, app.window().size(), app.window().scale_factor()));
+            measurement = Some((now, cpu_seconds(false), cpu_seconds(true), draws.get(), fire_updates, meter_updates, app.window().size(), app.window().scale_factor()));
             valid = true;
         }
-        if let Some((started, initial_cpu, initial_draws, initial_fire, initial_meter, size, scale)) = measurement {
+        if let Some((started, initial_cpu, initial_ui_cpu, initial_draws, initial_fire, initial_meter, size, scale)) = measurement {
             valid &= app.window().size() == size && app.window().scale_factor() == scale
                 && app.window().is_visible() && !app.window().is_minimized() && !app.get_show_settings();
             let elapsed = now.duration_since(started).as_secs_f64();
             if elapsed >= SAMPLE.as_secs_f64() {
-                let cpu = initial_cpu.zip(cpu_seconds()).map(|(start, end)| (end - start) / elapsed * 100.0);
+                let cpu = initial_cpu.zip(cpu_seconds(false)).map(|(start, end)| (end - start) / elapsed * 100.0);
+                let ui_cpu = initial_ui_cpu.zip(cpu_seconds(true)).map(|(start, end)| (end - start) / elapsed * 100.0);
                 rows.push(serde_json::json!({"mode":MODES[mode],"elapsed_s":elapsed,
-                    "single_core_cpu_percent":cpu,"draw_callbacks":notifier_supported.then(|| draws.get() - initial_draws),
+                    "single_core_cpu_percent":cpu,"ui_thread_single_core_cpu_percent":ui_cpu,
+                    "other_threads_single_core_cpu_percent":cpu.zip(ui_cpu).map(|(total, ui)| (total-ui).max(0.0)),"draw_callbacks":notifier_supported.then(|| draws.get() - initial_draws),
                     "fire_updates":fire_updates-initial_fire,"meter_updates":meter_updates-initial_meter,
                     "physical_width":size.width,"physical_height":size.height,"scale_factor":scale,
                     "window_size_visibility_unchanged":valid}));
-                eprintln!("{}: CPU={cpu:?}, elapsed={elapsed:.3}s", MODES[mode]);
+                eprintln!("{}: CPU={cpu:?}, UI thread={ui_cpu:?}, elapsed={elapsed:.3}s", MODES[mode]);
                 mode += 1;
                 if mode == MODES.len() {
-                    let report = serde_json::json!({"schema":1,"scope":"offline_native_ui_render_isolation",
+                    let report = serde_json::json!({"schema":2,"scope":"offline_native_ui_render_isolation",
                         "cpu_basis":"whole process user + kernel, single-core percent; excludes engine and GPU time",
+                        "thread_scope":"current Slint event-loop thread; remainder includes driver/backend/helper threads, not GPU time",
                         "draw_scope":"AfterRendering callback, before present; not GPU/display completion",
                         "foreground_scope":"not continuously verified; keep this window unobscured during the experiment",
                         "renderer_requested":std::env::var("SLINT_BACKEND").ok(),
