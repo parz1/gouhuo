@@ -131,3 +131,11 @@ Windows 原生 760×520 与 400×360 逻辑窗口均通过：选中分类进入�
 
 
 PTT 后续接收验收改用有界 `gouhuo-bot --silent`，只接收并记录统计，1200 秒后退出；复制到隔离证据目录运行，避免锁住 Cargo 输出。原 `received` 包含保活，不能当作语音包数。新增 `speaking_sessions` 后，两项真实 TLS/加密 UDP 测试验证“仅保活没有说话人”和“静音 PCM 语音包识别发送会话”，test-bot all-targets Clippy 通过。该追加仅影响机器人日志和测试，UI/引擎候选仍对应 24adbb2。原接收日志保留，新日志为 native-controls/ptt-receiver-voice-metadata.jsonl；长按验收仍待人工操作，机器人启动不算 PTT 通过。
+
+## 最新 CI 与资源采样一致性补充
+
+机器人统计提交 `fc967768fe9242840ebff3f65b53931941f45e85` 的 [redline CI](https://github.com/parz1/gouhuo/actions/runs/37440666232) 已全部完成：Windows deterministic、Linux core、Linux server 默认及无默认 feature、许可证、DCO、更新发布检查均成功；专用延迟 gate 跳过，不作为通过。该提交没有改动实际安装的 UI 或引擎，候选仍对应 `24adbb2`。
+
+资源采样脚本输出 schema 2：开始保存 UI/引擎 SHA-256 和进程启动时间，结束再次核对文件及唯一声音子进程；进程退出、重启、产物变化或结束时子进程变化使样本失败。CPU 使用计时区间最后一次样本，排除后置哈希核验开销。子进程清单仅在开始和结束核对，不宣称连续监控；State 是调用者标签，不作为窗口可见性或视图条件的自动证明。
+
+实际运行增强后的脚本 30.744 秒，文件哈希保持为本轮安装候选，结束时声音子进程未变。总单核 CPU 1.321%，工作集均值 83.325 MB，私有内存均值 126.714 MB；本地文件 resources/candidate-diagnostics-foreground-identity-verified.json 记录数值及核验字段。该轮未重新观察窗口状态、可访问性和输入条件，文件中的描述性标签不能证明前台或条件相同；只证明采样工具在真实进程上运行成功，不替代前台/最小化/托盘对照，也不据此判断资源回归通过。

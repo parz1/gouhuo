@@ -13,7 +13,9 @@ $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ClientPid 
 if ($children.Count -ne 1) { throw 'Expected one stable voice child.' }
 $processes = @((Get-Process -Id $ClientPid), (Get-Process -Id $children[0].ProcessId))
 $startTimes = @($processes | ForEach-Object { $_.StartTime.ToUniversalTime().ToString('o') })
-$initialCpu = @($processes | ForEach-Object { $_.TotalProcessorTime.TotalSeconds })
+$imagePaths = @($processes | ForEach-Object { $_.Path })
+$imageHashes = @($imagePaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+$initialCpu = @($processes | ForEach-Object { $_.Refresh(); $_.TotalProcessorTime.TotalSeconds })
 $started = [DateTime]::UtcNow
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $samples = @()
@@ -33,14 +35,30 @@ for ($i = 0; $i -lt $Seconds; $i++) {
     $samples += [pscustomobject]$row
 }
 $clock.Stop()
+# Verify both endpoints of the measurement. This does not claim continuous child inventory.
+$finalChildren = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ClientPid AND Name='gouhuo-voice.exe'")
+if ($finalChildren.Count -ne 1 -or $finalChildren[0].ProcessId -ne $children[0].ProcessId) {
+    throw 'Voice child inventory changed; measurement invalid.'
+}
+for ($n = 0; $n -lt $processes.Count; $n++) {
+    $processes[$n].Refresh()
+    if ($processes[$n].HasExited -or $processes[$n].StartTime.ToUniversalTime().ToString('o') -ne $startTimes[$n]) {
+        throw 'Process exited/restarted before final verification; measurement invalid.'
+    }
+    if ($processes[$n].Path -ne $imagePaths[$n] -or (Get-FileHash -LiteralPath $imagePaths[$n]).Hash -ne $imageHashes[$n]) {
+        throw 'Executable changed during measurement; measurement invalid.'
+    }
+}
 $cpu = @()
-for ($n = 0; $n -lt $processes.Count; $n++) { $cpu += ($processes[$n].TotalProcessorTime.TotalSeconds - $initialCpu[$n]) / $clock.Elapsed.TotalSeconds * 100 }
+# Use CPU values from the timed last sample, excluding verification overhead.
+$lastSampleCpu = @($samples[-1].ui_cpu_s, $samples[-1].engine_cpu_s)
+for ($n = 0; $n -lt $processes.Count; $n++) { $cpu += ($lastSampleCpu[$n] - $initialCpu[$n]) / $clock.Elapsed.TotalSeconds * 100 }
 $ws = @($samples | ForEach-Object { $_.ui_working_set_bytes + $_.engine_working_set_bytes })
 $private = @($samples | ForEach-Object { $_.ui_private_bytes + $_.engine_private_bytes })
 $machineCpu = Get-CimInstance Win32_Processor | Select-Object Name,NumberOfLogicalProcessors
 $machineOs = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize
 $result = [ordered]@{
-    schema = 1; state = $State; started_utc = $started.ToString('o'); elapsed_s = $clock.Elapsed.TotalSeconds
+    schema = 2; state = $State; started_utc = $started.ToString('o'); elapsed_s = $clock.Elapsed.TotalSeconds
     environment = [ordered]@{ processors = @($machineCpu); os = $machineOs }
     cpu_basis = 'single core percent; UI plus one unchanged child; no normalization by logical CPUs'
     ui_cpu_percent = $cpu[0]; engine_cpu_percent = $cpu[1]; total_cpu_percent = $cpu[0] + $cpu[1]
@@ -48,7 +66,17 @@ $result = [ordered]@{
     total_working_set_peak_bytes = ($ws | Measure-Object -Maximum).Maximum
     total_private_mean_bytes = ($private | Measure-Object -Average).Average
     total_private_peak_bytes = ($private | Measure-Object -Maximum).Maximum
-    processes = @($processes | ForEach-Object { [ordered]@{ pid = $_.Id; name = $_.ProcessName; sha256 = (Get-FileHash -LiteralPath $_.Path).Hash; version = $_.FileVersion } })
+    verification = [ordered]@{
+        executable_hashes_unchanged = $true
+        child_inventory_at_start_and_end = 'one same voice child'
+        comparison_scope = 'individual sample; matching UI state, settings, engine and accessibility conditions must be established separately'
+    }
+    processes = @(for ($n = 0; $n -lt $processes.Count; $n++) {
+        [ordered]@{
+            pid = $processes[$n].Id; name = $processes[$n].ProcessName
+            started_utc = $startTimes[$n]; sha256 = $imageHashes[$n]; version = $processes[$n].FileVersion
+        }
+    })
     samples = $samples
 }
 $fullOutput = [IO.Path]::GetFullPath($OutFile)
