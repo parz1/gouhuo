@@ -14,6 +14,7 @@ permissions:
   contents: write
 
 env:
+  GOUHUO_UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL || 'https://downloads.gouhuo.minerei.dev' }}
   CARGO_TERM_COLOR: always
   # 见 redline.yml：VS 自带的 cmake 4.x 不认 libopus 声明的老最低版本。
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"

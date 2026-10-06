@@ -404,6 +404,8 @@ git push origin v0.1.0
 写好说明，再在网页上点「发布」。这时才会：
 
 - 客户端「检查更新」看得到它（草稿不算）
+- 配好 R2 后，[`publish-updates.yml`](.github/workflows/publish-updates.yml) 上传并验证安装包，
+  最后更新官方源的版本清单；配置步骤见 [R2 接入指南](docs/r2-updates.md)
 - `latest` 指过去（[`docker-latest.yml`](.github/workflows/docker-latest.yml)），跟着 `latest`
   的服务器下次 `pull` 升级
 

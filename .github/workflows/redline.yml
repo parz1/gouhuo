@@ -34,6 +34,16 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
+  update-publication:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate update manifest and promotion ordering
+        run: python -m unittest discover -s packaging/updates -p 'test_*.py'
+
   # DCO：每个提交都要有 Signed-off-by。
   #
   # 只查 PR 里的提交，不查历史 —— 这个检查是从引入 DCO 那天起生效的，

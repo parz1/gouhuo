@@ -1,0 +1,60 @@
+name: publish-updates
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published stable release tag (for initial setup or retry)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-stable-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ (github.event_name == 'workflow_dispatch' || !github.event.release.prerelease) && vars.R2_BUCKET != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL || 'https://downloads.gouhuo.minerei.dev' }}
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test publication ordering and validation
+        run: python -m unittest discover -s packaging/updates -p 'test_*.py'
+      - name: Fetch the current official stable release
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Not a stable tag"; exit 1; }
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name')
+          [ "$latest" = "$RELEASE_TAG" ] || { echo "Only the current latest stable release can be promoted"; exit 1; }
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release.json
+          gh release download "$RELEASE_TAG" --dir release-assets
+      - name: Publish packages, verify downloads, then promote stable.json
+        run: |
+          aws --version
+          python packaging/updates/publish.py --release-json release.json --assets release-assets --output update-output --base-url "$UPDATE_BASE_URL" --upload
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: update-manifest
+          path: update-output/
+          if-no-files-found: ignore
