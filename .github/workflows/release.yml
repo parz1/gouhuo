@@ -8,7 +8,7 @@ name: release
 # 客户端的「检查更新」看的是 /releases/latest，草稿不算 —— 点发布之前没人会被提示。
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!voice-v*"]
 
 permissions:
   contents: write
