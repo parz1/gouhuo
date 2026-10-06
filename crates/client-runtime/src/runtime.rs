@@ -6,29 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::{
+    CaptureInfo, Devices, MicSnapshot, RuntimeSnapshot, RuntimeStage, RuntimeTimings, VoiceIntent,
+};
+use voice_types::TransmitMode;
+
 use voice_core::audio::{Capture, Render};
 use voice_core::cue::CueQueue;
 use voice_core::miccheck::{MicCheck, MicCheckControl};
 use voice_core::pipeline::{
     default_jitter, AudioProcessor, Pipeline, PipelineConfig, PipelineControl, PipelineState,
-    TransmitMode, VoiceStats,
 };
-
-/// Opaque platform device identifiers. `None` follows the system default.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Devices {
-    pub capture: Option<String>,
-    pub render: Option<String>,
-}
-
-/// Only portable diagnostic data crosses the platform boundary.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CaptureInfo {
-    pub opened: bool,
-    pub name: String,
-    pub is_virtual: bool,
-    pub silent_ratio: f32,
-}
 
 pub trait CaptureDiagnostics: Send + Sync {
     fn snapshot(&self) -> CaptureInfo;
@@ -69,81 +57,6 @@ pub struct StartVoice {
     pub upstream_key: [u8; 32],
     pub downstream_key: [u8; 32],
     pub devices: Devices,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VoiceIntent {
-    pub muted: bool,
-    /// Moderator-enforced mute is a constraint, never a change to local intent.
-    pub server_muted: bool,
-    pub deafened: bool,
-    pub transmitting: bool,
-    pub monitoring: bool,
-    pub mode: TransmitMode,
-}
-
-impl Default for VoiceIntent {
-    fn default() -> Self {
-        Self {
-            muted: false,
-            server_muted: false,
-            deafened: false,
-            transmitting: false,
-            monitoring: false,
-            mode: TransmitMode::PushToTalk,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RuntimeStage {
-    #[default]
-    Idle,
-    Preparing,
-    Starting,
-    Ready,
-    Failed,
-    Stopping,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MicSnapshot {
-    pub input_db: f32,
-    pub input_available: bool,
-    pub error: Option<String>,
-}
-
-/// Measured stage durations, in milliseconds. First capture/render timings
-/// come from successful device I/O on the audio threads. First UDP health is
-/// observed by the worker, with up to one polling interval (20 ms) of delay.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RuntimeTimings {
-    pub queued_ms: Option<f64>,
-    pub retire_ms: Option<f64>,
-    pub dns_ms: Option<f64>,
-    pub processor_ms: Option<f64>,
-    pub start_ms: Option<f64>,
-    /// Time from request submission to first successful input frame.
-    pub first_capture_ms: Option<f64>,
-    /// Time from request submission to first successful output frame.
-    pub first_render_ms: Option<f64>,
-    /// Time from request submission to the first observed authenticated probe.
-    pub first_udp_ms: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RuntimeSnapshot {
-    pub request_id: u64,
-    pub stage: RuntimeStage,
-    pub session_id: Option<u32>,
-    pub voice: Option<VoiceStats>,
-    pub mic: Option<MicSnapshot>,
-    pub intent: VoiceIntent,
-    pub capture: CaptureInfo,
-    /// Preparation failure (DNS, socket/codec/thread initialization), distinct
-    /// from the directional live-device errors inside `voice`.
-    pub error: Option<String>,
-    pub timings: RuntimeTimings,
 }
 
 struct State {
@@ -451,6 +364,32 @@ impl RuntimeHandle {
             });
         }
         snapshot
+    }
+}
+
+impl crate::VoiceControl for RuntimeHandle {
+    fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeHandle::snapshot(self)
+    }
+
+    fn set_muted(&self, on: bool) {
+        RuntimeHandle::set_muted(self, on);
+    }
+
+    fn set_deafened(&self, on: bool) {
+        RuntimeHandle::set_deafened(self, on);
+    }
+
+    fn set_transmitting(&self, on: bool) {
+        RuntimeHandle::set_transmitting(self, on);
+    }
+
+    fn set_volume(&self, member: u32, volume: f32) {
+        RuntimeHandle::set_volume(self, member, volume);
+    }
+
+    fn stop(&self) {
+        RuntimeHandle::stop(self);
     }
 }
 

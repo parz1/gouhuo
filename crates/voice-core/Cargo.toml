@@ -36,6 +36,7 @@ codec = ["dep:opus"]
 pipeline = ["codec"]
 
 [dependencies]
+voice-types.workspace = true
 protocol.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true

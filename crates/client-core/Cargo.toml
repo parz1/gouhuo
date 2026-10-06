@@ -9,11 +9,13 @@ description = "客户端逻辑，不含界面：连接、认证、状态镜像�
 [dependencies]
 protocol.workspace = true
 transport.workspace = true
-# 身份（Ed25519）加整条语音链路，带回声消除和降噪。
-voice-core = { workspace = true, features = ["pipeline", "apm"] }
+# Production control connections only need identity, never an audio pipeline.
+voice-core.workspace = true
 rustls.workspace = true
 prost.workspace = true
 
 [dev-dependencies]
+# Real voice integration tests and the talker example still exercise the engine.
+voice-core = { workspace = true, features = ["pipeline", "apm"] }
 # 集成测试直接对着真服务端跑 —— 没有 mock，没有假握手。
 server = { path = "../server" }

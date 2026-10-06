@@ -7,8 +7,8 @@
 | 层 | crate | 许可 | 面对的威胁 |
 |---|---|---|---|
 | **协议** | `protocol` | **MIT OR Apache-2.0** | 没有威胁，越多人实现越好 |
-| **引擎、服务端与客户端逻辑** | `voice-core`、`transport`、`server`、`client-core` | **MPL-2.0** | 改了不交回来 |
-| **客户端成品与运行层** | `client`、`client-runtime`、探针、`test-bot` | **GPL-3.0-or-later** | 套壳加广告再分发 |
+| **引擎、服务端与客户端逻辑** | `voice-types`、`voice-core`、`transport`、`server`、`client-core` | **MPL-2.0** | 改了不交回来 |
+| **客户端成品与运行层** | `client`、`client-runtime`、`client-process`、`voice-engine`、探针、`test-bot` | **GPL-3.0-or-later** | 套壳加广告再分发 |
 | **第三方** | `third_party/webrtc-audio-processing-sys` | BSD-3-Clause（Google / WebRTC，原样保留） |
 
 许可全文：[`LICENSE`](LICENSE)（GPL-3.0）、[`LICENSES/MPL-2.0.txt`](LICENSES/MPL-2.0.txt)、

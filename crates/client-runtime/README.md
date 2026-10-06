@@ -5,6 +5,34 @@ projection. It depends on `voice-core` and `protocol`; it has no Slint dependenc
 and imports no platform audio API. Desktop, mobile or another native frontend
 supplies an `AudioBackend` adapter.
 
+The default `in-process` feature includes the lifecycle worker. With
+`--no-default-features`, this crate instead exposes frontend data, `VoiceControl`,
+call commands, projections and recovery policies without compiling the worker,
+Opus or APM. `CallController` accepts `&dyn VoiceControl`; the current
+in-process `RuntimeHandle` and `client-process::RuntimeHandle` implement it.
+The process proxy supplies the same call controls and cached facts.
+Intent changes must be visible locally before a
+control method returns; successful transmission still comes from engine facts.
+
+`voice-types` owns `TransmitMode`, `VoiceStats` and the volume limit, with no
+dependencies by default and an optional serde feature. The old
+`voice_core::pipeline` paths re-export these same types. The `ipc` feature
+defines versioned wire messages; Rust types alone are not a stable ABI.
+In-process startup receives a shared sequence allocator. Cross-process startup
+transfers fresh authenticated keys and lets the engine own that allocator.
+Identity remains a minimal `client-core` dependency on `voice-core`.
+
+The desktop uses `client-process` and the separate `gouhuo-voice` executable.
+The workspace dependency disables the default worker; engine hosts must enable
+`in-process` explicitly. Automatic engine installation and rollback remain
+future work. See [the engine boundary](../../docs/voice-engine-boundary.md).
+
+```powershell
+cargo check -p client-runtime --no-default-features --lib --locked
+cargo test -p client-runtime --no-default-features --locked
+python scripts/check-voice-boundary.py
+```
+
 `VoiceRuntime` starts one long-lived lifecycle worker. Frontends use a cloned
 `RuntimeHandle` for intentions, commands and snapshots. The worker is the only
 owner of a `Pipeline` or `MicCheck`. A frontend handle cannot join audio threads

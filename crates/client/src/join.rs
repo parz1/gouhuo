@@ -581,14 +581,30 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_missing_join_page_is_explained() {
+        use std::io::{Read, Write};
         let spare = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = spare.local_addr().unwrap().port();
-        drop(spare);
+        // Keep ownership of the port: dropping it let another parallel server
+        // fixture bind here and accidentally supply a valid discovery page.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = spare.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
         let Outcome::Failed(failure) = go(typed(format!("http://127.0.0.1:{port}/")), &[]) else {
             panic!("没有加入页却没失败");
         };
         assert!(failure.headline.contains("加入页"), "{}", failure.headline);
         assert!(failure.advice.contains("邀请链接"), "{}", failure.advice);
+        server.join().unwrap();
     }
 
     #[test]

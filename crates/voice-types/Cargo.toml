@@ -1,0 +1,10 @@
+[package]
+name = "voice-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MPL-2.0"
+description = "Shared voice controls and facts, without an audio engine or platform dependencies."
+
+[dependencies]
+serde = { workspace = true, optional = true }

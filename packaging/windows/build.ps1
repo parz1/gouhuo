@@ -38,18 +38,30 @@ if (-not $iscc) {
 if (-not $iscc) { throw "找不到 Inno Setup 6 的 ISCC.exe。装一下：winget install JRSoftware.InnoSetup" }
 
 # ---- exe ----
+$voiceVersion = (Select-String -Path crates/voice-engine/Cargo.toml -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
+if (-not $voiceVersion) { throw "声音内核缺少独立版本号" }
+$env:GOUHUO_BUNDLED_VOICE_VERSION = $voiceVersion
+if ($env:GOUHUO_VOICE_PUBLIC_KEY -and $env:GOUHUO_VOICE_PUBLIC_KEY -notmatch '^[a-fA-F0-9]{64}$') {
+    throw "声音发布公钥必须为 32 字节十六进制"
+}
+if (-not $env:GOUHUO_VOICE_PUBLIC_KEY) { Remove-Item Env:GOUHUO_VOICE_PUBLIC_KEY -ErrorAction SilentlyContinue }
 if (-not $SkipBuild) {
     # cargo 的进度写在 stderr 上；PowerShell 5.1 在 Stop 模式下会把它当成错误。
     $ErrorActionPreference = "Continue"
+    # 分开构建，避免工作区 feature 合并把音频实现链进 UI。
     cargo build --locked --profile dist -p client
+    if ($LASTEXITCODE -ne 0) { throw "client build 失败" }
+    cargo build --locked --profile dist -p voice-engine
     $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 }
 $exe = Join-Path $root "target\dist\gouhuo.exe"
 if (-not (Test-Path $exe)) { throw "没有 $exe —— 去掉 -SkipBuild 再跑一次" }
+$voiceExe = Join-Path $root "target\dist\gouhuo-voice.exe"
+if (-not (Test-Path $voiceExe)) { throw "没有 $voiceExe —— 去掉 -SkipBuild 再跑一次" }
 
 # ---- 打包 ----
-& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DOutputDir=$(Join-Path $root 'target\installer')" `
+& $iscc /Qp "/DAppVersion=$version" "/DExePath=$exe" "/DVoiceExePath=$voiceExe" "/DOutputDir=$(Join-Path $root 'target\installer')" `
     (Join-Path $PSScriptRoot "gouhuo.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
 

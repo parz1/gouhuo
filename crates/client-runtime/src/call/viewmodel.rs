@@ -342,7 +342,7 @@ mod tests {
     use crate::{MicSnapshot, RuntimeStage};
     use client_core::ChatLine;
     use protocol::control::{BannedUser, Channel, Role};
-    use voice_core::pipeline::{TransmitMode, VoiceStats};
+    use voice_types::{TransmitMode, VoiceStats};
 
     fn connected_state() -> CallState {
         let mut state = CallState::default();

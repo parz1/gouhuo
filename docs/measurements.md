@@ -593,3 +593,75 @@ A startup / call enter / tagged draw wall span 为 389.07 / 35.79 / 14.25ms，B 
 `header-spacing-artifacts.json` 与更新的 `artifacts-final.json` 记录当前产物，dumpbin 无外部 CRT；打包不表示实际安装通过。
 最新 A PID 28592 / B PID 6716 复制运行哈希均匹配当前客户端，fresh AccessKit 均为本地 21943、大厅 2 人，A VAD / 等待说话、B PTT V / 等待 V；最终仅这两个客户端与隔离服务端 PID 41416 保留，离线 fixture 45156 已正常退出。
 真实宽窗口见 [native-header-spacing-760x520.png](design/rebuild/native-header-spacing-760x520.png)，SHA-256 `3F75E23BA4C4A0616FA28BCCA0E519B011BA1F07ECE843F4A4E6A19034ED16FD`，两端证据为 `header-spacing-runtime-views.json`；没有新增性能 trace、VAD 发送或声学测量结论。
+
+### 声音独立进程本地候选（2026-10-04）
+
+UI 版本 0.3.1，内核独立版本 0.1.0，IPC 1。分别构建两个 dist 产物后用 Inno Setup 打包；以下是本地候选，未安装或发布：
+
+| 产物 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| gouhuo.exe | 16,839,680 | D0B812433FA43C930398090B64BD5A37E9E8BD5215CEAE59C62ED1F485EB161F |
+| gouhuo-voice.exe | 1,867,776 | 70474661ADF85491797C03470228C9E902ACD9F5F634318840F403597C3DE831 |
+| gouhuo-setup-0.3.1.exe | 8,325,955 | 77ABDF1D1C49BB741FA9925B34C670B7A5C3B2C461B1C42C90A556F81CB7F0D0 |
+
+完整安装包为 **8.325955 十进制 MB**，通过现有 10 MB 回归闸和 60 MB 产品线。历史正式版实测常量保留原值，没有调整阈值。
+
+工作区回归 **581 passed / 13 ignored**，完整 Clippy、fmt、SPDX 与正式依赖边界检查通过。五个实际子进程测试使用合成设备，经过真实 TLS 与加密 UDP；生产 dist 内核也验证了 IPC 握手、按请求取消和正常退出。测试日志位于本地 target/voice-boundary-tests.log。
+
+这些检查不构成真实 WASAPI、扫描、AEC、声学延迟、CPU 或内存验收。scripts/m6-footprint.ps1 已改成统计 UI 与其声音子进程总量；拆分前的单进程数字不能作为此版本的资源结论。自动下载、签名验证、空闲激活和回滚仍未实现。
+
+### 独立内核签名与切换候选（2026-10-04）
+
+在进程拆分提交 e8f14bb 后加入离线签名、版本目录、空闲激活及启动回退。正式公钥未配置，当前安装包保持使用随包内核；配置公钥的编译路径已单独 check，签名及暂存工具使用公开测试向量完成命令行冒烟验证，没有生成或保存正式私钥。
+
+最终本地产物：UI 16,906,240 字节（SHA-256 `70897770D73E9B1B0C7A9A850B1042B2B070F070EC443C51AB13FA6DF1F8988B`）；内核仍为 1,867,776 字节，哈希同上一阶段。完整安装包 **8,346,681 字节 / 8.346681 十进制 MB**，SHA-256 `95E06696ECFA3B9C78872CA8A2BB6B33497BC8BAD31B0B87FE8C8E0E119AECA1`。通过原有 10 MB 门禁，未调整阈值，未安装或发布。
+
+工作区回归 587 passed / 13 ignored；之后新增的随包版本基线回归也通过（更新存储共 5 项），最终 7 项真实子进程测试与完整 Clippy 通过。fmt、SPDX、正式依赖图和 PowerShell 语法检查通过。加入页失败 fixture 原先释放端口后可能被并行服务占用，已改成持有端口并明确返回 404，客户端 73 项测试通过。
+
+这里验证的是签名拒绝、篡改拒绝、兼容范围、版本防重放、进程切换与回退，不构成声卡性能结论。网络发现和 HTTPS 下载尚未接入。代码、发布流程及密钥配置入口见 voice-engine-boundary.md。
+
+### 独立内核自动下载候选（2026-10-04）
+
+在 d7be77a 后接入 GitHub 独立发布查询、系统 WinHTTP 下载、兼容版本选择、取消及失败退避。设置开关同时控制下载和激活；关闭期间保留 pending，重启也不消费候选。无正式公钥的构建不启动网络更新线程。
+
+最终本地 UI 为 16,907,264 字节，SHA-256 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`；内核仍为 1,867,776 字节，哈希同前。安装包为 **8,347,394 字节 / 8.347394 十进制 MB**，SHA-256 `22F59834A11880148316A3336514FE8A4A54FD9C36A7710485478520365AB070`，通过原有 10 MB 门禁。没有配置正式公钥、安装或发布。
+
+最终工作区回归 **595 passed / 14 ignored**，Clippy、fmt、SPDX、三个前端依赖边界通过。下载与存储测试共 10 项，覆盖签名拒绝、篡改拒绝、数字版本选择、兼容筛选、取消、超限及开关行为；7 项真实子进程测试通过。被忽略的 WinHTTP 公开发布索引测试另行运行通过。完整签名下载使用 fixture；尚无正式签名发布的端到端网络验收。
+
+首次全量测试与 dist 优化构建并行时，既有节拍器和试麦错误测试发生计时失败；停止并行构建后，voice-core 顺序复查 144 项通过，随后普通并发的全量回归全部通过。没有放宽计时阈值。日志为 target/voice-download-tests.log、voice-download-core-retest.log 与 voice-download-dist.log。以上不构成真实声卡、声学延迟或资源性能验收。
+
+### 独立版本更新演练（2026-10-06）
+
+通过 scripts/voice-update-rehearsal.ps1 在隔离源码副本中构建报告 0.1.1 的内核。保持真实仓库内核版本 0.1.0 和 UI 产物不变，使用固定测试密钥签署本地发布 fixture，并经过生产发现、签名验证、暂存与进程切换路径。成功演练目录为 target/voice-update-rehearsal/086294e5858442cba9bc8b9d9c6dc8c8，report.json 记录原内核 PID 8252、新内核 PID 24224；UI SHA-256 始终为 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`。
+
+真实子进程经过 TLS 与加密 UDP，验证通话／试麦期间延后切换、空闲后 0.1.0 → 0.1.1、新内核通话、坏可执行文件与版本握手不符均回退到 0.1.1、重启后缓存版本可用。父测试进程二进制哈希前后相同。没有启动图形 UI，也没有真实声卡或正式发布 HTTPS 验收。
+
+首次演练发现空闲更新预置的 Stop 命令会阻止启动失败后的自动恢复：状态虽已回退，监督线程却等待下一条操作。已允许这种 Stop 状态走空闲恢复路径，并加入无需独立构建即可运行的回归。脚本另使用不同的测试二进制名称，避免共享 target 目录的原版产物覆盖已缓存的新版构建。相关进程回归 8 项通过，完整演练另行通过；日志为 target/voice-update-rehearsal.log 和 voice-update-rehearsal-regression.log。本轮未重新打包，上一阶段安装包不包含此次恢复修复。
+
+复跑脚本在已有构建缓存下再次通过，证据为 target/voice-update-rehearsal/2a26860ee30e48238853d895807d09f6/report.json；原／新内核 PID 为 17572／11936，UI 哈希仍相同。更新存储与下载 10 项、HTTPS URL 单测通过，相关两个 crate 的 all-targets Clippy、fmt、SPDX 与 PowerShell 语法检查通过。
+
+### 真实 WASAPI 更新功能验收（2026-10-06）
+
+`device-probe --list` 枚举 12 个输出、5 个输入端点，其中硬件输出 5 个、硬件输入 3 个；默认是 Sonar 虚拟输入／输出。没有修改默认设备。`scripts/voice-update-rehearsal.ps1 -Hardware` 明确选用 Arctis Nova Pro Wireless 物理麦克风与耳机，使用真实桌面后端，未传 `--synthetic`。
+
+完整演练通过，报告为 target/voice-update-rehearsal/785db9864e91481497a4ef08c277c5c3/report.json：原内核 PID 30148、新内核 PID 3368，实际版本 0.1.0 → 0.1.1。更新前后采集、渲染均成功且没有设备错误，UDP 保活正常；通话、试麦、真实设备扫描期间拒绝切换。扫描 5 个输入端点后空闲激活成功，无法启动和版本不符的候选均回退到 0.1.1，重启后物理试麦再次成功。UI 的 SHA-256 始终为 `EF0063959ED0818969B9F8DC70C249F39077706202606608DDFE776B044BE720`，父进程文件哈希也未变。
+
+所有扫描端点均报告仅有底噪，约 -96 dB，摄像头麦克风约 -89 dB；没有取得可辨人声。这里只验证设备生命周期和更新兼容性，不证明人工听感、AEC 效果、声学延迟或长期稳定性。没有保存音频、启动图形 UI 或使用正式签名发布。日志为 target/voice-hardware-inventory.log、voice-hardware-rehearsal.log 与 voice-hardware-regression.log；8 项普通子进程回归、相关 Clippy、fmt、SPDX 和 PowerShell 语法检查通过。本轮没有重打安装包。
+
+### 自动化收尾与交付（2026-10-06）
+
+按用户选择先完成自动化，人工人声／听感试听稍后；正式密钥仍另行配置。进程测试和演练不再硬编码当前内核版本：读取 Cargo 版本并计算下一 patch 候选。Windows CI 接入独立更新演练，并保存报告。与 CI 相同的 `-UiPath target/debug/gouhuo.exe` 命令本地通过，证据为 target/voice-update-rehearsal/1850cc51de7f4fce9736cf9c809e941a/report.json；尚未在 GitHub runner 上执行本轮改动。
+
+最终工作区回归 **596 passed / 15 ignored**，额外 quality-probe 单测 1 项通过，完整 Clippy、fmt、SPDX、三个前端依赖边界和 PowerShell 语法检查通过。合成 AEC 的回声抑制与无回声时保留近端信号两项回归通过，不代替真实声学验收。日志为 target/voice-update-final-tests.log、voice-update-final-quality.log 与 voice-update-final-ci-rehearsal.log。
+
+使用公开 RFC 测试公钥构建启用更新器的安装包，仅验证完整更新器代码的打包体积：**8,364,113 字节 / 8.364113 十进制 MB**，SHA-256 `2DD1DFCE5F979324A4DBD0902FB7399B83C24436C686B19296ED4C99B1E5DA2E`，通过原有 10 MB 门禁。它仅保留为 target/voice-update-final/TEST-KEY-ONLY-gouhuo-setup-0.3.1.exe，不安装或发布；没有生成正式密钥。随后移除测试公钥并重新构建默认交付候选。体积与哈希机器记录保存为 target/voice-update-final/test-pin-package.json 与 artifacts.json。
+
+最终交付候选包含 8a365cd 的空闲恢复修复，未配置公钥，继续使用随包内核：UI 16,907,264 字节，SHA-256 `290AD3A3B3029EE6CC72C682B5F313EC59EF943B6BB1AE18B49FFC7BB4EBBF5A`；内核 1,867,776 字节，哈希同前。安装包 **8,346,256 字节 / 8.346256 十进制 MB**，SHA-256 `3AB51C9DA2D146DF740C9C12EDCAF582DC1CD1B6BA7BC830A413F3031A827638`，通过原有 10 MB 门禁。未安装或发布。日志为 target/voice-update-test-pin-dist.log 和 voice-update-final-dist.log。
+
+### 正式签名配置与公钥安装包（2026-10-06）
+
+用户明确授权后，通过 scripts/configure-voice-signing.ps1 生成全新 Ed25519 正式密钥。生成前确认 parz1/gouhuo 没有同名配置，随后设置 Actions Secret GOUHUO_VOICE_SIGNING_KEY 与 Variable GOUHUO_VOICE_PUBLIC_KEY。公钥为 `bb1e9c9b6be7a377c0ee5505c9e8d4c54493fd6254829bfa2b1515bd7a4571c9`；私钥未输出、未写明文文件或进入仓库，Secret 通过标准输入上传。
+
+当前 Windows 用户的 LocalAppData/gouhuo-release-signing/parz1-gouhuo/voice-signing-key.dpapi 保存 DPAPI 加密备份，已验证解密一致性，目录 ACL 仅当前用户 FullControl，禁止继承。此备份绑定用户，需要另行安全迁移才能用于换机恢复。正式私钥经已有 Rust 工具签署内核清单，Node 独立验签通过；签名样本保留在 target/voice-production-key-check/6a63c36f3a8740739cd4ded9879900bd，仅用于本地验证，未发布。GitHub Secret 名称与公钥值已确认；再次运行脚本被拒绝，Secret 更新时间与公钥保持不变。
+
+从 GitHub Variable 读取正式公钥重新打包：UI **16,962,048 字节**，SHA-256 `06112ADD2BEA1559F506E296143F44729911003DEAFB4B1F3CC102EF967042C2`；内核 1,867,776 字节，哈希同前。完整安装包 **8,364,816 字节 / 8.364816 十进制 MB**，SHA-256 `38B61970F5E395FDD50B33FA939C2CCFE4AAC5ED9E937E8353BF2F408B3A73ED`，通过原有 10 MB 门禁。新包已启用独立更新器，但没有实际签名独立内核公开发布；未安装或发布此包，人工试听仍待后续安排。构建日志与机器记录为 target/voice-production-key-dist.log、voice-production-key-artifacts.json。此轮新增配置脚本完成语法与实际配置验证，没有改动声音算法或重复全量回归。

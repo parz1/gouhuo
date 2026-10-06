@@ -1,0 +1,26 @@
+[package]
+name = "voice-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version = "1.91"
+license.workspace = true
+description = "Independent desktop voice process."
+
+[[bin]]
+name = "gouhuo-voice"
+path = "src/main.rs"
+
+[dependencies]
+client-runtime = { workspace = true, features = ["in-process", "ipc"] }
+protocol.workspace = true
+voice-core = { workspace = true, features = ["pipeline", "apm"] }
+voice-types.workspace = true
+
+[dev-dependencies]
+client-process.workspace = true
+client-core.workspace = true
+server = { path = "../server" }
+transport.workspace = true
+ed25519-dalek.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

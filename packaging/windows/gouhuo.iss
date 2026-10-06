@@ -18,6 +18,9 @@
 #ifndef OutputDir
   #define OutputDir "..\..\target\installer"
 #endif
+#ifndef VoiceExePath
+  #define VoiceExePath "..\..\target\dist\gouhuo-voice.exe"
+#endif
 
 [Setup]
 ; 这个 GUID 永远别改：Windows 靠它认出「这是同一个程序的新版本」，改了就会装出两份。
@@ -67,6 +70,7 @@ Name: "desktopicon"; Description: "在桌面上放一个快捷方式"; GroupDesc
 
 [Files]
 Source: "{#ExePath}"; DestDir: "{app}"; DestName: "gouhuo.exe"; Flags: ignoreversion
+Source: "{#VoiceExePath}"; DestDir: "{app}"; DestName: "gouhuo-voice.exe"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]

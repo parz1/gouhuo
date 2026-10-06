@@ -103,7 +103,7 @@ impl CallHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::pipeline::VoiceStats;
+    use voice_types::VoiceStats;
 
     #[test]
     fn udp_outage_keeps_audio_open_until_reconnect_and_can_recover_in_place() {

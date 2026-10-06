@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One presentation projection for the dock, local seat and member list.
 use crate::{RuntimeSnapshot, RuntimeStage};
-use voice_core::pipeline::TransmitMode;
+use voice_types::TransmitMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -148,7 +148,7 @@ impl SelfStateView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::pipeline::VoiceStats;
+    use voice_types::VoiceStats;
 
     #[test]
     fn a_failed_speaker_does_not_lie_about_sending() {

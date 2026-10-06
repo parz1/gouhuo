@@ -44,6 +44,8 @@ jobs:
 
       - name: 编安装包
         shell: pwsh
+        env:
+          GOUHUO_VOICE_PUBLIC_KEY: ${{ vars.GOUHUO_VOICE_PUBLIC_KEY }}
         run: .\packaging\windows\build.ps1
 
       - name: 编服务端

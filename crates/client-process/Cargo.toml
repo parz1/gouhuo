@@ -1,0 +1,24 @@
+[package]
+name = "client-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Client proxy and supervisor for the independent voice process."
+
+[dependencies]
+client-runtime = { workspace = true, features = ["ipc"] }
+voice-types.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+protocol.workspace = true
+zeroize = "1"
+
+[[bin]]
+name = "gouhuo-voice-release"
+path = "src/bin/release.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinHttp"] }

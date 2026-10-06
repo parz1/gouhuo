@@ -21,17 +21,16 @@ use std::sync::{Arc, Mutex};
 
 use call::SlintAdapter;
 use client_core::{Client, Ended, Event};
+use client_process::RuntimeHandle;
 use client_runtime::call::{
     AudioViewModel, CallCommand, CallController, CallState, CallViewModel, CommandResult,
 };
+use client_runtime::ipc::{Cue as Chime, StartVoice};
 use client_runtime::self_state::ConnectionState;
-use client_runtime::{recovery, Devices, RuntimeHandle, RuntimeStage, StartVoice, VoiceRuntime};
+use client_runtime::{recovery, Devices, RuntimeStage};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
-use voice_core::cue::{chime, Chime};
 use voice_core::identity::Identity;
-use voice_core::miccheck::scan_microphones_cancellable;
-use voice_core::pipeline::TransmitMode;
-use voice_core::tts::{speakable_name, Announcer};
+use voice_types::TransmitMode;
 
 /// 多久去问一次语音链路的状态。
 ///
@@ -68,8 +67,8 @@ const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(25
 mod call;
 mod campfire;
 mod discover;
+mod engine_update;
 mod join;
-mod platform_audio;
 mod settings;
 mod single_instance;
 mod ui_timing;
@@ -235,7 +234,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
 
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
-    let runtime = match VoiceRuntime::new(Arc::new(platform_audio::DesktopAudio)) {
+    let (runtime, engine_updates) = match engine_update::runtime(stored.check_updates) {
         Ok(runtime) => runtime,
         Err(error) => {
             show_fatal(&format!("语音运行线程无法启动：{error}"));
@@ -252,6 +251,7 @@ fn run(instance_key: &str) -> Result<(), Failure> {
     };
     let state = Arc::new(Mutex::new(State {
         runtime: Some(runtime.handle()),
+        engine_updates: Some(engine_updates),
         settings_writer: Some(settings_writer.handle()),
         settings: stored,
         ..State::default()
@@ -338,6 +338,9 @@ fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
         app.on_set_check_updates(move |on| {
             let mut locked = state.lock().expect("state poisoned");
             locked.settings.check_updates = on;
+            if let Some(updates) = &locked.engine_updates {
+                updates.set_enabled(on);
+            }
             locked.persist_settings();
             if let Some(app) = weak.upgrade() {
                 app.set_check_updates(on);
@@ -503,6 +506,7 @@ struct State {
     recovery_history: std::collections::VecDeque<String>,
     /// Commands/snapshots only. The portable runtime owns and retires audio.
     runtime: Option<RuntimeHandle>,
+    engine_updates: Option<engine_update::Controller>,
     settings: Settings,
     settings_writer: Option<SettingsWriterHandle>,
     /// 下拉框里第 n 项对应哪个设备 id。第 0 项是「系统默认」，所以是 None。
@@ -511,9 +515,6 @@ struct State {
     device_generation: u64,
     scan_generation: u64,
     scan_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// 念名字的后台线程。**第一次要念的时候才起** —— 大多数人不开这个功能，
-    /// 不该为它常驻一个线程和一个语音合成引擎。
-    announcer: Option<Announcer>,
     /// 篝火上谁坐哪块石头。跨刷新保留 —— 坐下了就不挪。
     seats: campfire::SeatMap,
     /// 第几次「加入」。每开始一次、每取消一次都加一。
@@ -1149,7 +1150,6 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         host: server.ip().to_string(),
         udp_port: server.port(),
         session_id,
-        sequences: Arc::clone(&keys.sequences),
         upstream_key: *keys.upstream.as_bytes(),
         downstream_key: *keys.downstream.as_bytes(),
         devices: Devices {
@@ -1165,7 +1165,6 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
 /// 第 0 项永远是「系统默认」—— 绝大多数人不该需要管这个，
 /// 而且它是唯一在换了耳机之后还能跟着走的选项。
 fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
-    use voice_core::wasapi::{list_endpoints, Direction};
     let generation = {
         let mut locked = state.lock().expect("state poisoned");
         locked.device_generation = locked.device_generation.wrapping_add(1);
@@ -1181,12 +1180,15 @@ fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
     let state = Arc::clone(state);
     std::thread::spawn(move || {
         let at = std::time::Instant::now();
-        let lists: Vec<_> = [Direction::Capture, Direction::Render]
+        let (capture, render) = current_runtime(&state)
+            .and_then(|runtime| runtime.devices().ok())
+            .unwrap_or_default();
+        let lists: Vec<_> = [capture, render]
             .into_iter()
-            .map(|direction| {
+            .map(|endpoints| {
                 let mut labels = vec![String::from("系统默认")];
                 let mut ids = vec![None];
-                for endpoint in list_endpoints(direction).unwrap_or_default() {
+                for endpoint in endpoints {
                     labels.push(format!(
                         "{}{}",
                         endpoint.name,
@@ -1311,7 +1313,9 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
                 }
             });
             let results = if ready {
-                scan_microphones_cancellable(SCAN_PER_DEVICE, Arc::clone(&cancel))
+                current_runtime(&state)
+                    .and_then(|runtime| runtime.scan(SCAN_PER_DEVICE, Arc::clone(&cancel)).ok())
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -1338,8 +1342,8 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
                             }
                         )
                         .into(),
-                        verdict: result.verdict().into(),
-                        ok: result.hears_something(),
+                        verdict: result.verdict.clone().into(),
+                        ok: result.hears_something,
                         id: result.id.clone().into(),
                     })
                     .collect::<Vec<_>>();
@@ -1384,6 +1388,14 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
         app.get_self_muted(),
         app.get_self_deafened()
     );
+    if let Some(runtime) = locked.runtime.as_ref() {
+        text.push_str(&format!(
+            "声音内核：{} / IPC {} / PID {:?}\n",
+            runtime.engine_version(),
+            client_runtime::ipc::VERSION,
+            runtime.process_id()
+        ));
+    }
     if let Some(stats) = locked.runtime.as_ref().and_then(|r| r.snapshot().voice) {
         text.push_str(&format!(
             "UDP：{} / RTT：{:.1} ms
@@ -1816,7 +1828,13 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 Some(recovery::Action::Lost) => connection_notice(&state, false),
                 Some(recovery::Action::Recovered) => connection_notice(&state, true),
                 Some(recovery::Action::RetryVoice) => {
-                    restart_voice(&app, &state);
+                    if runtime.needs_reauthentication() {
+                        if let Some(client) = &client {
+                            client.reconnect_transport();
+                        }
+                    } else {
+                        restart_voice(&app, &state);
+                    }
                     return;
                 }
                 Some(recovery::Action::Reconnect) => {
@@ -2022,51 +2040,37 @@ fn record_recovery(state: &Arc<Mutex<State>>, message: &str) {
 fn connection_notice(state: &Arc<Mutex<State>>, recovered: bool) {
     let locked = state.lock().expect("state poisoned");
     if locked.settings.cue_sounds {
-        if let Some(sink) = locked.runtime.as_ref().and_then(RuntimeHandle::cues) {
-            sink.clear();
-            sink.push(
-                &voice_core::cue::connection_chime(recovered),
+        if let Some(runtime) = &locked.runtime {
+            runtime.notice(
+                if recovered {
+                    Chime::Recovered
+                } else {
+                    Chime::Lost
+                },
+                None,
+                true,
                 locked.settings.cue_volume as f32 / 100.0,
             );
         }
     }
 }
 
-/// 有人进出我所在的频道：响一声，按设置再念个名字。
-///
-/// 声音塞进正在跑的那条链路的播放里（见 `voice_core::cue`）：连着服务器是
-/// 语音链路，没连的时候是设置页上的独立试麦 —— 后者只有 `preview` 会用到。
-/// 两个都没有就不响：没有地方可以放。
+/// Local notices are synthesized and mixed with the AEC reference in the engine.
 fn announce(state: &Arc<Mutex<State>>, kind: Chime, name: &str, preview: bool) {
-    let mut locked = state.lock().expect("state poisoned");
+    let locked = state.lock().expect("state poisoned");
     if locked.client.is_none() && !preview {
         return;
     }
-    let Some(sink) = locked.runtime.as_ref().and_then(RuntimeHandle::cues) else {
+    let Some(runtime) = &locked.runtime else {
         return;
     };
-    let settings = &locked.settings;
-    let gain = settings.cue_volume as f32 / 100.0;
-    let (sounds, names) = (settings.cue_sounds, settings.announce_names);
-    // 试听的时候两样都响，不管开没开 —— 不然两个都关着的人点了「试听」
-    // 什么也听不到，只会以为坏了。
-    if sounds || preview {
-        sink.push(&chime(kind), gain);
-    }
-    if names || preview {
-        if locked.announcer.is_none() {
-            locked.announcer = Announcer::start().ok();
-        }
-        if let Some(announcer) = &locked.announcer {
-            let verb = match kind {
-                Chime::CameIn => "进来了",
-                Chime::WentOut => "走了",
-            };
-            announcer.say(&format!("{}{verb}", speakable_name(name)), sink, gain);
-        }
-    }
+    runtime.notice(
+        kind,
+        (locked.settings.announce_names || preview).then(|| name.to_owned()),
+        locked.settings.cue_sounds || preview,
+        locked.settings.cue_volume as f32 / 100.0,
+    );
 }
-
 /// 单人音量在设置里按什么存：公钥的 base32。
 fn volume_key(public_key: &[u8]) -> String {
     protocol::base32::encode(public_key)

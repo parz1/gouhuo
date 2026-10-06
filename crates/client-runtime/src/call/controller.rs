@@ -3,9 +3,9 @@
 
 use client_core::Client;
 use protocol::control::Role;
-use voice_core::pipeline::TransmitMode;
+use voice_types::TransmitMode;
 
-use crate::{self_state::ConnectionState, RuntimeHandle};
+use crate::{self_state::ConnectionState, VoiceControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallCommand {
@@ -65,7 +65,7 @@ impl CallController {
     pub fn dispatch(
         command: CallCommand,
         client: &Client,
-        runtime: &RuntimeHandle,
+        runtime: &dyn VoiceControl,
     ) -> CommandResult {
         use CallCommand::*;
         match command {
@@ -193,7 +193,7 @@ impl CallController {
                     }
                     user.public_key.clone()
                 };
-                let percent = percent.min((voice_core::pipeline::MAX_VOLUME * 100.0) as u32);
+                let percent = percent.min((voice_types::MAX_VOLUME * 100.0) as u32);
                 runtime.set_volume(session, percent as f32 / 100.0);
                 CommandResult::VolumeChanged {
                     session,
@@ -210,7 +210,7 @@ impl CallController {
         }
     }
 
-    fn publish_self_state(client: &Client, runtime: &RuntimeHandle) -> CommandResult {
+    fn publish_self_state(client: &Client, runtime: &dyn VoiceControl) -> CommandResult {
         let intent = runtime.snapshot().intent;
         // Moderator mute remains a constraint, not the user's self-muted preference.
         client.set_self_state(intent.muted, intent.deafened);
@@ -223,7 +223,7 @@ impl CallController {
     /// The host supplies portable connection state, never a GUI property. Mode
     /// comes from the runtime. Reconnect/VAD also clear any stale pressed intent.
     pub fn set_ptt(
-        runtime: &RuntimeHandle,
+        runtime: &dyn VoiceControl,
         connection: ConnectionState,
         down: bool,
     ) -> CommandResult {
@@ -259,7 +259,7 @@ fn member_action_denied(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-process"))]
 mod tests {
     use super::*;
     use std::io;

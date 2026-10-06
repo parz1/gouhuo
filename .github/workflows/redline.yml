@@ -123,6 +123,18 @@ jobs:
         run: cargo test --workspace
       - name: quality-probe test
         run: cargo test -p voice-core --example quality-probe
+      - name: Build unchanged rehearsal client
+        run: cargo build --locked -p client
+      - name: Rehearse independent signed engine update
+        shell: pwsh
+        run: .\scripts\voice-update-rehearsal.ps1 -UiPath target/debug/gouhuo.exe
+      - name: Save independent update evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-update-rehearsal
+          path: target/voice-update-rehearsal/*/report.json
+          if-no-files-found: error
+          retention-days: 14
 
   # 跟声卡无关的内核和客户端逻辑也要能在 Linux 上开发、测试。
   # 不编 Windows 专用的 client / device-probe，也不在共享 runner 上卡延迟。
@@ -143,11 +155,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake build-essential
       - name: check
-        run: cargo check -p voice-core -p client-core -p client-runtime -p test-bot --all-targets
+        run: cargo check -p voice-core -p client-core -p client-runtime -p client-process -p voice-engine -p test-bot --all-targets
+      - name: frontend voice boundary
+        run: |
+          cargo check -p client-runtime --no-default-features --lib --locked
+          python3 scripts/check-voice-boundary.py
+          cargo test -p client-runtime --no-default-features --locked
       - name: clippy
-        run: cargo clippy -p voice-core -p client-core -p client-runtime -p latency-probe -p test-bot --all-targets -- -D warnings
+        run: cargo clippy -p voice-core -p client-core -p client-runtime -p client-process -p voice-engine -p latency-probe -p test-bot --all-targets -- -D warnings
       - name: test
-        run: cargo test -p voice-core -p client-core -p client-runtime -p latency-probe -p test-bot
+        run: cargo test -p voice-core -p client-core -p client-runtime -p client-process -p voice-engine -p latency-probe -p test-bot
       - name: quality-probe test
         run: cargo test -p voice-core --example quality-probe
 
