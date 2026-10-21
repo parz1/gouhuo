@@ -210,6 +210,8 @@ fn independent_update_rehearsal() {
     let caller = join(&invite, "update-rehearsal");
     handle.set_mode(TransmitMode::Always);
     handle.start_voice(StartVoice {
+        tcp_voice: false,
+        tcp_active: false,
         devices: devices.clone(),
         ..request(&caller)
     });
@@ -315,6 +317,8 @@ fn independent_update_rehearsal() {
     }
     let fresh = join(&invite, "updated-core-call");
     handle.start_voice(StartVoice {
+        tcp_voice: false,
+        tcp_active: false,
         devices: devices.clone(),
         ..request(&fresh)
     });
@@ -551,19 +555,24 @@ fn server() -> String {
 }
 
 fn join(invite: &str, name: &str) -> Client {
-    Client::connect_with(
+    let (client, events) = Client::connect_with(
         invite,
         &Identity::generate().unwrap(),
         name,
         Options::default(),
     )
-    .unwrap()
-    .0
+    .unwrap();
+    // Retain/drain events: dropping this receiver abandons the control link
+    // as soon as another participant causes a roster notification.
+    std::thread::spawn(move || for _ in events {});
+    client
 }
 
 fn request(client: &Client) -> StartVoice {
     let (session_id, endpoint, keys) = client.voice_endpoint_session();
     StartVoice {
+        tcp_voice: false,
+        tcp_active: false,
         host: endpoint.ip().to_string(),
         udp_port: endpoint.port(),
         session_id,
@@ -647,6 +656,8 @@ fn child_preserves_mute_ptt_and_nonce_sequences_across_device_replacement() {
         }
     }
     handle.start_voice(StartVoice {
+        tcp_voice: false,
+        tcp_active: false,
         devices: Devices {
             capture: Some("replacement".into()),
             render: None,
@@ -685,6 +696,8 @@ fn child_rejects_one_reused_direction_key_in_a_new_session() {
     let original_pid = handle.process_id();
     // One directional key being new does not permit resetting the other one.
     handle.start_voice(StartVoice {
+        tcp_voice: false,
+        tcp_active: false,
         session_id: old.session_id.wrapping_add(1),
         downstream_key: [42; 32],
         ..old
@@ -811,4 +824,179 @@ fn incompatible_handshake_exits_without_opening_devices() {
     .unwrap();
     wait(|| child.0.try_wait().unwrap().is_some());
     assert!(!child.0.wait().unwrap().success());
+}
+
+/// One socket preserves the observed address while we block and restore UDP.
+struct UdpGate {
+    address: std::net::SocketAddr,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl UdpGate {
+    fn new(server: std::net::SocketAddr) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        let blocked = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (blocking, stopping) = (Arc::clone(&blocked), Arc::clone(&stop));
+        let worker = std::thread::spawn(move || {
+            let mut engine = None;
+            let mut bytes = [0; protocol::MAX_DATAGRAM];
+            while !stopping.load(Ordering::Acquire) {
+                if let Ok((n, from)) = socket.recv_from(&mut bytes) {
+                    if from != server {
+                        engine = Some(from);
+                    }
+                    if blocking.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let target = if from == server { engine } else { Some(server) };
+                    if let Some(target) = target {
+                        let _ = socket.send_to(&bytes[..n], target);
+                    }
+                }
+            }
+        });
+        Self {
+            address,
+            blocked,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for UdpGate {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+fn wait_transport(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let until = Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            Instant::now() < until,
+            "voice transport condition timed out"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn process_tls_fallback_mixed_udp_mute_ptt_replacement_and_recovery() {
+    let invite = server();
+    let speaker = join(&invite, "pipe-tls-speaker");
+    let listener = join(&invite, "pipe-udp-listener");
+    let mut start = request(&speaker);
+    let gate = UdpGate::new(speaker.voice_endpoint_session().1);
+    start.udp_port = gate.address.port();
+    let runtime = VoiceRuntime::with_args(ENGINE, vec!["--synthetic".into()]).unwrap();
+    let peer_runtime = VoiceRuntime::with_args(ENGINE, vec!["--synthetic".into()]).unwrap();
+    let handle = runtime.handle();
+    let peer = peer_runtime.handle();
+    peer.set_mode(TransmitMode::Always);
+    peer.start_voice_with_tunnel(
+        request(&listener),
+        listener.voice_tunnel(listener.session_id()),
+    );
+    handle.set_mode(TransmitMode::PushToTalk);
+    handle.set_muted(true);
+    handle.start_voice_with_tunnel(start.clone(), speaker.voice_tunnel(speaker.session_id()));
+    wait_transport(Duration::from_secs(20), || {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|s| s.tcp_active && s.tcp_ok)
+    });
+    assert_eq!(
+        handle.snapshot().stage,
+        RuntimeStage::Ready,
+        "{:?}",
+        handle.snapshot()
+    );
+    assert_eq!(handle.snapshot().voice.unwrap().packets_sent, 0);
+    let pid = handle.process_id();
+    // Mixed UDP/TLS peers exchange real encrypted Opus in both directions.
+    wait(|| {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|s| s.packets_received > 5 && !s.receive_quality.is_empty())
+    });
+    handle.set_muted(false);
+    handle.set_transmitting(true);
+    wait(|| {
+        peer.snapshot()
+            .voice
+            .is_some_and(|s| s.packets_received > 5 && !s.receive_quality.is_empty())
+    });
+    handle.set_transmitting(false);
+    assert!(!handle.snapshot().voice.unwrap().transmitting);
+    std::thread::sleep(Duration::from_millis(150));
+    let sent = handle.snapshot().voice.unwrap().packets_sent;
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(handle.snapshot().voice.unwrap().packets_sent, sent);
+    // Replacing devices retains the confirmed TLS path and nonce allocator.
+    handle.start_voice_with_tunnel(
+        StartVoice {
+            devices: Devices {
+                capture: Some("replacement".into()),
+                render: None,
+            },
+            ..start
+        },
+        speaker.voice_tunnel(speaker.session_id()),
+    );
+    wait(|| {
+        handle.snapshot().stage == RuntimeStage::Ready
+            && handle
+                .snapshot()
+                .voice
+                .is_some_and(|s| s.tcp_active && s.tcp_ok)
+    });
+    assert_eq!(handle.snapshot().voice.unwrap().packets_sent, 0);
+    handle.set_transmitting(true);
+    wait(|| handle.snapshot().voice.is_some_and(|s| s.packets_sent > 5));
+    handle.set_muted(true);
+    assert!(!handle.snapshot().voice.unwrap().transmitting);
+    gate.blocked
+        .store(false, std::sync::atomic::Ordering::Release);
+    wait_transport(Duration::from_secs(15), || {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|s| s.udp_ok && !s.tcp_active)
+    });
+    assert_eq!(
+        handle.process_id(),
+        pid,
+        "path recovery must not replace the engine"
+    );
+    assert!(handle.snapshot().intent.muted);
+    assert!(handle.snapshot().timings.first_transport_ms.is_some());
+    // A retired process cannot send through the old session's TLS lane.
+    handle.retire_engine();
+    wait(|| handle.process_id().is_none());
+    assert!(handle.needs_reauthentication());
+    let old = speaker.voice_tunnel(speaker.session_id()).unwrap();
+    speaker.disconnect();
+    assert!(!old.send(&[1; 20]));
+    let fresh = join(&invite, "pipe-fresh");
+    handle.start_voice_with_tunnel(request(&fresh), fresh.voice_tunnel(fresh.session_id()));
+    wait(|| handle.snapshot().stage == RuntimeStage::Ready);
+    assert!(handle.snapshot().intent.muted);
+    assert!(!handle.needs_reauthentication());
+    handle.shutdown();
+    peer.shutdown();
+    assert!(runtime.wait_stopped(Duration::from_secs(3)));
+    assert!(peer_runtime.wait_stopped(Duration::from_secs(3)));
+    fresh.disconnect();
+    listener.disconnect();
 }

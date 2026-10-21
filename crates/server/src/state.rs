@@ -570,6 +570,7 @@ impl Server {
     pub fn welcome_for(&self, session: SessionId) -> Welcome {
         let me = self.users.get(&session);
         Welcome {
+            tcp_voice: false,
             session_id: session,
             name: me.map(|u| u.name.clone()).unwrap_or_default(),
             role: me.map(|u| u.role as i32).unwrap_or(Role::Guest as i32),

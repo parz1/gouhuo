@@ -3,7 +3,7 @@
 //! factories. The device boundary is fake; the lifecycle and network are real.
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -131,6 +131,7 @@ impl AudioBackend for Backend {
 
 fn request(socket: &UdpSocket, session_id: u32) -> StartVoice {
     StartVoice {
+        tunnel: None,
         host: "127.0.0.1".into(),
         udp_port: socket.local_addr().unwrap().port(),
         session_id,
@@ -183,12 +184,307 @@ fn received(socket: &UdpSocket, window: Duration) -> Vec<protocol::VoiceHeader> 
     headers
 }
 
+fn answer_probe(socket: &UdpSocket) {
+    let mut packet = [0; protocol::MAX_DATAGRAM];
+    if let Ok((n, peer)) = socket.recv_from(&mut packet) {
+        let mut payload = Vec::new();
+        let header = VoiceCipher::new(&[1; 32])
+            .open(&packet[..n], &mut payload)
+            .unwrap();
+        if header.is_keepalive() {
+            let mut reply = Vec::new();
+            VoiceCipher::new(&[2; 32])
+                .seal(header, &payload, &mut reply)
+                .unwrap();
+            socket.send_to(&reply, peer).unwrap();
+        }
+    }
+}
+
 fn drain(runtime: &VoiceRuntime, handle: &RuntimeHandle) {
     handle.shutdown();
     assert!(
         runtime.wait_stopped(Duration::from_secs(3)),
         "worker did not drain"
     );
+}
+
+struct PausedCapture {
+    inner: Box<dyn Capture>,
+    pause: Arc<AtomicBool>,
+}
+struct PausedRender {
+    inner: Box<dyn Render>,
+    pause: Arc<AtomicBool>,
+}
+
+fn pause_io(pause: &AtomicBool) {
+    // Bound the fake driver so assertion failures never leave teardown stuck.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pause.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl Capture for PausedCapture {
+    fn read(&mut self, out: &mut [f32]) -> io::Result<bool> {
+        pause_io(&self.pause);
+        self.inner.read(out)
+    }
+}
+impl Render for PausedRender {
+    fn write(&mut self, frame: &[f32]) -> io::Result<()> {
+        pause_io(&self.pause);
+        self.inner.write(frame)
+    }
+}
+
+struct ResilienceBackend {
+    inner: Backend,
+    pause_capture: Arc<AtomicBool>,
+    pause_render: Arc<AtomicBool>,
+    fail_processor: AtomicBool,
+    silence: AtomicBool,
+    capture_ids: Mutex<Vec<Option<String>>>,
+}
+
+impl Default for ResilienceBackend {
+    fn default() -> Self {
+        Self {
+            inner: Backend::plain(),
+            pause_capture: Arc::new(AtomicBool::new(false)),
+            pause_render: Arc::new(AtomicBool::new(false)),
+            fail_processor: AtomicBool::new(false),
+            silence: AtomicBool::new(false),
+            capture_ids: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+struct Passthrough;
+impl AudioProcessor for Passthrough {
+    fn process_capture(&self, _frame: &mut [f32]) {}
+    fn analyze_render(&self, _frame: &mut [f32]) {}
+}
+
+impl AudioBackend for ResilienceBackend {
+    fn capture(&self, device: Option<&str>) -> io::Result<OpenedCapture> {
+        self.capture_ids
+            .lock()
+            .unwrap()
+            .push(device.map(str::to_owned));
+        if device == Some("missing") {
+            return Err(io::Error::other("selected input disappeared"));
+        }
+        Ok(OpenedCapture::new(Box::new(PausedCapture {
+            inner: if self.silence.load(Ordering::SeqCst) {
+                Box::new(voice_core::audio::SyntheticCapture::new(Vec::new()).then_silence())
+            } else {
+                self.inner.capture(device)?.stream
+            },
+            pause: self.pause_capture.clone(),
+        })))
+    }
+    fn render(&self, device: Option<&str>) -> io::Result<Box<dyn Render>> {
+        Ok(Box::new(PausedRender {
+            inner: self.inner.render(device)?,
+            pause: self.pause_render.clone(),
+        }))
+    }
+    fn try_processor(&self) -> io::Result<Option<Box<dyn AudioProcessor>>> {
+        if self.fail_processor.load(Ordering::SeqCst) {
+            Err(io::Error::other("APM initialization failed"))
+        } else {
+            Ok(Some(Box::new(Passthrough)))
+        }
+    }
+}
+
+#[test]
+fn quiet_muted_mic_check_keeps_progress_and_reports_stalled_playback() {
+    let backend = Arc::new(ResilienceBackend::default());
+    backend.silence.store(true, Ordering::SeqCst);
+    let runtime = VoiceRuntime::new(backend.clone()).unwrap();
+    let handle = runtime.handle();
+    handle.set_deafened(true);
+    handle.start_mic_check(Devices::default());
+    wait("more than two seconds of silent capture", || {
+        handle.snapshot().audio_progress.capture_frames > 210
+    });
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.stage, RuntimeStage::Ready);
+    assert!(!snapshot.audio_progress.capture_stalled && !snapshot.audio_progress.render_stalled);
+    assert!(snapshot.mic.unwrap().error.is_none());
+    backend.pause_render.store(true, Ordering::SeqCst);
+    wait("mic-check playback stall", || {
+        handle.snapshot().audio_progress.render_stalled
+    });
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.stage, RuntimeStage::Failed);
+    assert!(snapshot.mic.as_ref().unwrap().input_available);
+    assert!(snapshot.mic.unwrap().error.unwrap().contains("播放"));
+    backend.pause_render.store(false, Ordering::SeqCst);
+    wait("mic-check playback recovers", || {
+        handle.snapshot().stage == RuntimeStage::Ready
+    });
+    assert!(handle.snapshot().intent.muted && handle.snapshot().intent.deafened);
+    drain(&runtime, &handle);
+}
+
+#[test]
+fn live_io_stalls_are_visible_and_clear_when_the_device_advances_again() {
+    let backend = Arc::new(ResilienceBackend::default());
+    let runtime = VoiceRuntime::new(backend.clone()).unwrap();
+    let handle = runtime.handle();
+    let socket = socket();
+    handle.set_mode(TransmitMode::Always);
+    handle.start_voice(request(&socket, 61));
+    wait("active devices", || {
+        answer_probe(&socket);
+        let p = handle.snapshot().audio_progress;
+        p.capture_frames > 5 && p.render_frames > 5
+    });
+    wait("authenticated healthy UDP", || {
+        answer_probe(&socket);
+        handle.snapshot().voice.is_some_and(|s| s.udp_ok)
+    });
+    for capture in [true, false] {
+        let pause = if capture {
+            &backend.pause_capture
+        } else {
+            &backend.pause_render
+        };
+        pause.store(true, Ordering::SeqCst);
+        wait("stalled I/O", || {
+            answer_probe(&socket);
+            let s = handle.snapshot();
+            if capture {
+                s.audio_progress.capture_stalled
+            } else {
+                s.audio_progress.render_stalled
+            }
+        });
+        let snapshot = handle.snapshot();
+        let stats = snapshot.voice.unwrap();
+        assert!(stats.udp_ok, "healthy network must not hide stalled audio");
+        assert_eq!(snapshot.stage, RuntimeStage::Failed);
+        if capture {
+            assert!(stats.capture_error.is_some() && !stats.input_available && !stats.transmitting);
+            assert!(stats.render_available && stats.render_error.is_none());
+        } else {
+            assert!(stats.render_error.is_some() && !stats.render_available);
+            assert!(stats.input_available && stats.transmitting && stats.capture_error.is_none());
+        }
+        handle.set_muted(true);
+        pause.store(false, Ordering::SeqCst);
+        wait("progress recovers", || {
+            let s = handle.snapshot();
+            !s.audio_progress.capture_stalled
+                && !s.audio_progress.render_stalled
+                && s.voice
+                    .is_some_and(|v| v.error.is_none() && v.input_available && v.render_available)
+        });
+        assert!(handle.snapshot().intent.muted);
+        assert!(!handle.snapshot().voice.unwrap().transmitting);
+        handle.set_muted(false);
+        wait("sending after explicit unmute", || {
+            handle.snapshot().voice.is_some_and(|s| s.transmitting)
+        });
+    }
+    drain(&runtime, &handle);
+}
+
+#[test]
+fn apm_failure_is_visible_in_call_and_mic_check_and_clears_after_success() {
+    use client_runtime::{
+        call::{CallState, CallViewModel},
+        ProcessorStatus,
+    };
+    let backend = Arc::new(ResilienceBackend::default());
+    backend.fail_processor.store(true, Ordering::SeqCst);
+    let runtime = VoiceRuntime::new(backend.clone()).unwrap();
+    let handle = runtime.handle();
+    let socket = socket();
+    handle.start_voice(request(&socket, 62));
+    wait("unprocessed voice still captures", || {
+        handle.snapshot().voice.is_some_and(|s| s.input_available)
+    });
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.processor, ProcessorStatus::Failed);
+    assert!(snapshot.error.is_none());
+    let mut call = CallState::default();
+    call.connected();
+    let view = CallViewModel::project_audio(&call, &snapshot, true);
+    assert!(!view.processor_warning.is_empty());
+    assert!(
+        view.recovery_message.is_empty(),
+        "APM warning must not claim voice disconnected"
+    );
+    handle.start_mic_check(Devices::default());
+    wait("unprocessed mic check", || {
+        handle.snapshot().mic.is_some_and(|s| s.input_available)
+    });
+    assert_eq!(handle.snapshot().processor, ProcessorStatus::Failed);
+    backend.fail_processor.store(false, Ordering::SeqCst);
+    handle.start_mic_check(Devices::default());
+    wait("working processor", || {
+        handle.snapshot().processor == ProcessorStatus::Active
+    });
+    assert!(
+        CallViewModel::project_audio(&call, &handle.snapshot(), true)
+            .processor_warning
+            .is_empty()
+    );
+    handle.stop();
+    assert!(handle.snapshot().processor.warning().is_empty());
+    drain(&runtime, &handle);
+}
+
+#[test]
+fn missing_selected_input_and_device_replacement_preserve_mute_and_deafen() {
+    let backend = Arc::new(ResilienceBackend::default());
+    let runtime = VoiceRuntime::new(backend.clone()).unwrap();
+    let handle = runtime.handle();
+    let socket = socket();
+    handle.set_mode(TransmitMode::Always);
+    handle.set_deafened(true);
+    let mut first = request(&socket, 63);
+    let sequences = first.sequences.clone();
+    first.devices.capture = Some("missing".into());
+    handle.start_voice(first);
+    wait("missing selected input", || {
+        handle
+            .snapshot()
+            .voice
+            .is_some_and(|s| s.capture_error.is_some())
+    });
+    assert_eq!(
+        *backend.capture_ids.lock().unwrap(),
+        vec![Some("missing".into())]
+    );
+    assert!(handle.snapshot().intent.muted && handle.snapshot().intent.deafened);
+    let mut replacement = request(&socket, 63);
+    replacement.sequences = sequences;
+    replacement.devices.capture = Some("replacement".into());
+    handle.start_voice(replacement);
+    wait("replacement input", || {
+        handle.snapshot().voice.is_some_and(|s| s.input_available)
+    });
+    assert!(handle.snapshot().intent.muted && handle.snapshot().intent.deafened);
+    assert!(!handle.snapshot().voice.unwrap().transmitting);
+    handle.set_deafened(false);
+    assert!(handle.snapshot().intent.muted);
+    assert!(received(&socket, Duration::from_millis(150))
+        .iter()
+        .all(|h| h.is_keepalive()));
+    handle.set_muted(false);
+    wait("explicit unmute", || {
+        handle.snapshot().voice.is_some_and(|s| s.transmitting)
+    });
+    assert!(received(&socket, Duration::from_millis(80))
+        .iter()
+        .any(|h| !h.is_keepalive()));
+    drain(&runtime, &handle);
 }
 
 #[test]

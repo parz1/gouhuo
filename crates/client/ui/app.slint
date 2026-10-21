@@ -229,6 +229,11 @@ export component App inherits Window {
     in-out property <bool> self-muted: false;
     in-out property <bool> self-deafened: false;
     // UDP 通不通。不通的时候要让用户看见，而不是让他纳闷为什么没声音。
+    in property <bool> tcp-voice;
+    in-out property <bool> diagnostic-recording: true;
+    in property <string> diagnostic-export-status;
+    callback set-diagnostic-recording(bool);
+    callback export-diagnostics();
     in property <bool> udp-ok: false;
     in property <bool> udp-failed: false;
     in property <string> diagnostics;
@@ -241,6 +246,8 @@ export component App inherits Window {
     // 顶上一条说明加一个取消按钮。退回登录页的话，网络抖一下用户就以为
     // 自己被踢了，而且会下意识去点「加入」—— 那恰恰是不用做的事。
     in property <string> reconnecting;
+    in property <string> processor-warning;
+    in property <string> quality-warning;
     in property <string> voice-notice;
     /// Rust view-model projection; CallPage only renders this summary.
     in property <string> recovery-message;
@@ -483,10 +490,17 @@ export component App inherits Window {
         transmitting: root.transmitting;
         self-status: root.self-status;
         recovery-message: root.recovery-message;
+        tcp-voice: root.tcp-voice;
+        diagnostic-recording: root.diagnostic-recording;
+        diagnostic-export-status: root.diagnostic-export-status;
+        set-diagnostic-recording(on) => { root.set-diagnostic-recording(on); }
+        export-diagnostics => { root.export-diagnostics(); }
         udp-ok: root.udp-ok;
         udp-failed: root.udp-failed;
         reconnecting: root.reconnecting;
         voice-error: root.voice-error;
+        processor-warning: root.processor-warning;
+        quality-warning: root.quality-warning;
         voice-notice: root.voice-notice;
         diagnostics: root.diagnostics;
         member-data: root.member-data;
@@ -565,6 +579,10 @@ export component App inherits Window {
                             color: Theme.dim;
                             font-size: 13px;
                             wrap: word-wrap;
+                        }
+                        if root.settings-tab == 0 && root.processor-warning != "": Text {
+                            text: root.processor-warning; wrap: word-wrap;
+                            color: Theme.warn; font-size: 12px;
                         }
                         if root.settings-tab == 0: Rectangle {
                             background: Theme.panel;

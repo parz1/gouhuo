@@ -66,6 +66,7 @@ const FIRE_FRAME_IDLE: std::time::Duration = std::time::Duration::from_millis(25
 
 mod call;
 mod campfire;
+mod diagnostic_log;
 mod discover;
 mod engine_update;
 mod history_view;
@@ -578,6 +579,7 @@ struct State {
     history_attempt: u32,
     history_operation: Option<std::sync::mpsc::Receiver<client_process::history::OperationResult>>,
     history_view_version: Option<(u64, u64, u64, bool)>,
+    diagnostic_log: diagnostic_log::Recorder,
     client: Option<Client>,
     call: CallState,
     recovery: client_runtime::health::CallHealth,
@@ -1293,17 +1295,22 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
     // Replacements preserve local intent. Volumes are staged before admission
     // so a candidate cannot send with stale/default controls.
     apply_volumes(state, client);
-    runtime.start_voice(StartVoice {
-        host: server.ip().to_string(),
-        udp_port: server.port(),
-        session_id,
-        upstream_key: *keys.upstream.as_bytes(),
-        downstream_key: *keys.downstream.as_bytes(),
-        devices: Devices {
-            capture: settings.capture_device,
-            render: settings.render_device,
+    runtime.start_voice_with_tunnel(
+        StartVoice {
+            tcp_voice: false,
+            tcp_active: false,
+            host: server.ip().to_string(),
+            udp_port: server.port(),
+            session_id,
+            upstream_key: *keys.upstream.as_bytes(),
+            downstream_key: *keys.downstream.as_bytes(),
+            devices: Devices {
+                capture: settings.capture_device,
+                render: settings.render_device,
+            },
         },
-    });
+        client.voice_tunnel(session_id),
+    );
     sync_audio(app, state);
 }
 
@@ -1357,13 +1364,13 @@ fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
                 return;
             }
             let mut models = Vec::new();
-            for (is_capture, (labels, ids)) in [true, false].into_iter().zip(lists) {
+            for (is_capture, (mut labels, mut ids)) in [true, false].into_iter().zip(lists) {
                 let saved = if is_capture {
                     &locked.settings.capture_device
                 } else {
                     &locked.settings.render_device
                 };
-                let index = ids.iter().position(|id| id == saved).unwrap_or(0) as i32;
+                let index = selected_device_index(&mut labels, &mut ids, saved) as i32;
                 let labels: Vec<SharedString> = labels.into_iter().map(Into::into).collect();
                 models.push((is_capture, index, ModelRc::new(VecModel::from(labels))));
                 if is_capture {
@@ -1543,7 +1550,20 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
             runtime.process_id()
         ));
     }
+    if let Some(snapshot) = locked.runtime.as_ref().map(|r| r.snapshot()) {
+        let progress = &snapshot.audio_progress;
+        text.push_str(&format!(
+            "音频处理：{:?}\n采集帧：{} / 距上次采集：{} ms / 停滞：{}\n播放帧：{} / 距上次播放：{} ms / 停滞：{}\n",
+            snapshot.processor, progress.capture_frames, progress.capture_age_ms, progress.capture_stalled,
+            progress.render_frames, progress.render_age_ms, progress.render_stalled
+        ));
+    }
     if let Some(stats) = locked.runtime.as_ref().and_then(|r| r.snapshot().voice) {
+        for speaker in &stats.receive_quality {
+            let q = &speaker.quality;
+            text.push_str(&format!("接收语音会话 {}：{:?}（最近10秒，接收估计）\n播放缺帧：{:.1}% / 最长连续缺帧：{} / 迟到：{} / 乱序：{}\nPLC：{:.1}% / 等待帧：{} / 缓冲溢出丢弃：{} / 过旧帧丢弃：{}\n到达间隔抖动峰值：{:.1} ms / 本地缓冲跨度：{:.1} ms / 目标缓冲：{:.1} ms\n",
+                speaker.session, q.level, q.missing_percent, q.max_loss_burst, q.late, q.reordered, q.plc_percent, q.waits, q.overflow, q.stale_dropped, q.jitter_ms, q.buffered_ms, q.target_ms));
+        }
         text.push_str(&format!(
             "UDP：{} / RTT：{:.1} ms
 发送包：{} / 收到包：{} / 播放等待：{}
@@ -1561,6 +1581,18 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
             stats.packets_received,
             stats.underruns,
             stats.input_db
+        ));
+    }
+    if let Some(stats) = locked.runtime.as_ref().and_then(|r| r.snapshot().voice) {
+        text.push_str(&format!(
+            "传输路径：{} / TLS语音探测：{} / 过期或溢出丢帧：{}\n",
+            if stats.tcp_active {
+                "TLS兼容连接"
+            } else {
+                "UDP"
+            },
+            stats.tcp_ok,
+            stats.tunnel_dropped
         ));
     }
     if let Some(client) = &locked.client {
@@ -1628,6 +1660,49 @@ fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
 
 /// 设置面板：切换说话方式、绑按住说话的键、试听麦克风、选设备。
 fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkeys>>) {
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_diagnostic_recording(move |enabled| {
+            state
+                .lock()
+                .expect("state poisoned")
+                .diagnostic_log
+                .set_enabled(enabled);
+            if let Some(app) = weak.upgrade() {
+                app.set_diagnostic_recording(enabled);
+                app.set_diagnostic_export_status(
+                    if enabled {
+                        "时间线正在记录；可直接导出最近的故障经过。"
+                    } else {
+                        "时间线已暂停，已有记录保留，可以导出。"
+                    }
+                    .into(),
+                );
+            }
+        });
+    }
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_export_diagnostics(move || {
+            let report = state
+                .lock()
+                .expect("state poisoned")
+                .diagnostic_log
+                .report();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let status = match diagnostic_log::export(&report) {
+                    Ok(path) => format!("已导出：{}", path.display()),
+                    Err(error) => format!("导出失败：{error}"),
+                };
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    app.set_diagnostic_export_status(status.into())
+                });
+            });
+        });
+    }
     {
         let state = Arc::clone(state);
         let weak = app.as_weak();
@@ -1708,7 +1783,9 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
             let Some(app) = weak.upgrade() else { return };
             {
                 let mut locked = state.lock().expect("state poisoned");
-                let id = locked.capture_ids.get(index as usize).cloned().flatten();
+                let Some(id) = locked.capture_ids.get(index as usize).cloned() else {
+                    return;
+                };
                 locked.settings.capture_device = id;
                 locked.persist_settings();
             }
@@ -1750,7 +1827,9 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
             let Some(app) = weak.upgrade() else { return };
             {
                 let mut locked = state.lock().expect("state poisoned");
-                let id = locked.render_ids.get(index as usize).cloned().flatten();
+                let Some(id) = locked.render_ids.get(index as usize).cloned() else {
+                    return;
+                };
                 locked.settings.render_device = id;
                 locked.persist_settings();
             }
@@ -2044,6 +2123,15 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
         };
         let Some(runtime) = runtime else { return };
         let snapshot = runtime.snapshot();
+        {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.diagnostic_log.set_engine(
+                &runtime.engine_version(),
+                runtime.process_id(),
+                runtime.needs_reauthentication(),
+            );
+            locked.diagnostic_log.sample(call.connection(), &snapshot);
+        }
         let reconnecting = call.connection() == ConnectionState::Reconnecting;
         let mut view = CallViewModel::project_audio(&call, &snapshot, ptt_bound);
         SlintAdapter::apply_audio(&app, &view);
@@ -3352,5 +3440,46 @@ mod tests {
     #[test]
     fn default_nick_is_never_empty() {
         assert!(!default_nick().is_empty());
+    }
+}
+
+/// Keep a missing saved selection visible; displaying "system default" would
+/// misrepresent the fixed microphone policy and make re-selection ambiguous.
+pub fn selected_device_index(
+    labels: &mut Vec<String>,
+    ids: &mut Vec<Option<String>>,
+    selected: &Option<String>,
+) -> usize {
+    if let Some(index) = ids.iter().position(|id| id == selected) {
+        return index;
+    }
+    labels.push("已选设备（当前不可用）".into());
+    ids.push(selected.clone());
+    ids.len() - 1
+}
+
+#[cfg(test)]
+mod device_selection_tests {
+    use super::*;
+
+    #[test]
+    fn missing_fixed_selection_stays_visible_and_does_not_select_default() {
+        let mut labels = vec!["系统默认".into(), "麦克风".into()];
+        let mut ids = vec![None, Some("present".into())];
+        let missing = Some("unplugged".into());
+        let index = selected_device_index(&mut labels, &mut ids, &missing);
+        assert_ne!(index, 0);
+        assert_eq!(ids[index], missing);
+        assert!(labels[index].contains("不可用"));
+        assert_eq!(
+            selected_device_index(&mut labels, &mut ids, &missing),
+            index
+        );
+        assert_eq!(ids.len(), 3);
+        assert_eq!(selected_device_index(&mut labels, &mut ids, &None), 0);
+        assert_eq!(
+            selected_device_index(&mut labels, &mut ids, &Some("present".into())),
+            1
+        );
     }
 }

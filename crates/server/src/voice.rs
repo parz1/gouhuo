@@ -33,7 +33,8 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use voice_core::tunnel::{DatagramQueue, ReplayWindow};
 
 use protocol::{ProtocolError, VoiceCipher, VoiceHeader, MAX_DATAGRAM};
 
@@ -43,11 +44,13 @@ use crate::state::SessionId;
 ///
 /// 64 个包在 20 ms 帧下是 1.28 秒。乱序超过这个程度的包，抖动缓冲那边
 /// 本来也早就放弃它了，丢掉不可惜。
-pub const REPLAY_WINDOW: u32 = 64;
+pub use voice_core::tunnel::REPLAY_WINDOW;
 
 /// 一个人的语音状态：两把密钥、学到的地址、防重放窗口。
 struct VoicePeer {
     /// 客户端发上来的包用这把开。
+    tcp: bool,
+    tunnel: Option<Arc<DatagramQueue>>,
     upstream: VoiceCipher,
     /// 转发给这个人的包用这把封。
     downstream: VoiceCipher,
@@ -106,6 +109,8 @@ impl VoiceRouter {
         peers.insert(
             session,
             VoicePeer {
+                tcp: false,
+                tunnel: None,
                 upstream: VoiceCipher::new(upstream),
                 downstream: VoiceCipher::new(downstream),
                 addr: None,
@@ -114,6 +119,57 @@ impl VoiceRouter {
                 keepalive_replay: ReplayWindow::default(),
             },
         );
+    }
+
+    pub fn attach_tunnel(&self, session: SessionId, queue: Arc<DatagramQueue>) {
+        if let Some(peer) = self.peers.lock().unwrap().get_mut(&session) {
+            peer.tunnel = Some(queue);
+        }
+    }
+
+    pub fn set_tcp(&self, session: SessionId, tcp: bool) {
+        if let Some(peer) = self.peers.lock().unwrap().get_mut(&session) {
+            peer.tcp = tcp;
+            if let Some(queue) = &peer.tunnel {
+                queue.clear();
+            }
+        }
+    }
+
+    /// TLS identity must match the encrypted header. Never learn a UDP address here.
+    pub fn accept_tunnel(&self, session: SessionId, datagram: &[u8]) -> Option<Incoming> {
+        if datagram.len() > MAX_DATAGRAM {
+            return None;
+        }
+        let mut peers = self.peers.lock().unwrap();
+        let peer = peers.get_mut(&session)?;
+        if !peer.tcp {
+            return None;
+        }
+        let mut payload = Vec::new();
+        let header = peer.upstream.open(datagram, &mut payload).ok()?;
+        if header.session != session {
+            return None;
+        }
+        let replay = if header.is_keepalive() {
+            &mut peer.keepalive_replay
+        } else {
+            &mut peer.replay
+        };
+        if !replay.accept(header.seq) {
+            return None;
+        }
+        if header.is_keepalive() {
+            let mut wire = Vec::new();
+            peer.downstream.seal(header, &[], &mut wire).ok()?;
+            peer.tunnel.as_ref()?.push(&wire);
+            return None;
+        }
+        Some(Incoming::Voice(Forward {
+            header,
+            payload,
+            from: session,
+        }))
     }
 
     /// 走人时摘掉。**必须摘** —— 留着的话，一个拿着旧密钥的人还能继续往
@@ -229,17 +285,20 @@ impl VoiceRouter {
                 let Some(peer) = peers.get(&target) else {
                     continue;
                 };
-                // 还没发过语音的人，我们不知道往哪发。等他自己先出声。
-                let Some(addr) = peer.addr else {
-                    continue;
-                };
+
                 let mut wire = Vec::with_capacity(MAX_DATAGRAM);
                 if peer
                     .downstream
                     .seal(forward.header, &forward.payload, &mut wire)
                     .is_ok()
                 {
-                    outgoing.push((addr, wire));
+                    if peer.tcp {
+                        if let Some(queue) = &peer.tunnel {
+                            queue.push(&wire);
+                        }
+                    } else if let Some(addr) = peer.addr {
+                        outgoing.push((addr, wire));
+                    }
                 }
             }
         }
@@ -260,59 +319,99 @@ impl VoiceRouter {
     }
 }
 
-/// 滑动窗口防重放。
-///
-/// 位图的第 0 位是 `highest` 本身，第 n 位是 `highest - n`。
-///
-/// seq 是 u32，20 ms 帧下约 994 天回绕，实际撞不上；但比较一律用
-/// **回绕减法**，这样万一真跑了三年也只是窗口重置一次，而不是从此
-/// 所有包都被当成重放丢掉。
-#[derive(Default)]
-struct ReplayWindow {
-    highest: u32,
-    bitmap: u64,
-    started: bool,
-}
-
-impl ReplayWindow {
-    fn accept(&mut self, seq: u32) -> bool {
-        if !self.started {
-            self.started = true;
-            self.highest = seq;
-            self.bitmap = 1;
-            return true;
-        }
-
-        let ahead = seq.wrapping_sub(self.highest) as i32;
-        if ahead > 0 {
-            let step = ahead as u32;
-            self.bitmap = if step >= REPLAY_WINDOW {
-                1
-            } else {
-                (self.bitmap << step) | 1
-            };
-            self.highest = seq;
-            true
-        } else {
-            let back = ahead.unsigned_abs();
-            if back >= REPLAY_WINDOW {
-                // 太旧了。抖动缓冲那边早就放弃它了。
-                return false;
-            }
-            let mask = 1u64 << back;
-            if self.bitmap & mask != 0 {
-                return false;
-            }
-            self.bitmap |= mask;
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::FLAG_KEEPALIVE;
+
+    #[test]
+    fn tunnel_requires_selected_authenticated_session_and_shares_replay_window() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        router.register(7, &[1; 32], &[2; 32]);
+        router.register(8, &[1; 32], &[3; 32]);
+        let queue = Arc::new(DatagramQueue::default());
+        router.attach_tunnel(7, Arc::clone(&queue));
+        let cipher = VoiceCipher::new(&[1; 32]);
+        let packet = |session, seq, flags| {
+            let mut bytes = Vec::new();
+            cipher
+                .seal(
+                    VoiceHeader {
+                        session,
+                        seq,
+                        timestamp: 0,
+                        flags,
+                    },
+                    &[1; 20],
+                    &mut bytes,
+                )
+                .unwrap();
+            bytes
+        };
+        assert!(router.accept_tunnel(7, &packet(7, 1, 0)).is_none());
+        router.set_tcp(7, true);
+        assert!(
+            router.accept_tunnel(7, &packet(8, 1, 0)).is_none(),
+            "TLS identity must override claimed session, even with matching keys"
+        );
+        let voice = packet(7, 1, 0);
+        assert!(matches!(
+            router.accept_tunnel(7, &voice),
+            Some(Incoming::Voice(_))
+        ));
+        assert!(
+            router
+                .accept("127.0.0.1:12345".parse().unwrap(), &voice)
+                .is_none(),
+            "cross-path replay accepted"
+        );
+        assert_eq!(
+            router.packets_received(7),
+            0,
+            "TLS must not make UDP appear healthy"
+        );
+        assert!(router.peers.lock().unwrap()[&7].addr.is_none());
+        assert!(router
+            .accept_tunnel(7, &packet(7, 2, FLAG_KEEPALIVE))
+            .is_none());
+        assert!(
+            queue.pop(std::time::Duration::ZERO).is_some(),
+            "TLS probes must echo through TLS"
+        );
+        router.unregister(7);
+        assert!(router.accept_tunnel(7, &packet(7, 3, 0)).is_none());
+    }
+
+    #[test]
+    fn tunnel_recipient_does_not_need_a_udp_address_and_path_change_flushes_audio() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        router.register(8, &[1; 32], &[2; 32]);
+        let queue = Arc::new(DatagramQueue::default());
+        router.attach_tunnel(8, Arc::clone(&queue));
+        router.set_tcp(8, true);
+        let forward = Forward {
+            header: VoiceHeader {
+                session: 7,
+                seq: 3,
+                timestamp: 0,
+                flags: 0,
+            },
+            payload: vec![1, 2, 3],
+            from: 7,
+        };
+        router.deliver(&forward, &[8]);
+        let packet = queue.pop(std::time::Duration::ZERO).unwrap();
+        let mut payload = Vec::new();
+        let header = VoiceCipher::new(&[2; 32])
+            .open(&packet.bytes, &mut payload)
+            .unwrap();
+        assert_eq!(header.session, 7);
+        assert_eq!(payload, [1, 2, 3]);
+        router.set_tcp(8, false);
+        assert!(!queue.valid(&packet));
+        router.deliver(&forward, &[8]);
+        assert!(queue.pop(std::time::Duration::ZERO).is_none());
+    }
 
     #[test]
     fn in_order_packets_all_pass() {

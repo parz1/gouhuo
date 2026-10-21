@@ -153,13 +153,16 @@ fn upstream_outage_keeps_rendering_then_recovers_without_audio_retry_churn() {
         "{reports:?}"
     );
     assert!(
-        reports.iter().any(|r| r["event"] == "tcp_reconnected"),
+        !reports.iter().any(|r| r["event"] == "tcp_reconnected"),
         "{reports:?}"
     );
     assert!(
         reports.iter().any(|r| r["action"] == "Recovered"),
         "{reports:?}"
     );
+    assert!(reports
+        .iter()
+        .any(|r| r["tcp_active"] == true && r["tcp_ok"] == true));
     let during: Vec<_> = reports
         .iter()
         .filter(|r| {
@@ -173,7 +176,7 @@ fn upstream_outage_keeps_rendering_then_recovers_without_audio_retry_churn() {
     );
     let final_report = reports.iter().find(|r| r["event"] == "finished").unwrap();
     assert_eq!(final_report["udp_ok"], true, "{final_report}");
-    assert_eq!(final_report["audio_opens"], 2, "{final_report}");
+    assert_eq!(final_report["audio_opens"], 1, "{final_report}");
 }
 
 #[test]
@@ -302,4 +305,51 @@ fn cli_loops_wav_and_writes_private_jsonl_without_overwriting() {
         std::fs::remove_file(path).unwrap();
     }
     std::fs::remove_dir(dir).unwrap();
+}
+
+fn blocked_udp_falls_back_and_returns(direction: Direction) {
+    let (invite, hub) = server();
+    let mut blocked = config(&invite, 25);
+    blocked.impairment.outage_at = Duration::ZERO;
+    blocked.impairment.outage_for = Duration::from_secs(16);
+    blocked.impairment.direction = direction;
+    let reports = run(vec![blocked, config(&invite, 25)], &hub);
+    for bot in [1, 2] {
+        let middle: Vec<_> = reports
+            .iter()
+            .filter(|r| {
+                r["bot"] == bot
+                    && r["event"] == "sample"
+                    && (12000..16000).contains(&r["elapsed_ms"].as_u64().unwrap())
+            })
+            .collect();
+        assert!(middle.len() >= 3, "{reports:?}");
+        assert!(
+            middle.last().unwrap()["audible_frames"].as_u64().unwrap()
+                > middle.first().unwrap()["audible_frames"].as_u64().unwrap() + 50,
+            "TLS/UDP mixed peers must hear each other: {middle:?}"
+        );
+        let final_row = reports
+            .iter()
+            .find(|r| r["bot"] == bot && r["event"] == "finished")
+            .unwrap();
+        assert_eq!(final_row["udp_ok"], true, "{final_row}");
+        assert_eq!(final_row["tcp_active"], false, "{final_row}");
+        assert_eq!(final_row["audio_opens"], 1, "{final_row}");
+        assert_eq!(final_row["generation"], 1, "{final_row}");
+    }
+    assert!(reports.iter().any(|r| r["bot"] == 1 && r["tcp_ok"] == true));
+    assert!(!reports.iter().any(|r| r["event"] == "tcp_reconnected"
+        || r["action"] == "RetryVoice"
+        || r["action"] == "Reconnect"));
+}
+
+#[test]
+fn blocked_both_directions_falls_back_and_returns_without_reopening_audio() {
+    blocked_udp_falls_back_and_returns(Direction::Both);
+}
+
+#[test]
+fn blocked_downlink_falls_back_and_returns_without_reopening_audio() {
+    blocked_udp_falls_back_and_returns(Direction::Down);
 }

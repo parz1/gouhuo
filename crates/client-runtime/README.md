@@ -81,7 +81,7 @@ or perform other blocking work. Only `CaptureInfo` crosses the platform boundary
 
 `Preparing` means background initialization is pending. `Starting` means the
 pipeline exists but the required devices or authenticated UDP probe are still
-pending. `Ready` requires capture, playback and UDP health. `RuntimeSnapshot.timings`
+pending. `Ready` requires capture, playback and authenticated transport health (UDP or negotiated TLS fallback). `RuntimeSnapshot.timings`
 records measured queue/retirement/DNS/processor/start durations and times from
 request submission to the first successful capture/render frame. Authenticated
 UDP readiness is first observed by the worker with up to 20 ms polling delay.
@@ -106,3 +106,9 @@ commands, alongside pure self-state and recovery policy tests.
 cargo test -p client-runtime --offline
 cargo clippy -p client-runtime --all-targets --offline -- -D warnings
 ```
+
+The desktop process adapter uses IPC v2. It forwards bounded encrypted datagrams
+between the TLS connection and an engine-local `VoiceTunnel`; PCM and nonce
+allocation remain inside the engine. Request IDs, control revisions and process
+generations invalidate stale replies. Portable snapshots include processor status,
+device progress, TLS health and ten-second receive quality in `voice-types`.

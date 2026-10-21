@@ -26,6 +26,8 @@ pub enum TransmitMode {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VoiceStats {
+    /// Per-speaker receive/playout evidence over the most recent ten seconds.
+    pub receive_quality: Vec<SpeakerQuality>,
     pub sequences_exhausted: bool,
     pub udp_failed: bool,
     pub error: Option<String>,
@@ -40,6 +42,10 @@ pub struct VoiceStats {
     pub render_available: bool,
     /// UDP 双向保活是否正常；不通时由客户端执行恢复策略。
     pub udp_ok: bool,
+    /// Confirmed TLS path and fresh bidirectional TLS voice probe.
+    pub tcp_active: bool,
+    pub tcp_ok: bool,
+    pub tunnel_dropped: u64,
     /// 最近一次保活的往返时间，毫秒。
     pub rtt_ms: f64,
     pub packets_sent: u64,
@@ -54,4 +60,61 @@ pub struct VoiceStats {
     /// **是 APM 处理之后的值** —— 那才是真正会被发出去的东西。
     /// 界面上拿它画电平条，用户据此判断「麦克风到底有没有在收音」。
     pub input_db: f32,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerQuality {
+    pub session: u32,
+    pub quality: ReceiveQuality,
+}
+
+impl VoiceStats {
+    pub fn transport_ok(&self) -> bool {
+        if self.tcp_active {
+            self.tcp_ok
+        } else {
+            self.udp_ok
+        }
+    }
+    pub fn path_failed(&self) -> bool {
+        if self.tcp_active {
+            !self.tcp_ok
+        } else {
+            self.udp_failed
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QualityLevel {
+    #[default]
+    Unknown,
+    Good,
+    Degraded,
+    Poor,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReceiveQuality {
+    pub level: QualityLevel,
+    pub received: u64,
+    pub played: u64,
+    pub missing: u64,
+    pub late: u64,
+    pub reordered: u64,
+    pub concealed: u64,
+    pub waits: u64,
+    pub overflow: u64,
+    pub stale_dropped: u64,
+    pub max_loss_burst: u64,
+    pub missing_percent: f64,
+    pub plc_percent: f64,
+    /// Variation in transit times; independent of sender/local clock offset.
+    pub jitter_ms: f64,
+    /// Current local queue span, including gaps, not mouth-to-ear latency.
+    pub buffered_ms: f64,
+    pub target_ms: f64,
 }

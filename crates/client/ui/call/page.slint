@@ -2,6 +2,7 @@
 import { Row, ChatRow } from "types.slint";
 import { Seat, SeatGeometry } from "../campfire.slint";
 import { CallTokens } from "tokens.slint";
+import { CallButton } from "controls/button.slint";
 import { CallHeader } from "header.slint";
 import { ChannelNavigator } from "navigator.slint";
 import { RecoverySummary } from "recovery-summary.slint";
@@ -39,10 +40,17 @@ export component CallPage inherits Rectangle {
     in property <bool> transmitting;
     in property <string> self-status;
     in property <string> recovery-message;
+    in property <bool> tcp-voice;
+    in property <bool> diagnostic-recording;
+    in property <string> diagnostic-export-status;
+    callback set-diagnostic-recording(bool);
+    callback export-diagnostics();
     in property <bool> udp-ok;
     in property <bool> udp-failed;
     in property <string> reconnecting;
     in property <string> voice-error;
+    in property <string> processor-warning;
+    in property <string> quality-warning;
     in property <string> voice-notice;
     in property <string> diagnostics;
     in property <Row> member-data;
@@ -164,11 +172,30 @@ export component CallPage inherits Rectangle {
                         leave => { root.leave(); }
                     }
                     Rectangle { height: 1px; background: CallTokens.line; }
+                    if root.tcp-voice: Text { text: "兼容连接 · 延迟可能增加"; height: 24px; color: CallTokens.dim; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    if root.processor-warning != "": Rectangle {
+                        background: CallTokens.panel;
+                        HorizontalLayout {
+                            padding: 8px; spacing: 8px;
+                            Text {
+                                text: root.processor-warning; wrap: word-wrap;
+                                horizontal-stretch: 1; min-width: 0;
+                                color: CallTokens.warm; font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            CallButton { width: 72px; height: 30px; label: "重试语音"; clicked => { root.retry-voice(); } }
+                        }
+                    }
                     if root.recovery-message != "": RecoverySummary {
                         message: root.recovery-message; reconnecting: root.reconnecting != "";
                         retry => { root.retry-voice(); }
                         cancel => { root.leave(); }
                         details => { root.close-overlay(false); root.overlay = 5; }
+                    }
+                    if root.quality-warning != "": Text {
+                        text: root.quality-warning; wrap: word-wrap;
+                        color: CallTokens.warm; font-size: 12px;
+                        horizontal-alignment: center;
                     }
                     content := Rectangle {
                         vertical-stretch: 1;
@@ -185,7 +212,7 @@ export component CallPage inherits Rectangle {
                                 delete-channel(id) => { root.delete-channel(id); }
                                 rename-channel(id, name) => { root.rename-channel(id, name); }
                             }
-                            if !(root.narrow && root.tree-open) && root.diagnostics-open: DiagnosticsPane { report: root.diagnostics; refresh => { root.show-diagnostics(); } close => { root.diagnostics-open = false; root.more-focus += 1; } }
+                            if !(root.narrow && root.tree-open) && root.diagnostics-open: DiagnosticsPane { recording: root.diagnostic-recording; export-status: root.diagnostic-export-status; set-recording(on) => { root.set-diagnostic-recording(on); } export-report => { root.export-diagnostics(); } report: root.diagnostics; refresh => { root.show-diagnostics(); } close => { root.diagnostics-open = false; root.more-focus += 1; } }
                             if !(root.narrow && root.tree-open) && !root.diagnostics-open && root.chat-open: ChatPane { lines: root.chat; draft <=> root.draft; send => { root.send-text(); } }
                             if root.scene-shown: SceneHost { seats: root.seats; waiting: root.waiting; geometry: root.scene-geometry; waiting-talking: root.waiting-talking; transmitting: root.transmitting; stale: root.reconnecting != ""; backdrop: root.backdrop; restore-member: root.menu-origin == 2 ? root.restore-member : -1; resized(w, h) => { root.campfire-resized(w, h); } open-member(id) => { root.member(id, 2); } }
                         }

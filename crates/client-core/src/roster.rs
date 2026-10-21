@@ -437,6 +437,7 @@ mod tests {
     #[test]
     fn welcome_populates_everything() {
         let welcome = Welcome {
+            tcp_voice: false,
             session_id: 3,
             name: "阿狸".into(),
             role: Role::Member as i32,

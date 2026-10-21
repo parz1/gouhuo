@@ -22,6 +22,9 @@ pub const CASES: &[&str] = &[
     "capture-failed",
     "render-failed",
     "udp-failed",
+    "tcp-fallback",
+    "apm-failed",
+    "weak-network",
     "long-nickname-key",
     "alone",
     "eight-members",
@@ -404,6 +407,8 @@ impl Fixture {
         app.set_reconnecting("".into());
         app.set_voice_error("".into());
         app.set_voice_notice("".into());
+        app.set_processor_warning("".into());
+        app.set_quality_warning("".into());
         app.set_self_status("等待人声".into());
         app.set_recovery_message("".into());
         app.set_self_muted(false);
@@ -414,6 +419,7 @@ impl Fixture {
         app.set_input_available(true);
         app.set_render_available(true);
         app.set_input_level(0.34);
+        app.set_tcp_voice(false);
         app.set_udp_ok(true);
         app.set_udp_failed(false);
         app.set_transmitting(false);
@@ -456,6 +462,19 @@ impl Fixture {
                 app.set_transmitting(true);
                 app.set_input_level(0.76);
                 app.set_self_status("正在发送 · 播放不可用".into());
+            }
+            "tcp-fallback" => {
+                app.set_tcp_voice(true);
+                app.set_udp_ok(false);
+            }
+            "apm-failed" => {
+                app.set_processor_warning(client_runtime::ProcessorStatus::Failed.warning().into());
+            }
+            "weak-network" => {
+                app.set_quality_warning("接收语音质量波动（1 路） · 详情见诊断信息".into());
+                app.set_diagnostic_recording(true);
+                app.set_diagnostic_export_status("".into());
+                app.set_diagnostics("UDP：双向保活正常\n接收语音会话 8：卡顿（最近10秒，接收估计）\n播放缺帧：5.0% / 最长连续缺帧：6\n迟到：4 / 乱序：8 / PLC：8.0%\n本地缓冲跨度：60 ms / 目标缓冲：40 ms\n\n时间线自动保留最近5分钟，无需提前开启记录。\n不录音，不保存聊天、昵称、设备名称或密钥。".into());
             }
             "udp-failed" => {
                 app.set_udp_failed(true);

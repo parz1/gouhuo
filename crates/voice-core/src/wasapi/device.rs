@@ -367,7 +367,7 @@ unsafe fn read_format(wfx: *const WAVEFORMATEX) -> Option<Format> {
     })
 }
 
-fn device_id(device: &IMMDevice) -> windows::core::Result<String> {
+pub(super) fn device_id(device: &IMMDevice) -> windows::core::Result<String> {
     let id = unsafe { device.GetId()? };
     let s = unsafe { id.to_string() }.unwrap_or_default();
     unsafe { CoTaskMemFree(Some(id.0 as *const _)) };

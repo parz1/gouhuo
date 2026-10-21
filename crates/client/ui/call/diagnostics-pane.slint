@@ -5,6 +5,10 @@ import { CallButton } from "controls/button.slint";
 
 export component DiagnosticsPane inherits Rectangle {
     in property <string> report;
+    in property <bool> recording;
+    in property <string> export-status;
+    callback set-recording(bool);
+    callback export-report();
     callback refresh();
     callback close();
     VerticalLayout {
@@ -17,6 +21,12 @@ export component DiagnosticsPane inherits Rectangle {
             CallButton { width: 64px; height: 32px; label: "刷新"; clicked => { root.refresh(); } }
             Text { text: "选中文字，Ctrl+C 复制"; min-width: 0; overflow: elide; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
         }
+        HorizontalLayout {
+            height: 32px; spacing: 8px;
+            CallButton { label: root.recording ? "暂停时间线" : "继续时间线"; clicked => { root.set-recording(!root.recording); } }
+            CallButton { label: "导出记录"; clicked => { root.export-report(); } }
+        }
+        Text { text: root.export-status != "" ? root.export-status : "自动保留最近5分钟的状态时间线（最多1800条），可直接导出；不录音，退出后清空。"; wrap: word-wrap; color: CallTokens.dim; font-size: 11px; }
         ScrollView {
             vertical-stretch: 1;
             TextInput { text: root.report; read-only: true; single-line: false; color: CallTokens.text; font-family: CallTokens.font; font-size: 12px; wrap: word-wrap; }

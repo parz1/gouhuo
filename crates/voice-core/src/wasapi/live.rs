@@ -36,6 +36,7 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
@@ -85,21 +86,82 @@ impl OpenedOn {
     }
 }
 
-/// 按 id 打开设备；打不开就退回系统默认。
-///
-/// 存下来的设备 id 会失效 —— 耳机拔了、蓝牙断了、驱动重装了。那种时候
-/// **绝不能就此没声音**：用户拔个耳机而已，他不会想到要去设置里重选一遍。
-/// 退回默认至少还能说话，名字也会在界面上显示成实际用的那个。
+/// Fixed microphones must never silently fall back to another input.
+/// Output retains fallback so a missing speaker does not prevent listening.
 fn open_or_default(
     id: Option<&str>,
     direction: Direction,
 ) -> windows::core::Result<windows::Win32::Media::Audio::IMMDevice> {
-    if let Some(id) = id {
-        if let Ok(device) = crate::wasapi::open_device(Some(id), direction) {
-            return Ok(device);
-        }
+    resolve_device(id, direction, |id| {
+        crate::wasapi::open_device(id, direction)
+    })
+}
+
+fn resolve_device<T, E>(
+    id: Option<&str>,
+    direction: Direction,
+    mut open: impl FnMut(Option<&str>) -> Result<T, E>,
+) -> Result<T, E> {
+    match open(id) {
+        Err(_) if id.is_some() && direction == Direction::Render => open(None),
+        result => result,
     }
-    crate::wasapi::open_device(None, direction)
+}
+
+/// Checked on the owning audio thread, at most once a second. Returning an
+/// error lets the lifecycle rebuild with the latest mute/PTT intentions.
+struct DefaultWatch {
+    id: Option<String>,
+    checked_at: Instant,
+    direction: Direction,
+}
+
+impl DefaultWatch {
+    fn new(
+        device: &windows::Win32::Media::Audio::IMMDevice,
+        follows_default: bool,
+        direction: Direction,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            id: if follows_default {
+                Some(crate::wasapi::device::device_id(device).map_err(|e| err("读取设备标识", e))?)
+            } else {
+                None
+            },
+            checked_at: Instant::now(),
+            direction,
+        })
+    }
+
+    fn check(&mut self) -> io::Result<()> {
+        let direction = self.direction;
+        self.check_with(Instant::now(), || {
+            let device = crate::wasapi::open_device(None, direction)
+                .map_err(|e| err("系统默认音频设备不可用", e))?;
+            crate::wasapi::device::device_id(&device).map_err(|e| err("读取默认设备标识", e))
+        })
+    }
+
+    fn check_with(
+        &mut self,
+        now: Instant,
+        current_default: impl FnOnce() -> io::Result<String>,
+    ) -> io::Result<()> {
+        let Some(id) = &self.id else {
+            return Ok(());
+        };
+        if now.saturating_duration_since(self.checked_at) < Duration::from_secs(1) {
+            return Ok(());
+        }
+        self.checked_at = now;
+        let current = current_default()?;
+        if current != *id {
+            return Err(io::Error::other(
+                "系统默认音频设备已切换，正在恢复语音；闭麦状态会保留。",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn err(context: &str, e: windows::core::Error) -> io::Error {
@@ -145,6 +207,7 @@ pub struct WasapiCapture {
 }
 
 struct CaptureStream {
+    default_watch: DefaultWatch,
     _com: crate::wasapi::ComGuard,
     client: IAudioClient,
     capture: IAudioCaptureClient,
@@ -186,8 +249,15 @@ impl WasapiCapture {
     fn open(&mut self) -> io::Result<&mut CaptureStream> {
         if self.stream.is_none() {
             let com = crate::wasapi::ComGuard::new();
-            let device = open_or_default(self.device_id.as_deref(), Direction::Capture)
-                .map_err(|e| err("打不开录音设备", e))?;
+            let device =
+                open_or_default(self.device_id.as_deref(), Direction::Capture).map_err(|e| {
+                    err(
+                        "指定或默认麦克风不可用；请检查连接或在设置里重新选择麦克风，不会自动换麦",
+                        e,
+                    )
+                })?;
+            let default_watch =
+                DefaultWatch::new(&device, self.device_id.is_none(), Direction::Capture)?;
             *self.name.lock().expect("name poisoned") = crate::wasapi::device_name(&device);
             self.is_hardware.store(
                 crate::wasapi::device_is_hardware(&device),
@@ -207,6 +277,7 @@ impl WasapiCapture {
                 unsafe { client.GetService() }.map_err(|e| err("取采集接口", e))?;
             unsafe { client.Start() }.map_err(|e| err("启动录音流", e))?;
             self.stream = Some(CaptureStream {
+                default_watch,
                 _com: com,
                 client,
                 capture,
@@ -232,6 +303,7 @@ impl Capture for WasapiCapture {
         } = self;
         let stream = stream.as_mut().expect("刚打开过");
         stream.opened_on.check("录音")?;
+        stream.default_watch.check()?;
         let channels = stream.format.channels as usize;
 
         while pending.len() < out.len() {
@@ -369,6 +441,7 @@ pub struct WasapiRender {
 }
 
 struct RenderStream {
+    default_watch: DefaultWatch,
     _com: crate::wasapi::ComGuard,
     client: IAudioClient,
     render: IAudioRenderClient,
@@ -395,6 +468,8 @@ impl WasapiRender {
             let com = crate::wasapi::ComGuard::new();
             let device = open_or_default(self.device_id.as_deref(), Direction::Render)
                 .map_err(|e| err("打不开播放设备", e))?;
+            let default_watch =
+                DefaultWatch::new(&device, self.device_id.is_none(), Direction::Render)?;
             let Opened {
                 client,
                 event,
@@ -429,6 +504,7 @@ impl WasapiRender {
 
             unsafe { client.Start() }.map_err(|e| err("启动播放流", e))?;
             self.stream = Some(RenderStream {
+                default_watch,
                 _com: com,
                 client,
                 render,
@@ -450,6 +526,7 @@ impl Render for WasapiRender {
         } = self;
         let stream = stream.as_mut().expect("刚打开过");
         stream.opened_on.check("播放")?;
+        stream.default_watch.check()?;
         let channels = stream.format.channels as usize;
         let sample_bytes = stream.format.bits as usize / 8;
         let bytes_per_frame = channels * sample_bytes;
@@ -526,6 +603,73 @@ fn upmix_into(mono: &[f32], channels: usize, format: &Format, out: &mut Vec<u8>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_microphone_failure_never_opens_default_input() {
+        let mut attempts = Vec::new();
+        let result = super::resolve_device(Some("missing"), super::Direction::Capture, |id| {
+            attempts.push(id.map(str::to_owned));
+            if id.is_some() {
+                Err("missing microphone")
+            } else {
+                Ok("other microphone")
+            }
+        });
+        assert_eq!(result, Err("missing microphone"));
+        assert_eq!(attempts, vec![Some("missing".into())]);
+    }
+
+    #[test]
+    fn fixed_output_failure_can_fall_back_but_success_keeps_selection() {
+        let mut attempts = Vec::new();
+        let result = super::resolve_device(Some("missing"), super::Direction::Render, |id| {
+            attempts.push(id.map(str::to_owned));
+            if id.is_some() {
+                Err("missing speaker")
+            } else {
+                Ok("default speaker")
+            }
+        });
+        assert_eq!(result, Ok("default speaker"));
+        assert_eq!(attempts, vec![Some("missing".into()), None]);
+        let result = super::resolve_device(Some("fixed"), super::Direction::Capture, |id| {
+            assert_eq!(id, Some("fixed"));
+            Ok::<_, ()>("fixed")
+        });
+        assert_eq!(result, Ok("fixed"));
+    }
+
+    #[test]
+    fn default_watch_detects_switch_and_removal_without_polling_fixed_devices() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut watch = super::DefaultWatch {
+            id: Some("a".into()),
+            checked_at: start,
+            direction: super::Direction::Capture,
+        };
+        watch
+            .check_with(start + Duration::from_millis(999), || panic!("too early"))
+            .unwrap();
+        watch
+            .check_with(start + Duration::from_secs(1), || Ok("a".into()))
+            .unwrap();
+        assert!(watch
+            .check_with(start + Duration::from_secs(2), || Ok("b".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("已切换"));
+        assert!(watch
+            .check_with(start + Duration::from_secs(3), || Err(
+                std::io::Error::other("no default")
+            ))
+            .is_err());
+        watch.id = None;
+        watch
+            .check_with(start + Duration::from_secs(4), || {
+                panic!("fixed device queried default")
+            })
+            .unwrap();
+    }
     use super::*;
 
     fn format(channels: u16, float: bool) -> Format {

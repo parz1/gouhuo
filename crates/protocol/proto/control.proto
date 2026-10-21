@@ -86,6 +86,8 @@ message Welcome {
   repeated User users = 6;
   // 客户端应该待在哪个频道。
   uint32 current_channel_id = 7;
+  // Supports authenticated TLS voice; absent on old servers.
+  bool tcp_voice = 8;
 }
 
 // 认证没过，或者服务端不收。发完就断开。
@@ -339,6 +341,12 @@ message Pong {
 // ===========================================================================
 
 // 客户端发给服务端的一切。
+// Encrypted voice datagram, same header/key/sequence as UDP. Maximum MAX_DATAGRAM.
+message VoiceDatagram { bytes datagram = 1; }
+// Client requests its bidirectional path; server echoes after applying it.
+// UDP keepalives continue on UDP and never change the selected path.
+message VoicePath { bool tcp = 1; }
+
 message ClientMessage {
   oneof payload {
     Hello hello = 1;
@@ -354,6 +362,8 @@ message ClientMessage {
     BanUser ban_user = 11;
     Unban unban = 12;
     SetRole set_role = 13;
+    VoiceDatagram voice_datagram = 14;
+    VoicePath voice_path = 15;
   }
 }
 
@@ -370,5 +380,7 @@ message ServerMessage {
     TextMessage text_message = 8;
     Goodbye goodbye = 9;
     BanList ban_list = 10;
+    VoiceDatagram voice_datagram = 11;
+    VoicePath voice_path = 12;
   }
 }

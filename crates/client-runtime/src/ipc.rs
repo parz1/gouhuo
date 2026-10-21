@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{Devices, RuntimeSnapshot, VoiceIntent};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 256 * 1024;
 pub const MAX_VOLUMES: usize = 2048;
 
@@ -21,6 +21,8 @@ pub struct Hello {
 /// Deliberately has no Debug: session keys must never enter diagnostics.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StartVoice {
+    pub tcp_voice: bool,
+    pub tcp_active: bool,
     pub host: String,
     pub udp_port: u16,
     pub session_id: u32,
@@ -40,6 +42,11 @@ pub enum Cue {
 #[derive(Serialize, Deserialize)]
 pub enum Command {
     Controls,
+    Tunnel {
+        tcp_active: bool,
+        dropped: u64,
+        packets: Vec<TunnelPacket>,
+    },
     StartVoice(StartVoice),
     StartMic(Devices),
     Stop,
@@ -87,6 +94,7 @@ impl Request {
                 _ => true,
             }
             && match &self.command {
+                Command::Tunnel { packets, .. } => valid_packets(packets),
                 Command::StartVoice(v) => v.udp_port != 0 && v.host.len() <= 1024,
                 Command::Scan { per_device_ms, .. } => (1..=5000).contains(per_device_ms),
                 Command::StopAfter(ms) => *ms <= 5000,
@@ -133,6 +141,13 @@ pub enum RpcReply {
 
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
+    Tunnel {
+        id: u64,
+        revision: u64,
+        tcp_requested: bool,
+        clear_generation: u64,
+        packets: Vec<TunnelPacket>,
+    },
     Snapshot {
         revision: u64,
         requires_auth: bool,
@@ -207,5 +222,97 @@ mod tests {
             VERSION + 1
         );
         assert!(reader.is_empty());
+    }
+}
+
+/// Wall-clock expiry is shared by the two local processes. A pipe stall must
+/// not give old audio another full queue lifetime when it reaches the peer.
+#[derive(Serialize, Deserialize)]
+pub struct TunnelPacket {
+    pub bytes: Vec<u8>,
+    pub expires_unix_ms: u64,
+}
+pub const MAX_TUNNEL_BATCH: usize = 32;
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+pub fn valid_packets(packets: &[TunnelPacket]) -> bool {
+    packets.len() <= MAX_TUNNEL_BATCH
+        && packets
+            .iter()
+            .all(|p| !p.bytes.is_empty() && p.bytes.len() <= protocol::MAX_DATAGRAM)
+}
+impl TunnelPacket {
+    pub fn fresh(&self) -> bool {
+        let remaining = self.expires_unix_ms.saturating_sub(unix_ms());
+        remaining > 0 && remaining <= 100
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+    #[test]
+    fn rejects_unbounded_datagrams_and_expired_or_future_packets() {
+        let mut packet = TunnelPacket {
+            bytes: vec![1],
+            expires_unix_ms: unix_ms() + 80,
+        };
+        assert!(packet.fresh());
+        packet.expires_unix_ms = unix_ms().saturating_sub(1);
+        assert!(!packet.fresh());
+        packet.expires_unix_ms = unix_ms() + 1000;
+        assert!(!packet.fresh());
+        assert!(!valid_packets(&[TunnelPacket {
+            bytes: vec![0; protocol::MAX_DATAGRAM + 1],
+            expires_unix_ms: unix_ms() + 50
+        }]));
+        assert!(!valid_packets(
+            &(0..=MAX_TUNNEL_BATCH)
+                .map(|_| TunnelPacket {
+                    bytes: vec![1],
+                    expires_unix_ms: unix_ms() + 50
+                })
+                .collect::<Vec<_>>()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[test]
+    fn portable_diagnostics_survive_ipc_round_trip() {
+        let original = crate::RuntimeSnapshot {
+            processor: crate::ProcessorStatus::Failed,
+            audio_progress: crate::AudioProgress {
+                capture_stalled: true,
+                capture_frames: 3,
+                ..Default::default()
+            },
+            voice: Some(voice_types::VoiceStats {
+                tcp_active: true,
+                tcp_ok: true,
+                tunnel_dropped: 9,
+                receive_quality: vec![voice_types::SpeakerQuality {
+                    session: 7,
+                    quality: voice_types::ReceiveQuality {
+                        level: voice_types::QualityLevel::Poor,
+                        missing: 3,
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &original).unwrap();
+        let decoded: crate::RuntimeSnapshot = read_frame(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
     }
 }

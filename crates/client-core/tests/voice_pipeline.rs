@@ -1360,3 +1360,160 @@ fn one_way_udp_loss_is_detected_even_if_other_people_are_still_audible() {
     stop.store(true, Ordering::Relaxed);
     relay.join().unwrap();
 }
+
+#[test]
+fn udp_fault_injection_exposes_receive_damage_with_healthy_keepalives() {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use voice_core::quality::QualityLevel;
+
+    struct Relay {
+        stop: Arc<AtomicBool>,
+        mode: Arc<AtomicU8>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    let server = start_server();
+    let listener = join(&server, "quality-listener");
+    let talker = join(&server, "quality-talker");
+    let mut config = voice_config(&listener, &server, TransmitMode::PushToTalk);
+    let upstream = config.server;
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .unwrap();
+    config.server = socket.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mode = Arc::new(AtomicU8::new(0));
+    let worker_stop = stop.clone();
+    let worker_mode = mode.clone();
+    let worker = std::thread::spawn(move || {
+        let mut peer = None;
+        let mut delayed: VecDeque<(Instant, Vec<u8>, std::net::SocketAddr)> = VecDeque::new();
+        let mut bytes = [0; protocol::MAX_DATAGRAM];
+        while !worker_stop.load(Ordering::Relaxed) {
+            while delayed
+                .front()
+                .is_some_and(|(at, _, _)| *at <= Instant::now())
+            {
+                let (_, packet, to) = delayed.pop_front().unwrap();
+                let _ = socket.send_to(&packet, to);
+            }
+            let Ok((n, from)) = socket.recv_from(&mut bytes) else {
+                continue;
+            };
+            if from != upstream {
+                peer = Some(from);
+                let _ = socket.send_to(&bytes[..n], upstream);
+                continue;
+            }
+            let Some(to) = peer else {
+                continue;
+            };
+            let Ok((header, _)) = protocol::VoiceHeader::parse(&bytes[..n]) else {
+                continue;
+            };
+            let mode = worker_mode.load(Ordering::Relaxed);
+            if !header.is_keepalive() && !header.is_terminator() {
+                if mode == 1 && header.seq % 30 < 6 {
+                    continue;
+                }
+                if mode == 2 && header.seq % 5 == 0 {
+                    delayed.push_back((
+                        Instant::now() + Duration::from_millis(80),
+                        bytes[..n].to_vec(),
+                        to,
+                    ));
+                    continue;
+                }
+            }
+            let _ = socket.send_to(&bytes[..n], to);
+        }
+    });
+    let relay = Relay {
+        stop,
+        mode,
+        worker: Some(worker),
+    };
+    let voice = Pipeline::start(
+        config,
+        Box::new(SyntheticCapture::new(Vec::new()).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let source = Pipeline::start(
+        voice_config(&talker, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(chirp_f32(FRAME_SAMPLES * 1500)).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let wait = |condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "injected UDP quality state timed out: {:?}",
+                voice.stats().receive_quality
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait(&|| {
+        voice.stats().udp_ok
+            && voice
+                .stats()
+                .receive_quality
+                .iter()
+                .any(|s| s.quality.played >= 30)
+    });
+    let original_session = listener.session_id();
+    relay.mode.store(1, Ordering::Relaxed);
+    wait(&|| {
+        voice
+            .stats()
+            .receive_quality
+            .iter()
+            .any(|s| s.quality.max_loss_burst >= 5 && s.quality.level == QualityLevel::Poor)
+    });
+    assert!(voice.stats().udp_ok && !voice.stats().udp_failed);
+    relay.mode.store(2, Ordering::Relaxed);
+    wait(&|| {
+        voice
+            .stats()
+            .receive_quality
+            .iter()
+            .any(|s| s.quality.reordered > 0 && s.quality.jitter_ms >= 30.0)
+    });
+    assert!(voice.stats().udp_ok);
+    source.set_muted(true);
+    assert!(!source.stats().transmitting);
+    relay.mode.store(0, Ordering::Relaxed);
+    let before = voice.stats().packets_received;
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(
+        voice.stats().speaking.is_empty(),
+        "queued speech did not drain after mute"
+    );
+    assert!(
+        voice.stats().packets_received <= before + 12,
+        "mute leaked new speech through recovery"
+    );
+    assert_eq!(
+        listener.session_id(),
+        original_session,
+        "quality must not reconnect TLS"
+    );
+    assert!(voice
+        .stats()
+        .receive_quality
+        .iter()
+        .all(|s| s.quality.buffered_ms < 100.0));
+    drop(relay);
+}
