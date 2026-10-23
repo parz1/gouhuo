@@ -397,10 +397,7 @@ mod tests {
 
     #[test]
     fn receive_quality_warns_without_claiming_disconnection_or_restarting_voice() {
-        use voice_core::{
-            pipeline::SpeakerQuality,
-            quality::{QualityLevel, ReceiveQuality},
-        };
+        use voice_types::{QualityLevel, ReceiveQuality, SpeakerQuality};
         let mut snapshot = live_snapshot();
         snapshot.voice.as_mut().unwrap().receive_quality = vec![SpeakerQuality {
             session: 8,
