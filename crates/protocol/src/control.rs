@@ -149,6 +149,8 @@ macro_rules! envelope_from {
 envelope_from!(
     ClientMessage,
     Hello => client_message::Payload::Hello,
+    VoiceDatagram => client_message::Payload::VoiceDatagram,
+    VoicePath => client_message::Payload::VoicePath,
     Authenticate => client_message::Payload::Authenticate,
     Ping => client_message::Payload::Ping,
     JoinChannel => client_message::Payload::JoinChannel,
@@ -165,6 +167,8 @@ envelope_from!(
 envelope_from!(
     ServerMessage,
     Challenge => server_message::Payload::Challenge,
+    VoiceDatagram => server_message::Payload::VoiceDatagram,
+    VoicePath => server_message::Payload::VoicePath,
     Welcome => server_message::Payload::Welcome,
     Rejected => server_message::Payload::Rejected,
     Pong => server_message::Payload::Pong,
@@ -392,5 +396,34 @@ mod tests {
             let _ = decode_frame::<ServerMessage>(&bytes);
             let _ = peek_frame_len(&bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod fallback_compatibility {
+    use super::*;
+    // Deliberately frozen pre-extension shape, not the generated current schema.
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyWelcome {
+        #[prost(uint32, tag = "1")]
+        session_id: u32,
+        #[prost(uint32, tag = "4")]
+        udp_port: u32,
+    }
+    #[test]
+    fn old_welcome_disables_fallback_and_old_reader_ignores_capability() {
+        let old = LegacyWelcome {
+            session_id: 7,
+            udp_port: 20800,
+        };
+        let current = Welcome::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(!current.tcp_voice);
+        let current = Welcome {
+            tcp_voice: true,
+            ..current
+        };
+        let decoded = LegacyWelcome::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, old);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 }

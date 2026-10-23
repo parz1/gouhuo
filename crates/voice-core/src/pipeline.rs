@@ -52,7 +52,7 @@ use crate::codec::{VoiceDecoder, VoiceEncoder};
 use crate::cue::CueQueue;
 use crate::jitter::JitterConfig;
 use crate::playout::Playback;
-pub use voice_types::{VoiceStats, MAX_VOLUME};
+pub use voice_types::{SpeakerQuality, VoiceStats, MAX_VOLUME};
 
 /// 固定抖动缓冲的深度（帧）。**语音链路已经不用它了**，留着给测量工具当基线：
 /// M1 量过，2 帧（20 ms）在「同城」和「跨省」两档网络下都不欠载，
@@ -189,6 +189,7 @@ impl Default for PipelineState {
 }
 
 struct Speaker {
+    replay: crate::tunnel::ReplayWindow,
     playback: Playback<VoiceDecoder>,
     last_packet: Instant,
     last_voice: Instant,
@@ -206,6 +207,7 @@ impl Speaker {
     fn new(jitter: JitterConfig) -> Result<Self, opus::Error> {
         let now = Instant::now();
         Ok(Self {
+            replay: crate::tunnel::ReplayWindow::default(),
             playback: Playback::new(jitter, VoiceDecoder::new()?, FRAME_SAMPLES),
             last_packet: now,
             last_voice: now - SPEAKING_TIMEOUT,
@@ -255,6 +257,12 @@ pub struct PipelineControl {
 }
 
 struct Shared {
+    tunnel: Option<Arc<dyn crate::tunnel::VoiceTunnel>>,
+    session_id: u32,
+    udp_probe: AtomicU64,
+    tcp_probe: AtomicU64,
+    recovered_probes: AtomicU32,
+    last_tcp_ms: AtomicU64,
     error: Mutex<Option<String>>,
     capture_error: Mutex<Option<String>>,
     render_error: Mutex<Option<String>>,
@@ -372,10 +380,21 @@ impl Pipeline {
 
     pub fn start_with_state(
         cfg: PipelineConfig,
+        capture: Box<dyn Capture>,
+        render: Box<dyn Render>,
+        processor: Option<Box<dyn AudioProcessor>>,
+        initial: PipelineState,
+    ) -> io::Result<Self> {
+        Self::start_with_tunnel(cfg, capture, render, processor, initial, None)
+    }
+
+    pub fn start_with_tunnel(
+        cfg: PipelineConfig,
         mut capture: Box<dyn Capture>,
         mut render: Box<dyn Render>,
         processor: Option<Box<dyn AudioProcessor>>,
         initial: PipelineState,
+        tunnel: Option<Arc<dyn crate::tunnel::VoiceTunnel>>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(match cfg.server {
             SocketAddr::V4(_) => "0.0.0.0:0",
@@ -401,6 +420,12 @@ impl Pipeline {
         let monitoring = Arc::new(AtomicBool::new(initial.monitoring));
         let send_enabled = Arc::new(AtomicBool::new(initial.send_enabled));
         let shared = Arc::new(Shared {
+            tunnel: tunnel.clone(),
+            session_id: cfg.session_id,
+            udp_probe: AtomicU64::new(0),
+            tcp_probe: AtomicU64::new(0),
+            recovered_probes: AtomicU32::new(0),
+            last_tcp_ms: AtomicU64::new(0),
             error: Mutex::new(None),
             capture_error: Mutex::new(None),
             render_error: Mutex::new(None),
@@ -489,6 +514,22 @@ impl Pipeline {
             })?);
         }
 
+        if let Some(tunnel) = tunnel {
+            let stop = Arc::clone(&transport_stop);
+            let shared = Arc::clone(&shared);
+            let key = cfg.downstream_key;
+            pipeline.threads.push(spawn("gouhuo-voice-tls", move || {
+                let cipher = VoiceCipher::new(&key);
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(packet) = tunnel.recv(Duration::from_millis(250)) {
+                        if !stop.load(Ordering::Relaxed) {
+                            receive_packet(&packet, &cipher, &shared, jitter, true);
+                        }
+                    }
+                }
+            })?);
+        }
+
         // ---- 播放 ----
         {
             let stop = Arc::clone(&stop);
@@ -547,6 +588,9 @@ impl PipelineControl {
     pub fn set_transmitting(&self, on: bool) {
         self.transmitting.store(on, Ordering::Relaxed);
         if !on && matches!(self.mode(), TransmitMode::PushToTalk) {
+            if let Some(tunnel) = &self.shared.tunnel {
+                tunnel.clear_send();
+            }
             self.shared.sending.store(false, Ordering::Relaxed);
         }
     }
@@ -555,6 +599,9 @@ impl PipelineControl {
     pub fn set_send_enabled(&self, enabled: bool) {
         self.send_enabled.store(enabled, Ordering::Relaxed);
         if !enabled {
+            if let Some(tunnel) = &self.shared.tunnel {
+                tunnel.clear_send();
+            }
             self.shared.sending.store(false, Ordering::Relaxed);
         }
     }
@@ -571,6 +618,9 @@ impl PipelineControl {
         self.muted.store(true, Ordering::Relaxed);
         self.send_enabled.store(false, Ordering::Relaxed);
         self.transport_stop.store(true, Ordering::Relaxed);
+        if let Some(tunnel) = &self.shared.tunnel {
+            tunnel.clear_send();
+        }
         self.shared.sending.store(false, Ordering::Relaxed);
         self.shared.input_available.store(false, Ordering::Relaxed);
         self.shared
@@ -600,6 +650,9 @@ impl PipelineControl {
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
         if muted {
+            if let Some(tunnel) = &self.shared.tunnel {
+                tunnel.clear_send();
+            }
             self.shared.sending.store(false, Ordering::Relaxed);
         }
     }
@@ -672,6 +725,20 @@ impl PipelineControl {
 
     pub fn stats(&self) -> VoiceStats {
         let now = Instant::now();
+        let receive_quality = self
+            .shared
+            .speakers
+            .lock()
+            .map(|speakers| {
+                speakers
+                    .iter()
+                    .map(|(&session, speaker)| SpeakerQuality {
+                        session,
+                        quality: speaker.playback.quality(self.shared.now_ms_f64()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let speaking = self
             .shared
             .speakers
@@ -694,7 +761,17 @@ impl PipelineControl {
             && last > 0
             && self.shared.now_ms().saturating_sub(last) < UDP_DEAD_AFTER.as_millis() as u64;
 
+        let tcp_active =
+            transport_live && self.shared.tunnel.as_ref().is_some_and(|t| t.tcp_active());
+        let last_tcp = self.shared.last_tcp_ms.load(Ordering::Relaxed);
+        let tcp_ok = tcp_active
+            && last_tcp > 0
+            && self.shared.now_ms().saturating_sub(last_tcp) < UDP_DEAD_AFTER.as_millis() as u64;
         VoiceStats {
+            receive_quality,
+            tcp_active,
+            tcp_ok,
+            tunnel_dropped: self.shared.tunnel.as_ref().map_or(0, |t| t.dropped()),
             sequences_exhausted: self.sequences.exhausted(),
             udp_failed: transport_live
                 && self.send_enabled.load(Ordering::Relaxed)
@@ -931,7 +1008,7 @@ fn send_loop(
                     && !stop.load(Ordering::Relaxed)
                     && cipher.seal(header, &[], &mut wire).is_ok()
                 {
-                    let _ = socket.send_to(&wire, server);
+                    let _ = send_voice(&socket, server, shared, &wire);
                 }
                 was_sending = false;
             }
@@ -962,7 +1039,7 @@ fn send_loop(
             ) || transmitting.load(Ordering::Relaxed));
         let mut submitted = false;
         if permitted && cipher.seal(header, packet, &mut wire).is_ok() {
-            match socket.send_to(&wire, server) {
+            match send_voice(&socket, server, shared, &wire) {
                 Ok(_) => {
                     shared.packets_sent.fetch_add(1, Ordering::Relaxed);
                     shared.transport_sent();
@@ -974,6 +1051,27 @@ fn send_loop(
         shared.sending.store(submitted, Ordering::Relaxed);
         was_sending = submitted;
     }
+}
+
+fn send_voice(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    shared: &Shared,
+    wire: &[u8],
+) -> io::Result<usize> {
+    if let Some(tunnel) = &shared.tunnel {
+        if tunnel.tcp_active() {
+            return if tunnel.send(wire) {
+                Ok(wire.len())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "TLS voice lane closed",
+                ))
+            };
+        }
+    }
+    socket.send_to(wire, server)
 }
 
 fn recv_loop(
@@ -991,7 +1089,6 @@ fn recv_loop(
     crate::clock::boost_current_thread();
     let cipher = VoiceCipher::new(&key);
     let mut buf = [0u8; 2048];
-    let mut payload = Vec::with_capacity(MAX_DATAGRAM);
 
     while !stop.load(Ordering::Relaxed) {
         let (n, from) = match socket.recv_from(&mut buf) {
@@ -1027,56 +1124,99 @@ fn recv_loop(
         if from != server {
             continue;
         }
-        let Ok(header) = cipher.open(&buf[..n], &mut payload) else {
-            continue;
-        };
-        shared.packets_received.fetch_add(1, Ordering::Relaxed);
-
-        if header.is_keepalive() {
-            // 保活回来了：UDP 两个方向都通。时间戳里装的是我们发出去的时刻。
-            shared
-                .last_keepalive_ms
-                .store(shared.now_ms().max(1), Ordering::Relaxed);
-            // 时间戳装的是发出去那一刻的微秒数，跟 shared 同一个原点。
-            // **用微秒不是毫秒**：本机回环的往返是几十微秒，按毫秒算一律是 0，
-            // 界面上就永远显示 0.0 ms，看着像坏了。
-            let rtt = shared.now_us().wrapping_sub(header.timestamp);
-            shared.rtt_us.store(rtt, Ordering::Relaxed);
-            continue;
-        }
-
-        let mut speakers = shared.speakers.lock().expect("speakers poisoned");
-        let speaker = match speakers.entry(header.session) {
-            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::btree_map::Entry::Vacant(e) => {
-                let Ok(mut speaker) = Speaker::new(jitter) else {
-                    continue;
-                };
-                if let Some(&volume) = shared
-                    .volumes
-                    .lock()
-                    .expect("volumes poisoned")
-                    .get(&header.session)
-                {
-                    speaker.volume = volume;
-                }
-                e.insert(speaker)
-            }
-        };
-        speaker.last_packet = Instant::now();
-
-        if header.is_terminator() {
-            speaker.playback.end_at(header.seq);
-            speaker.ended = true;
-            continue;
-        }
-        speaker.ended = false;
-        speaker.last_voice = Instant::now();
-        let sent_ms = speaker.sent_ms(header.timestamp);
-        speaker
-            .playback
-            .push(header.seq, sent_ms, payload.clone(), shared.now_ms_f64());
+        receive_packet(&buf[..n], &cipher, shared, jitter, false);
     }
+}
+
+fn receive_packet(
+    packet: &[u8],
+    cipher: &VoiceCipher,
+    shared: &Shared,
+    jitter: JitterConfig,
+    tcp: bool,
+) {
+    if packet.len() > MAX_DATAGRAM {
+        return;
+    }
+    let mut payload = Vec::with_capacity(MAX_DATAGRAM);
+    let Ok(header) = cipher.open(packet, &mut payload) else {
+        return;
+    };
+    shared.packets_received.fetch_add(1, Ordering::Relaxed);
+
+    if header.is_keepalive() {
+        if header.session != shared.session_id {
+            return;
+        }
+        let pending = if tcp {
+            &shared.tcp_probe
+        } else {
+            &shared.udp_probe
+        };
+        if pending
+            .compare_exchange(
+                header.seq as u64 + 1,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let now = shared.now_ms().max(1);
+        if tcp {
+            shared.last_tcp_ms.store(now, Ordering::Relaxed);
+            shared.transport_sent();
+        } else {
+            let last = shared.last_keepalive_ms.swap(now, Ordering::Relaxed);
+            if last == 0 || now.saturating_sub(last) > 3_000 {
+                shared.recovered_probes.store(1, Ordering::Relaxed);
+            } else {
+                shared.recovered_probes.fetch_add(1, Ordering::Relaxed);
+            }
+            shared.rtt_us.store(
+                shared.now_us().wrapping_sub(header.timestamp),
+                Ordering::Relaxed,
+            );
+        }
+        return;
+    }
+
+    let mut speakers = shared.speakers.lock().expect("speakers poisoned");
+    let speaker = match speakers.entry(header.session) {
+        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::btree_map::Entry::Vacant(e) => {
+            let Ok(mut speaker) = Speaker::new(jitter) else {
+                return;
+            };
+            if let Some(&volume) = shared
+                .volumes
+                .lock()
+                .expect("volumes poisoned")
+                .get(&header.session)
+            {
+                speaker.volume = volume;
+            }
+            e.insert(speaker)
+        }
+    };
+    if !speaker.replay.accept(header.seq) {
+        return;
+    }
+    speaker.last_packet = Instant::now();
+
+    if header.is_terminator() {
+        speaker.playback.end_at(header.seq);
+        speaker.ended = true;
+        return;
+    }
+    speaker.ended = false;
+    speaker.last_voice = Instant::now();
+    let sent_ms = speaker.sent_ms(header.timestamp);
+    speaker
+        .playback
+        .push(header.seq, sent_ms, payload.clone(), shared.now_ms_f64());
 }
 
 fn play_loop(
@@ -1205,6 +1345,32 @@ fn keepalive_loop(
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
+        if let Some(tunnel) = &shared.tunnel {
+            let last = shared.last_keepalive_ms.load(Ordering::Relaxed);
+            let udp_dead = shared.started.elapsed() >= UDP_DEAD_AFTER
+                && shared.now_ms().saturating_sub(last) >= UDP_DEAD_AFTER.as_millis() as u64;
+            if udp_dead {
+                shared.recovered_probes.store(0, Ordering::Relaxed);
+                tunnel.request_tcp(true);
+            } else if tunnel.tcp_active() && shared.recovered_probes.load(Ordering::Relaxed) >= 3 {
+                tunnel.request_tcp(false);
+            }
+            if tunnel.tcp_active() {
+                let Some(seq) = sequences.next(true) else {
+                    return;
+                };
+                let header = VoiceHeader {
+                    session: session_id,
+                    seq,
+                    timestamp: shared.now_us(),
+                    flags: FLAG_KEEPALIVE,
+                };
+                shared.tcp_probe.store(seq as u64 + 1, Ordering::Release);
+                if cipher.seal(header, &[], &mut wire).is_ok() {
+                    tunnel.send(&wire);
+                }
+            }
+        }
         let Some(seq) = sequences.next(true) else {
             shared.transport_failed("语音加密序号已耗尽，需要重新连接。".into(), true);
             return;
@@ -1216,12 +1382,14 @@ fn keepalive_loop(
             timestamp: shared.now_us(),
             flags: FLAG_KEEPALIVE,
         };
+        shared.udp_probe.store(seq as u64 + 1, Ordering::Release);
         if !stop.load(Ordering::Relaxed)
             && send_enabled.load(Ordering::Relaxed)
             && cipher.seal(header, &[], &mut wire).is_ok()
         {
             match socket.send_to(&wire, server) {
                 Ok(_) => shared.transport_sent(),
+                Err(_) if shared.tunnel.as_ref().is_some_and(|t| t.tcp_active()) => {}
                 Err(error) => shared.transport_failed(format!("语音保活发送失败：{error}"), false),
             }
         }

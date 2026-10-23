@@ -7,9 +7,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    CaptureInfo, Devices, MicSnapshot, RuntimeSnapshot, RuntimeStage, RuntimeTimings, VoiceIntent,
+    AudioProgress, CaptureInfo, Devices, MicSnapshot, ProcessorStatus, RuntimeSnapshot,
+    RuntimeStage, RuntimeTimings, VoiceIntent,
 };
-use voice_types::TransmitMode;
+use voice_types::{TransmitMode, VoiceStats};
 
 use voice_core::audio::{Capture, Render};
 use voice_core::cue::CueQueue;
@@ -45,11 +46,16 @@ pub trait AudioBackend: Send + Sync + 'static {
     fn processor(&self) -> Option<Box<dyn AudioProcessor>> {
         None
     }
+    /// Distinguish an intentionally disabled processor from initialization failure.
+    fn try_processor(&self) -> io::Result<Option<Box<dyn AudioProcessor>>> {
+        Ok(self.processor())
+    }
 }
 
 /// A connection's immutable voice material. Replacements using the same keys
 /// must reuse `sequences`; a new authenticated session supplies fresh material.
 pub struct StartVoice {
+    pub tunnel: Option<Arc<dyn voice_core::tunnel::VoiceTunnel>>,
     pub host: String,
     pub udp_port: u16,
     pub session_id: u32,
@@ -194,6 +200,8 @@ impl RuntimeHandle {
         if let Some(stats) = &mut state.snapshot.voice {
             stats.transmitting = false;
             stats.udp_ok = false;
+            stats.tcp_ok = false;
+            stats.tcp_active = false;
             stats.speaking.clear();
         }
     }
@@ -212,6 +220,8 @@ impl RuntimeHandle {
         if let Some(stats) = &mut state.snapshot.voice {
             stats.transmitting = false;
             stats.udp_ok = false;
+            stats.tcp_ok = false;
+            stats.tcp_active = false;
             stats.speaking.clear();
         }
         let _ = self
@@ -354,7 +364,15 @@ impl RuntimeHandle {
         let state = self.shared.state.lock().expect("runtime state poisoned");
         let mut snapshot = state.snapshot.clone();
         if let Some(control) = &state.control {
-            snapshot.voice = Some(control.stats());
+            let mut stats = control.stats();
+            apply_voice_progress(&mut stats, &snapshot.audio_progress);
+            if matches!(
+                snapshot.stage,
+                RuntimeStage::Starting | RuntimeStage::Ready | RuntimeStage::Failed
+            ) {
+                snapshot.stage = voice_stage(&stats);
+            }
+            snapshot.voice = Some(stats);
         }
         if let Some(control) = &state.mic_control {
             snapshot.mic = Some(MicSnapshot {
@@ -362,6 +380,9 @@ impl RuntimeHandle {
                 input_available: control.is_running(),
                 error: control.error(),
             });
+        }
+        if let Some(mic) = &mut snapshot.mic {
+            apply_mic_progress(mic, &snapshot.audio_progress);
         }
         snapshot
     }
@@ -410,10 +431,97 @@ enum Active {
 
 type DiagnosticsSlot = Arc<Mutex<Option<Arc<dyn CaptureDiagnostics>>>>;
 
-#[derive(Default)]
 struct DeviceProgress {
-    capture_at: Mutex<Option<Instant>>,
-    render_at: Mutex<Option<Instant>>,
+    started: Instant,
+    capture_at: Mutex<FrameProgress>,
+    render_at: Mutex<FrameProgress>,
+}
+
+const AUDIO_STALL_AFTER: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct FrameProgress {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    frames: u64,
+}
+
+impl FrameProgress {
+    fn record(&mut self, now: Instant) {
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        self.frames = self.frames.saturating_add(1);
+    }
+}
+
+impl Default for DeviceProgress {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            capture_at: Mutex::new(FrameProgress::default()),
+            render_at: Mutex::new(FrameProgress::default()),
+        }
+    }
+}
+
+impl DeviceProgress {
+    fn snapshot(&self, now: Instant) -> AudioProgress {
+        let capture = self.capture_at.lock().expect("capture progress poisoned");
+        let render = self.render_at.lock().expect("render progress poisoned");
+        let capture_age = now.saturating_duration_since(capture.last.unwrap_or(self.started));
+        let render_age = now.saturating_duration_since(render.last.unwrap_or(self.started));
+        AudioProgress {
+            capture_frames: capture.frames,
+            render_frames: render.frames,
+            capture_age_ms: capture_age.as_millis() as u64,
+            render_age_ms: render_age.as_millis() as u64,
+            capture_stalled: capture_age >= AUDIO_STALL_AFTER,
+            render_stalled: render_age >= AUDIO_STALL_AFTER,
+        }
+    }
+}
+
+fn apply_voice_progress(stats: &mut VoiceStats, progress: &AudioProgress) {
+    if progress.capture_stalled {
+        stats.input_available = false;
+        stats.transmitting = false;
+        stats
+            .capture_error
+            .get_or_insert_with(|| "麦克风采集已停滞，正在尝试恢复；请检查设备。".into());
+    }
+    if progress.render_stalled {
+        stats.render_available = false;
+        stats
+            .render_error
+            .get_or_insert_with(|| "播放已停滞，正在尝试恢复；麦克风仍可能在发送。".into());
+    }
+    if stats.error.is_none() {
+        stats.error = stats
+            .capture_error
+            .clone()
+            .or_else(|| stats.render_error.clone());
+    }
+}
+
+fn apply_mic_progress(mic: &mut MicSnapshot, progress: &AudioProgress) {
+    if progress.capture_stalled {
+        mic.input_available = false;
+        mic.error
+            .get_or_insert_with(|| "麦克风采集已停滞，请检查设备后重新试麦。".into());
+    } else if progress.render_stalled {
+        mic.error
+            .get_or_insert_with(|| "试听播放已停滞，请检查输出设备后重新试麦。".into());
+    }
+}
+
+fn prepare_processor(
+    backend: &dyn AudioBackend,
+) -> (Option<Box<dyn AudioProcessor>>, ProcessorStatus) {
+    match backend.try_processor() {
+        Ok(Some(processor)) => (Some(processor), ProcessorStatus::Active),
+        Ok(None) => (None, ProcessorStatus::Disabled),
+        Err(_) => (None, ProcessorStatus::Failed),
+    }
 }
 
 // Deferred factories keep creation, use and final destruction of COM/device
@@ -424,7 +532,6 @@ struct DeferredCapture {
     stream: Option<Box<dyn Capture>>,
     diagnostics: DiagnosticsSlot,
     progress: Arc<DeviceProgress>,
-    first_recorded: bool,
 }
 
 impl Capture for DeferredCapture {
@@ -435,13 +542,12 @@ impl Capture for DeferredCapture {
             self.stream = Some(opened.stream);
         }
         let read = self.stream.as_mut().expect("opened capture").read(out)?;
-        if read && !self.first_recorded {
+        if read {
             self.progress
                 .capture_at
                 .lock()
                 .expect("capture progress poisoned")
-                .get_or_insert_with(Instant::now);
-            self.first_recorded = true;
+                .record(Instant::now());
         }
         Ok(read)
     }
@@ -452,7 +558,6 @@ struct DeferredRender {
     device: Option<String>,
     stream: Option<Box<dyn Render>>,
     progress: Arc<DeviceProgress>,
-    first_recorded: bool,
 }
 
 impl Render for DeferredRender {
@@ -461,13 +566,12 @@ impl Render for DeferredRender {
             self.stream = Some(self.backend.render(self.device.as_deref())?);
         }
         self.stream.as_mut().expect("opened render").write(frame)?;
-        if !self.first_recorded {
+        {
             self.progress
                 .render_at
                 .lock()
                 .expect("render progress poisoned")
-                .get_or_insert_with(Instant::now);
-            self.first_recorded = true;
+                .record(Instant::now());
         }
         Ok(())
     }
@@ -483,14 +587,12 @@ fn devices(backend: &Arc<dyn AudioBackend>, devices: Devices) -> AudioStreams {
             stream: None,
             diagnostics: Arc::clone(&diagnostics),
             progress: Arc::clone(&progress),
-            first_recorded: false,
         }),
         Box::new(DeferredRender {
             backend: Arc::clone(backend),
             device: devices.render,
             stream: None,
             progress: Arc::clone(&progress),
-            first_recorded: false,
         }),
         diagnostics,
         progress,
@@ -601,7 +703,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                         return Ok(None);
                     }
                     let at = Instant::now();
-                    let processor = backend.processor();
+                    let (processor, processor_status) = prepare_processor(backend.as_ref());
                     measured(&shared, id, |t| t.processor_ms = Some(ms(at.elapsed())));
                     if !current(&shared, id) {
                         return Ok(None);
@@ -623,7 +725,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                         )
                     };
                     let at = Instant::now();
-                    let started = Pipeline::start_with_state(
+                    let started = Pipeline::start_with_tunnel(
                         PipelineConfig {
                             server,
                             session_id: request.session_id,
@@ -637,6 +739,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                         render,
                         processor,
                         initial,
+                        request.tunnel,
                     );
                     measured(&shared, id, |t| t.start_ms = Some(ms(at.elapsed())));
                     let owner = started?;
@@ -661,6 +764,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                     }
                     state.cues = Some(control.cues());
                     state.control = Some(control.clone());
+                    state.snapshot.processor = processor_status;
                     state.snapshot.stage = RuntimeStage::Starting;
                     control.set_send_enabled(true);
                     Ok(Some(Active::Voice {
@@ -693,7 +797,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                     continue;
                 }
                 let at = Instant::now();
-                let processor = backend.processor();
+                let (processor, processor_status) = prepare_processor(backend.as_ref());
                 measured(&shared, id, |t| t.processor_ms = Some(ms(at.elapsed())));
                 if !current(&shared, id) {
                     continue;
@@ -713,6 +817,7 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                         owner.set_monitoring(state.snapshot.intent.monitoring);
                         state.mic_control = Some(owner.control());
                         state.cues = Some(owner.cues());
+                        state.snapshot.processor = processor_status;
                         state.snapshot.stage = RuntimeStage::Starting;
                         active = Some(Active::Mic {
                             owner,
@@ -743,6 +848,8 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
                     state.snapshot.voice = None;
                     state.snapshot.mic = None;
                     state.snapshot.capture = CaptureInfo::default();
+                    state.snapshot.processor = ProcessorStatus::Disabled;
+                    state.snapshot.audio_progress = AudioProgress::default();
                 }
                 stop_at = None;
             }
@@ -753,6 +860,18 @@ fn run(backend: Arc<dyn AudioBackend>, shared: Arc<Shared>, receiver: mpsc::Rece
     state.snapshot.stage = RuntimeStage::Idle;
     state.snapshot.voice = None;
     state.snapshot.mic = None;
+    state.snapshot.processor = ProcessorStatus::Disabled;
+    state.snapshot.audio_progress = AudioProgress::default();
+}
+
+fn voice_stage(stats: &VoiceStats) -> RuntimeStage {
+    if stats.error.is_some() || stats.sequences_exhausted || stats.path_failed() {
+        RuntimeStage::Failed
+    } else if stats.input_available && stats.render_available && stats.transport_ok() {
+        RuntimeStage::Ready
+    } else {
+        RuntimeStage::Starting
+    }
 }
 
 fn sync(shared: &Shared, active: Option<&Active>) {
@@ -781,11 +900,13 @@ fn sync(shared: &Shared, active: Option<&Active>) {
     if let Some(provider) = provider {
         state.snapshot.capture = provider.snapshot();
     }
+    state.snapshot.audio_progress = progress.snapshot(Instant::now());
     let since = state.requested_at;
-    if let Some(at) = *progress
+    if let Some(at) = progress
         .capture_at
         .lock()
         .expect("capture progress poisoned")
+        .first
     {
         state
             .snapshot
@@ -793,7 +914,12 @@ fn sync(shared: &Shared, active: Option<&Active>) {
             .first_capture_ms
             .get_or_insert(ms(at.saturating_duration_since(since)));
     }
-    if let Some(at) = *progress.render_at.lock().expect("render progress poisoned") {
+    if let Some(at) = progress
+        .render_at
+        .lock()
+        .expect("render progress poisoned")
+        .first
+    {
         state
             .snapshot
             .timings
@@ -802,7 +928,15 @@ fn sync(shared: &Shared, active: Option<&Active>) {
     }
     match active {
         Active::Voice { owner, .. } => {
-            let stats = owner.stats();
+            let mut stats = owner.stats();
+            apply_voice_progress(&mut stats, &state.snapshot.audio_progress);
+            if stats.transport_ok() {
+                state
+                    .snapshot
+                    .timings
+                    .first_transport_ms
+                    .get_or_insert(ms(since.elapsed()));
+            }
             if stats.udp_ok {
                 state
                     .snapshot
@@ -810,19 +944,18 @@ fn sync(shared: &Shared, active: Option<&Active>) {
                     .first_udp_ms
                     .get_or_insert(ms(since.elapsed()));
             }
-            state.snapshot.stage =
-                if stats.error.is_some() || stats.sequences_exhausted || stats.udp_failed {
-                    RuntimeStage::Failed
-                } else if stats.input_available && stats.render_available && stats.udp_ok {
-                    RuntimeStage::Ready
-                } else {
-                    RuntimeStage::Starting
-                };
+            state.snapshot.stage = voice_stage(&stats);
             state.snapshot.voice = Some(stats);
         }
         Active::Mic { owner, .. } => {
             owner.set_monitoring(state.snapshot.intent.monitoring);
-            let error = owner.error();
+            let mut mic = MicSnapshot {
+                input_db: owner.input_db(),
+                input_available: owner.is_running(),
+                error: owner.error(),
+            };
+            apply_mic_progress(&mut mic, &state.snapshot.audio_progress);
+            let error = mic.error.clone();
             state.snapshot.stage = if error.is_some() {
                 RuntimeStage::Failed
             } else if owner.is_running() {
@@ -830,12 +963,118 @@ fn sync(shared: &Shared, active: Option<&Active>) {
             } else {
                 RuntimeStage::Starting
             };
-            state.snapshot.mic = Some(MicSnapshot {
-                input_db: owner.input_db(),
-                input_available: owner.is_running(),
-                error,
-            });
+            state.snapshot.mic = Some(mic);
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::health::CallHealth;
+    use crate::recovery::Action;
+
+    #[test]
+    fn startup_grace_stalls_and_successful_io_have_directional_progress() {
+        let progress = DeviceProgress::default();
+        let start = progress.started;
+        let before = progress.snapshot(start + AUDIO_STALL_AFTER - Duration::from_millis(1));
+        assert!(!before.capture_stalled && !before.render_stalled);
+        let stalled = progress.snapshot(start + AUDIO_STALL_AFTER);
+        assert!(stalled.capture_stalled && stalled.render_stalled);
+        progress
+            .capture_at
+            .lock()
+            .unwrap()
+            .record(start + AUDIO_STALL_AFTER);
+        let recovered = progress.snapshot(start + AUDIO_STALL_AFTER);
+        assert!(!recovered.capture_stalled && recovered.render_stalled);
+        assert_eq!(recovered.capture_frames, 1);
+        assert_eq!(recovered.capture_age_ms, 0);
+        progress
+            .render_at
+            .lock()
+            .unwrap()
+            .record(start + AUDIO_STALL_AFTER);
+        let now = start + AUDIO_STALL_AFTER + Duration::from_millis(10);
+        progress.capture_at.lock().unwrap().record(now);
+        assert_eq!(
+            progress.capture_at.lock().unwrap().first,
+            Some(start + AUDIO_STALL_AFTER)
+        );
+        assert_eq!(progress.snapshot(now).capture_frames, 2);
+        assert_eq!(progress.snapshot(now).render_age_ms, 10);
+    }
+
+    #[test]
+    fn stalled_io_is_a_device_failure_even_with_healthy_network() {
+        for capture in [true, false] {
+            let progress = AudioProgress {
+                capture_stalled: capture,
+                render_stalled: !capture,
+                ..Default::default()
+            };
+            let mut stats = VoiceStats {
+                udp_ok: true,
+                input_available: true,
+                render_available: true,
+                transmitting: true,
+                ..Default::default()
+            };
+            apply_voice_progress(&mut stats, &progress);
+            assert_eq!(stats.transmitting, !capture);
+            assert_eq!(stats.input_available, !capture);
+            assert_eq!(stats.render_available, capture);
+            let snapshot = RuntimeSnapshot {
+                stage: RuntimeStage::Failed,
+                voice: Some(stats),
+                ..Default::default()
+            };
+            let mut health = CallHealth::default();
+            let lost = health.tick(Duration::ZERO, &snapshot, false);
+            assert!(lost.device_error && !lost.healthy);
+            assert_eq!(lost.action, Some(Action::Lost));
+            assert_eq!(
+                health.tick(Duration::from_secs(1), &snapshot, false).action,
+                Some(Action::RetryVoice)
+            );
+            assert_eq!(
+                health
+                    .tick(Duration::from_secs(40), &snapshot, false)
+                    .action,
+                Some(Action::RetryVoice)
+            );
+        }
+    }
+
+    #[test]
+    fn progress_failure_preserves_driver_error_and_mic_check_direction() {
+        let mut stats = VoiceStats {
+            capture_error: Some("driver unplugged".into()),
+            error: Some("driver unplugged".into()),
+            ..Default::default()
+        };
+        apply_voice_progress(
+            &mut stats,
+            &AudioProgress {
+                capture_stalled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(stats.capture_error.as_deref(), Some("driver unplugged"));
+        assert_eq!(stats.error.as_deref(), Some("driver unplugged"));
+        let mut mic = MicSnapshot {
+            input_available: true,
+            ..Default::default()
+        };
+        apply_mic_progress(
+            &mut mic,
+            &AudioProgress {
+                render_stalled: true,
+                ..Default::default()
+            },
+        );
+        assert!(mic.input_available && mic.error.is_some());
     }
 }
 

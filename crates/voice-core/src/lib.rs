@@ -29,11 +29,13 @@ pub mod netsim;
 #[cfg(feature = "pipeline")]
 pub mod pipeline;
 pub mod playout;
+pub mod quality;
 pub mod redline;
 pub mod signal;
 pub mod timescale;
 #[cfg(feature = "pipeline")]
 pub mod tts;
+pub mod tunnel;
 
 #[cfg(windows)]
 pub mod sysstat;

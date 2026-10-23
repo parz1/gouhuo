@@ -210,7 +210,12 @@ impl Endpoint {
     }
 
     fn start(&self) -> u64 {
+        self.start_at(None)
+    }
+
+    fn start_at(&self, override_address: Option<std::net::SocketAddr>) -> u64 {
         let (session_id, server, keys) = self.client.voice_endpoint_session();
+        let server = override_address.unwrap_or(server);
         let handle = self.handle();
         // Match the host start path: mode changes clear an old PTT press;
         // current local mute/deafen intent is never replaced by a roster echo.
@@ -222,6 +227,7 @@ impl Endpoint {
                 .is_some_and(|u| u.server_muted),
         );
         handle.start_voice(StartVoice {
+            tunnel: self.client.voice_tunnel(session_id),
             host: server.ip().to_string(),
             udp_port: server.port(),
             session_id,
@@ -737,5 +743,60 @@ fn real_tls_udp_call_lifecycle_and_projection() {
     eprintln!(
         "[call-session +{}ms] voice workers drained; all controlled captures dropped on their owners",
         start.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn tls_fallback_preserves_mute_ptt_and_drops_the_old_lane_after_reconnect() {
+    let identity = Identity::generate().unwrap();
+    let server = LocalServer::start(identity.public_key());
+    let a = Endpoint::connect(&server, identity, "fallback-a");
+    let b = Endpoint::connect(&server, Identity::generate().unwrap(), "fallback-b");
+    let blocked = UdpSocket::bind("127.0.0.1:0").unwrap();
+    a.handle().set_mode(TransmitMode::PushToTalk);
+    a.handle().set_muted(true);
+    a.start_at(Some(blocked.local_addr().unwrap()));
+    b.handle().set_mode(TransmitMode::Always);
+    b.start();
+    let tunnel = a.client.voice_tunnel(a.client.session_id()).unwrap();
+    // Select through the actual request/ack path. Timed automatic selection is
+    // independently covered by the bot's directional-outage tests.
+    tunnel.request_tcp(true);
+    wait("TLS audio ready", || {
+        a.handle()
+            .snapshot()
+            .voice
+            .is_some_and(|s| s.tcp_ok && s.input_available && s.render_available)
+    });
+    assert_eq!(a.sent(), 0);
+    a.handle().set_muted(false);
+    assert_eq!(a.sent(), 0, "unmuting must preserve released PTT");
+    a.ptt(true);
+    wait("speech via TLS", || {
+        a.sent() > 5 && received_speech(&b, a.client.session_id())
+    });
+    a.ptt(false);
+    quiet(&a, &b);
+    a.ptt(true);
+    wait("PTT resumed", || {
+        a.handle().snapshot().voice.is_some_and(|s| s.transmitting)
+    });
+    a.handle().set_muted(true);
+    quiet(&a, &b);
+    let old_session = a.client.session_id();
+    a.client.reconnect_transport();
+    wait("new authenticated session", || {
+        a.client.session_id() != old_session
+    });
+    assert!(!tunnel.tcp_active());
+    assert!(!tunnel.send(&[1; 32]));
+    a.start();
+    wait("new UDP pipeline", || ready(&a));
+    assert_eq!(a.sent(), 0, "reconnect reopened a muted microphone");
+    assert!(!a.handle().snapshot().voice.unwrap().tcp_active);
+    assert_eq!(
+        a.audio.opens.lock().unwrap().len(),
+        2,
+        "path selection itself reopened audio"
     );
 }

@@ -18,9 +18,12 @@ pub struct AudioViewModel {
     pub self_muted: bool,
     pub render_available: bool,
     pub udp_ok: bool,
+    pub tcp_active: bool,
     pub udp_failed: bool,
     pub voice_error: String,
     pub reconnecting: String,
+    pub processor_warning: String,
+    pub quality_warning: String,
     pub voice_notice: String,
     pub recovery_message: String,
     pub capture: CaptureInfo,
@@ -146,10 +149,25 @@ impl CallViewModel {
             _ => String::new(),
         };
         let connected = connection == ConnectionState::Connected;
-        let udp_failed = connected && stats.is_some_and(|s| s.udp_failed);
-        // Confirmed UDP failure supersedes an older reconnect/probe notice.
+        let affected = if connected {
+            stats.map_or(0, |s| {
+                s.receive_quality
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.quality.level,
+                            voice_types::QualityLevel::Degraded | voice_types::QualityLevel::Poor
+                        )
+                    })
+                    .count()
+            })
+        } else {
+            0
+        };
+        let udp_failed = connected && stats.is_some_and(|s| s.path_failed());
+        // Preserve the call page's existing priority in one GUI-free location.
         let voice_notice = if udp_failed {
-            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。".into()
+            "服务器已连接，但语音未连通；可重试语音或检查网络。".into()
         } else {
             state.voice_notice.clone()
         };
@@ -168,9 +186,16 @@ impl CallViewModel {
             self_muted: snapshot.intent.muted,
             render_available: stats.is_some_and(|s| s.render_available),
             udp_ok: connected && stats.is_some_and(|s| s.udp_ok),
+            tcp_active: connected && stats.is_some_and(|s| s.tcp_active),
             udp_failed,
             voice_error,
             reconnecting,
+            processor_warning: snapshot.processor.warning().into(),
+            quality_warning: if affected > 0 {
+                format!("接收语音质量波动（{affected} 路） · 详情见诊断信息")
+            } else {
+                String::new()
+            },
             voice_notice,
             recovery_message,
             capture: snapshot.capture.clone(),
@@ -368,6 +393,36 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn receive_quality_warns_without_claiming_disconnection_or_restarting_voice() {
+        use voice_types::{QualityLevel, ReceiveQuality, SpeakerQuality};
+        let mut snapshot = live_snapshot();
+        snapshot.voice.as_mut().unwrap().receive_quality = vec![SpeakerQuality {
+            session: 8,
+            quality: ReceiveQuality {
+                level: QualityLevel::Poor,
+                ..Default::default()
+            },
+        }];
+        let state = connected_state();
+        let view = CallViewModel::project_audio(&state, &snapshot, true);
+        assert!(view.udp_ok);
+        assert!(view.quality_warning.contains("1 路"));
+        assert!(view.recovery_message.is_empty());
+        let mut health = crate::health::CallHealth::default();
+        let health = health.tick(std::time::Duration::ZERO, &snapshot, false);
+        assert!(health.healthy && health.action.is_none());
+        snapshot.voice.as_mut().unwrap().receive_quality.clear();
+        assert!(CallViewModel::project_audio(&state, &snapshot, true)
+            .quality_warning
+            .is_empty());
+        assert!(
+            CallViewModel::project_audio(&CallState::default(), &snapshot, true)
+                .quality_warning
+                .is_empty()
+        );
     }
 
     fn roster() -> Roster {
@@ -609,7 +664,7 @@ mod tests {
         snapshot.voice.as_mut().unwrap().udp_failed = true;
         assert_eq!(
             CallViewModel::project_audio(&state, &snapshot, true).recovery_message,
-            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。"
+            "服务器已连接，但语音未连通；可重试语音或检查网络。"
         );
     }
 
@@ -626,7 +681,7 @@ mod tests {
         assert_eq!(view.connection, ConnectionState::Connected);
         assert_eq!(
             view.voice_notice,
-            "服务器已连接，但 UDP 语音未连通；可重试语音或检查网络。"
+            "服务器已连接，但语音未连通；可重试语音或检查网络。"
         );
         assert_eq!(view.recovery_message, view.voice_notice);
         assert!(view.udp_failed && !view.udp_ok);

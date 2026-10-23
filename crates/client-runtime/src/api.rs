@@ -103,11 +103,16 @@ pub struct RuntimeTimings {
     pub first_render_ms: Option<f64>,
     /// Time from request submission to the first observed authenticated probe.
     pub first_udp_ms: Option<f64>,
+    pub first_transport_ms: Option<f64>,
 }
 
 #[cfg_attr(feature = "ipc", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuntimeSnapshot {
+    #[cfg_attr(feature = "ipc", serde(default))]
+    pub processor: ProcessorStatus,
+    #[cfg_attr(feature = "ipc", serde(default))]
+    pub audio_progress: AudioProgress,
     pub request_id: u64,
     pub stage: RuntimeStage,
     pub session_id: Option<u32>,
@@ -119,4 +124,35 @@ pub struct RuntimeSnapshot {
     /// from the directional live-device errors inside `voice`.
     pub error: Option<String>,
     pub timings: RuntimeTimings,
+}
+
+#[cfg_attr(feature = "ipc", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProcessorStatus {
+    #[default]
+    Disabled,
+    Active,
+    Failed,
+}
+
+impl ProcessorStatus {
+    pub fn warning(&self) -> &'static str {
+        if *self == Self::Failed {
+            "音频处理未启用：降噪、自动增益和回声消除不可用。使用耳机可减少回声；可重试语音。"
+        } else {
+            ""
+        }
+    }
+}
+
+/// Device I/O progress, independent of sound level, mute and network traffic.
+#[cfg_attr(feature = "ipc", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioProgress {
+    pub capture_frames: u64,
+    pub render_frames: u64,
+    pub capture_age_ms: u64,
+    pub render_age_ms: u64,
+    pub capture_stalled: bool,
+    pub render_stalled: bool,
 }

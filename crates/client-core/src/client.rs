@@ -200,6 +200,11 @@ pub struct VoiceKeys {
 
 /// 一次成功的连接。重连就是换掉这一整个。
 struct Link {
+    tcp_voice: bool,
+    tcp_requested: AtomicBool,
+    tcp_confirmed: AtomicBool,
+    voice_out: Arc<voice_core::tunnel::DatagramQueue>,
+    voice_in: Arc<voice_core::tunnel::DatagramQueue>,
     shutdown_sock: Arc<TcpStream>,
     #[cfg(test)]
     wire: Arc<Mutex<Wire>>,
@@ -298,11 +303,15 @@ impl Link {
                 ConnectionCause::local(reason),
             );
         }
+        self.voice_out.wake_writer();
     }
 
     fn shutdown(&self) {
-        // Never wait for a stalled TLS writer before interrupting the socket.
         self.writer_state.stopped.store(true, Ordering::Release);
+        self.voice_out.clear();
+        self.voice_in.clear();
+        self.voice_out.wake_writer();
+        // Never wait for a stalled TLS writer before interrupting the socket.
         let _ = self.shutdown_sock.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -320,6 +329,7 @@ fn writer_loop(
     socket: Arc<TcpStream>,
     state: Arc<WriterState>,
     queue: Receiver<PendingMessage>,
+    voice: Arc<voice_core::tunnel::DatagramQueue>,
 ) {
     struct Completed<'a>(&'a WriterState, &'a TcpStream);
     impl Drop for Completed<'_> {
@@ -332,18 +342,42 @@ fn writer_loop(
     let _completed = Completed(&state, &socket);
     // Drop the queue and all byte permits before reporting completion.
     let queue = queue;
+    voice.register_writer();
     while !state.stopped.load(Ordering::Acquire) {
-        let pending = match queue.recv_timeout(Duration::from_millis(50)) {
-            Ok(pending) => pending,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        let pending = match queue.try_recv() {
+            Ok(pending) => Some(pending),
+            Err(mpsc::TryRecvError::Disconnected) => return,
+            Err(mpsc::TryRecvError::Empty) => None,
         };
+        let datagram = if pending.is_none() {
+            voice.pop(Duration::ZERO)
+        } else {
+            None
+        };
+        if pending.is_none() && datagram.is_none() {
+            std::thread::park_timeout(Duration::from_millis(50));
+            continue;
+        }
         let result = match wire.lock() {
             Ok(mut wire) => {
                 if state.stopped.load(Ordering::Acquire) {
                     return;
                 }
-                wire.send(&pending.message)
+                if let Some(pending) = &pending {
+                    wire.send(&pending.message)
+                } else if let Some(datagram) = datagram {
+                    if voice.valid(&datagram) {
+                        wire.send(&protocol::control::ClientMessage::from(
+                            protocol::control::VoiceDatagram {
+                                datagram: datagram.bytes,
+                            },
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
             }
             Err(_) => Err(std::io::Error::other("TLS 写入状态不可用")),
         };
@@ -355,6 +389,64 @@ fn writer_loop(
             );
             return;
         }
+    }
+}
+
+struct Tunnel(std::sync::Weak<Link>);
+impl voice_core::tunnel::VoiceTunnel for Tunnel {
+    fn request_tcp(&self, tcp: bool) {
+        let Some(link) = self.0.upgrade() else {
+            return;
+        };
+        if link.tcp_requested.swap(tcp, Ordering::AcqRel) != tcp {
+            link.voice_out.clear();
+            link.send(&protocol::control::VoicePath { tcp }.into());
+        }
+    }
+    fn tcp_active(&self) -> bool {
+        self.0.upgrade().is_some_and(|link| {
+            !link.writer_state.stopped.load(Ordering::Acquire)
+                && link.tcp_confirmed.load(Ordering::Acquire)
+        })
+    }
+    fn send(&self, datagram: &[u8]) -> bool {
+        self.0.upgrade().is_some_and(|link| {
+            !link.writer_state.stopped.load(Ordering::Acquire)
+                && link.tcp_confirmed.load(Ordering::Acquire)
+                && link.voice_out.push(datagram)
+        })
+    }
+    fn send_expiring(&self, datagram: &[u8], remaining: Duration) -> bool {
+        self.0.upgrade().is_some_and(|link| {
+            !link.writer_state.stopped.load(Ordering::Acquire)
+                && link.tcp_confirmed.load(Ordering::Acquire)
+                && link.voice_out.push_expiring(datagram, remaining)
+        })
+    }
+    fn recv(&self, wait: Duration) -> Option<Vec<u8>> {
+        if let Some(link) = self.0.upgrade() {
+            link.voice_in.pop(wait).map(|d| d.bytes)
+        } else {
+            std::thread::sleep(wait);
+            None
+        }
+    }
+    fn recv_expiring(&self, wait: Duration) -> Option<(Vec<u8>, Duration)> {
+        let link = self.0.upgrade()?;
+        let packet = link.voice_in.pop(wait)?;
+        let remaining = Duration::from_millis(packet.remaining_ms());
+        Some((packet.bytes, remaining))
+    }
+    fn clear_send(&self) {
+        if let Some(link) = self.0.upgrade() {
+            link.voice_out.clear();
+            link.voice_in.wake_reader();
+        }
+    }
+    fn dropped(&self) -> u64 {
+        self.0
+            .upgrade()
+            .map_or(0, |l| l.voice_out.dropped() + l.voice_in.dropped())
     }
 }
 
@@ -527,8 +619,15 @@ impl Client {
         (link.session_id, link.voice_addr, Arc::clone(&link.voice))
     }
 
-    /// 借出名单来画界面。**别在持有它的时候做慢事情** ——
-    /// 读线程要拿同一把锁才能把新状态写进去。
+    /// Returns a lane pinned to this session; stale starts cannot use a new connection.
+    pub fn voice_tunnel(&self, session: u32) -> Option<Arc<dyn voice_core::tunnel::VoiceTunnel>> {
+        let link = self.shared.link();
+        (link.tcp_voice && link.session_id == session).then(|| {
+            Arc::new(Tunnel(Arc::downgrade(&link))) as Arc<dyn voice_core::tunnel::VoiceTunnel>
+        })
+    }
+
+    /// 借出名单来画界面。别在持有它的时候做慢事情，读线程需要同一把锁。
     pub fn roster(&self) -> MutexGuard<'_, Roster> {
         self.shared.roster.lock().expect("roster poisoned")
     }
@@ -753,6 +852,21 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
         match reader.next::<ServerMessage>() {
             Ok(Some(message)) => {
                 shared.heard();
+                match &message.payload {
+                    Some(server_message::Payload::VoiceDatagram(packet)) => {
+                        shared.link().voice_in.push(&packet.datagram);
+                        continue;
+                    }
+                    Some(server_message::Payload::VoicePath(path)) => {
+                        let link = shared.link();
+                        link.tcp_confirmed.store(path.tcp, Ordering::Release);
+                        if !path.tcp {
+                            link.voice_out.clear();
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 if let Some(server_message::Payload::Pong(pong)) = &message.payload {
                     shared
                         .server_udp_received
@@ -1062,16 +1176,23 @@ fn establish(
         pending_bytes: Arc::new(AtomicUsize::new(0)),
         error: Mutex::new(None),
     });
+    let voice_out = Arc::new(voice_core::tunnel::DatagramQueue::default());
     let (writer, queue) = mpsc::sync_channel(WRITE_QUEUE_MESSAGES);
     {
         let wire = Arc::clone(&wire);
         let socket = Arc::clone(&sock);
         let state = Arc::clone(&writer_state);
+        let voice_queue = Arc::clone(&voice_out);
         std::thread::Builder::new()
             .name("gouhuo-client-write".into())
-            .spawn(move || writer_loop(wire, socket, state, queue))?;
+            .spawn(move || writer_loop(wire, socket, state, queue, voice_queue))?;
     }
     let link = Link {
+        tcp_voice: welcome.tcp_voice,
+        tcp_requested: AtomicBool::new(false),
+        tcp_confirmed: AtomicBool::new(false),
+        voice_out,
+        voice_in: Arc::new(voice_core::tunnel::DatagramQueue::default()),
         voice_addr,
         shutdown_sock: sock,
         #[cfg(test)]
@@ -1757,5 +1878,62 @@ mod shutdown_tests {
         drop(guard); // Also releases a broken implementation so the test never leaves a stuck thread.
         worker.join().unwrap();
         assert!(result.is_ok(), "disconnect waited for the TLS writer lock");
+    }
+    #[test]
+    fn tls_voice_lane_is_bounded_during_stalled_writes_and_cannot_survive_disconnect() {
+        let (client, _events, hub) = connection_with_hub("tunnel-cancel");
+        let session = client.session_id();
+        let tunnel = client.voice_tunnel(session).unwrap();
+        assert!(client.voice_tunnel(session + 1).is_none());
+        tunnel.request_tcp(true);
+        wait_for("path acknowledgment", || tunnel.tcp_active());
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        for _ in 0..2000 {
+            assert!(tunnel.send(&[1; 100]));
+        }
+        assert!(tunnel.dropped() > 0);
+        assert_eq!(
+            link.writer_state.pending_bytes.load(Ordering::Acquire),
+            0,
+            "voice consumed the control budget"
+        );
+        client.set_self_state(true, false);
+        assert!(
+            !link.writer_state.stopped.load(Ordering::Acquire),
+            "voice overflow disconnected control"
+        );
+        tunnel.clear_send();
+        let started = Instant::now();
+        client.disconnect();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(!tunnel.tcp_active());
+        assert!(!tunnel.send(&[1; 10]));
+        drop(guard);
+        wait_for("TLS writer exit", || {
+            link.writer_state.completed.load(Ordering::Acquire)
+        });
+        wait_for("server disconnect", || hub.user_count() == 0);
+    }
+    #[test]
+    fn stalled_voice_expires_without_losing_control_commands() {
+        let (client, _events) = connection("voice-priority");
+        let tunnel = client.voice_tunnel(client.session_id()).unwrap();
+        tunnel.request_tcp(true);
+        wait_for("TCP path", || tunnel.tcp_active());
+        let link = client.shared.link();
+        let guard = link.wire.lock().unwrap();
+        for _ in 0..256 {
+            assert!(tunnel.send(&[1; 100]));
+        }
+        client.set_self_state(true, false);
+        std::thread::sleep(voice_core::tunnel::MAX_AGE + Duration::from_millis(20));
+        drop(guard);
+        wait_for("mute command survived voice congestion", || {
+            client.roster().my_user().is_some_and(|u| u.self_muted)
+        });
+        assert!(!link.writer_state.stopped.load(Ordering::Acquire));
+        assert!(tunnel.dropped() >= 128);
+        client.disconnect();
     }
 }

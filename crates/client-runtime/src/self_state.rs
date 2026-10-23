@@ -72,8 +72,9 @@ impl SelfStateView {
         let stats = snapshot.voice.as_ref();
         let ptt_mode = matches!(intent.mode, TransmitMode::PushToTalk);
         let capture_failed = stats.is_some_and(|s| s.capture_error.is_some());
-        let transport_failed = stats
-            .is_some_and(|s| s.transport_error.is_some() || s.udp_failed || s.sequences_exhausted);
+        let transport_failed = stats.is_some_and(|s| {
+            s.transport_error.is_some() || s.path_failed() || s.sequences_exhausted
+        });
         let render_failed = stats.is_some_and(|s| s.render_error.is_some());
         let input_available = stats
             .map(|s| s.input_available)
@@ -106,7 +107,7 @@ impl SelfStateView {
             ConnectionState::Connected
                 if snapshot.stage == RuntimeStage::Starting
                     && (!input_available
-                        || stats.is_some_and(|s| !s.udp_ok || !s.render_available)) =>
+                        || stats.is_some_and(|s| !s.transport_ok() || !s.render_available)) =>
             {
                 SelfStatus::Preparing
             }

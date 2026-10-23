@@ -9,6 +9,7 @@ description = "Client proxy and supervisor for the independent voice process."
 [dependencies]
 client-runtime = { workspace = true, features = ["ipc"] }
 voice-types.workspace = true
+voice-core.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

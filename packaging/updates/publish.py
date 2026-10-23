@@ -137,8 +137,8 @@ def publish(manifest, assets, output, base, upload, read=public_read):
         if body is None or len(body) != item['size'] or hashlib.sha256(body).hexdigest() != item['sha256']:
             raise ValueError(f'Public download verification failed: {item["name"]}')
     upload(output / 'index.html', prefix + 'index.html', 'public, max-age=300')
-    if read(manifest['release_url']) is None:
-        raise ValueError('Public release page is unavailable')
+    if read(manifest['release_url']) != (output / 'index.html').read_bytes():
+        raise ValueError('Public release page verification failed; check cached content or access challenges')
     upload(output / 'stable.json', 'stable.json', 'no-store, no-cache, max-age=0, must-revalidate')
     if read(f'{base}/stable.json') != (output / 'stable.json').read_bytes():
         raise ValueError('Stable manifest is stale; check the Cloudflare cache bypass rule')

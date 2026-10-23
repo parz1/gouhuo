@@ -22,6 +22,8 @@ pub mod history;
 pub mod update;
 
 struct State {
+    tunnel: Option<Arc<dyn voice_core::tunnel::VoiceTunnel>>,
+    tunnel_clear_generation: u64,
     snapshot: RuntimeSnapshot,
     volumes: BTreeMap<u32, f32>,
     revision: u64,
@@ -100,6 +102,8 @@ impl VoiceRuntime {
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
+                tunnel: None,
+                tunnel_clear_generation: 0,
                 snapshot: RuntimeSnapshot::default(),
                 volumes: BTreeMap::new(),
                 revision: 0,
@@ -223,6 +227,7 @@ impl RuntimeHandle {
         if state.closed {
             return;
         }
+        clear_tunnel(&mut state);
         state.io_failure = Some("voice process retirement requested".into());
         state.ready = false;
         state.reauthenticate = state.snapshot.session_id.is_some();
@@ -234,6 +239,16 @@ impl RuntimeHandle {
     }
 
     pub fn start_voice(&self, request: StartVoice) -> u64 {
+        self.start_voice_with_tunnel(request, None)
+    }
+
+    pub fn start_voice_with_tunnel(
+        &self,
+        mut request: StartVoice,
+        tunnel: Option<Arc<dyn voice_core::tunnel::VoiceTunnel>>,
+    ) -> u64 {
+        request.tcp_voice = tunnel.is_some();
+        request.tcp_active = tunnel.as_ref().is_some_and(|t| t.tcp_active());
         let mut state = self.shared.state.lock().expect("voice proxy poisoned");
         if state.closed {
             return state.snapshot.request_id;
@@ -256,6 +271,7 @@ impl RuntimeHandle {
             state.pending = Some(Command::Stop);
         } else {
             state.reauthenticate = false;
+            state.tunnel = tunnel;
             state.pending = Some(Command::StartVoice(request));
         }
         let id = state.snapshot.request_id;
@@ -280,12 +296,15 @@ impl RuntimeHandle {
         if state.closed {
             return;
         }
+        clear_tunnel(&mut state);
         if preserve_playback {
             state.snapshot.request_id += 1;
             state.snapshot.stage = RuntimeStage::Stopping;
             if let Some(stats) = &mut state.snapshot.voice {
                 stats.transmitting = false;
                 stats.udp_ok = false;
+                stats.tcp_ok = false;
+                stats.tcp_active = false;
                 stats.speaking.clear();
             }
         } else {
@@ -340,6 +359,9 @@ impl RuntimeHandle {
             {
                 stats.transmitting = false;
             }
+        }
+        if let Some(tunnel) = &state.tunnel {
+            tunnel.clear_send();
         }
         state.revision += 1;
         state.unacked_since.get_or_insert_with(Instant::now);
@@ -543,7 +565,15 @@ impl VoiceControl for RuntimeHandle {
     }
 }
 
+fn clear_tunnel(state: &mut State) {
+    if let Some(tunnel) = state.tunnel.take() {
+        tunnel.clear_send();
+    }
+    state.tunnel_clear_generation = 0;
+}
+
 fn replace(state: &mut State, stage: RuntimeStage, session_id: Option<u32>) {
+    clear_tunnel(state);
     state.auxiliary.retain(|command| {
         if let Command::Scan { rpc, .. } = command {
             if let Some(reply) = state.rpc.remove(rpc) {
@@ -607,6 +637,7 @@ fn supervise(
             }
         }
         let mut state = shared.state.lock().expect("voice proxy poisoned");
+        clear_tunnel(&mut state);
         state.ready = false;
         // Idle activation seeds Stop before spawning. A spawn/handshake failure
         // must still restart the verified fallback without another user command.
@@ -771,6 +802,44 @@ fn communicate(
                 }
                 let mut confirm = false;
                 match reply {
+                    Reply::Tunnel {
+                        id,
+                        revision,
+                        tcp_requested,
+                        clear_generation,
+                        packets,
+                    } => {
+                        if !ipc::valid_packets(&packets) {
+                            return Err(io::Error::other("invalid tunnel batch"));
+                        }
+                        if id == state.snapshot.request_id
+                            && revision == state.revision
+                            && state.ready
+                            && !state.closed
+                            && !state.reauthenticate
+                        {
+                            if let Some(tunnel) = &state.tunnel {
+                                tunnel.request_tcp(tcp_requested);
+                                if clear_generation != state.tunnel_clear_generation {
+                                    tunnel.clear_send();
+                                }
+                                for packet in packets {
+                                    if packet.fresh() {
+                                        tunnel.send_expiring(
+                                            &packet.bytes,
+                                            Duration::from_millis(
+                                                packet
+                                                    .expires_unix_ms
+                                                    .saturating_sub(ipc::unix_ms())
+                                                    .min(100),
+                                            ),
+                                        );
+                                    }
+                                }
+                                state.tunnel_clear_generation = clear_generation;
+                            }
+                        }
+                    }
                     Reply::Snapshot {
                         revision,
                         requires_auth,
@@ -846,7 +915,30 @@ fn communicate(
                                 state.dirty = false;
                                 Some(Command::Controls)
                             } else {
-                                state.auxiliary.pop_front()
+                                state.auxiliary.pop_front().or_else(|| {
+                                    state.tunnel.as_ref().map(|tunnel| {
+                                        let mut packets = Vec::new();
+                                        for _ in 0..ipc::MAX_TUNNEL_BATCH {
+                                            let Some((bytes, remaining)) =
+                                                tunnel.recv_expiring(Duration::ZERO)
+                                            else {
+                                                break;
+                                            };
+                                            if !remaining.is_zero() {
+                                                packets.push(ipc::TunnelPacket {
+                                                    bytes,
+                                                    expires_unix_ms: ipc::unix_ms()
+                                                        + remaining.as_millis() as u64,
+                                                });
+                                            }
+                                        }
+                                        Command::Tunnel {
+                                            tcp_active: tunnel.tcp_active(),
+                                            dropped: tunnel.dropped(),
+                                            packets,
+                                        }
+                                    })
+                                })
                             };
                             if let Some(command) = command {
                                 if let Command::StartVoice(ref start) = command {
@@ -871,11 +963,17 @@ fn communicate(
                             .0;
                     }
                 };
+                let tunnel_frame = matches!(request.command, Command::Tunnel { .. });
                 ipc::write_frame(&mut input, &request)?;
                 {
                     let mut state = writer_shared.state.lock().expect("voice proxy poisoned");
                     if state.generation == generation {
                         state.writing_since = None;
+                        if tunnel_frame {
+                            let _ = writer_shared
+                                .wake
+                                .wait_timeout(state, Duration::from_millis(10));
+                        }
                     }
                 }
                 if matches!(request.command, Command::Shutdown) {

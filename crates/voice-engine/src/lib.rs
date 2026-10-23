@@ -59,6 +59,7 @@ struct Session {
 }
 
 struct State {
+    tunnel: Option<Arc<IpcTunnel>>,
     id: u64,
     applied_id: u64,
     revision: u64,
@@ -90,6 +91,7 @@ pub fn serve(
     let runtime = VoiceRuntime::new(backend)?;
     let handle = runtime.handle();
     let shared = Arc::new(Mutex::new(State {
+        tunnel: None,
         id: 0,
         applied_id: 0,
         revision: 0,
@@ -148,6 +150,40 @@ pub fn serve(
                     return;
                 }
             }
+            let tunnel_reply = {
+                let state = writer_state.lock().expect("engine state poisoned");
+                state
+                    .tunnel
+                    .as_ref()
+                    .filter(|_| state.applied_id == state.id)
+                    .map(|tunnel| {
+                        let mut packets = Vec::new();
+                        for _ in 0..ipc::MAX_TUNNEL_BATCH {
+                            let Some(packet) = tunnel.outgoing.pop(Duration::ZERO) else {
+                                break;
+                            };
+                            let remaining = packet.remaining_ms();
+                            if remaining > 0 && tunnel.outgoing.valid(&packet) {
+                                packets.push(ipc::TunnelPacket {
+                                    bytes: packet.bytes,
+                                    expires_unix_ms: ipc::unix_ms() + remaining,
+                                });
+                            }
+                        }
+                        Reply::Tunnel {
+                            id: state.id,
+                            revision: state.revision,
+                            tcp_requested: tunnel.requested.load(Ordering::Acquire),
+                            clear_generation: tunnel.cleared.load(Ordering::Acquire),
+                            packets,
+                        }
+                    })
+            };
+            if tunnel_reply.is_some_and(|reply| ipc::write_frame(&mut output, &reply).is_err()) {
+                writer_stopped.store(true, Ordering::Release);
+                writer_handle.shutdown();
+                return;
+            }
             if ipc::write_frame(&mut output, &next).is_err() {
                 writer_stopped.store(true, Ordering::Release);
                 writer_handle.shutdown();
@@ -173,11 +209,40 @@ pub fn serve(
             }
             // Intent and volume updates happen on this fast reader, never on
             // the lifecycle queue. Device/APM initialization cannot block mute.
-            apply_controls(&request, &handle, &mut state);
+            // Datagram polling is not a control mutation: reapplying mute/PTT
+            // would repeatedly cancel keepalives and queued audio.
+            if !matches!(request.command, Command::Tunnel { .. }) {
+                apply_controls(&request, &handle, &mut state);
+            }
             state.revision = request.revision;
             match request.command {
                 Command::Shutdown => return Ok(()),
                 Command::Controls => {}
+                Command::Tunnel {
+                    tcp_active,
+                    dropped,
+                    packets,
+                } => {
+                    if request.id == state.id && state.applied_id == state.id {
+                        if let Some(tunnel) = &state.tunnel {
+                            tunnel.active.store(tcp_active, Ordering::Release);
+                            tunnel.remote_dropped.store(dropped, Ordering::Release);
+                            for packet in packets {
+                                if packet.fresh() {
+                                    tunnel.incoming.push_expiring(
+                                        &packet.bytes,
+                                        Duration::from_millis(
+                                            packet
+                                                .expires_unix_ms
+                                                .saturating_sub(ipc::unix_ms())
+                                                .min(100),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 Command::CancelScan { rpc } => {
                     if let Some((active, cancel)) = &state.scan {
                         if *active == rpc {
@@ -374,7 +439,18 @@ fn apply_lifecycle(command: Command, handle: &RuntimeHandle, state: &mut State) 
                 });
             }
             let session = state.session.as_ref().expect("engine session");
+            state.tunnel = start.tcp_voice.then(|| {
+                Arc::new(IpcTunnel {
+                    active: AtomicBool::new(start.tcp_active),
+                    requested: AtomicBool::new(start.tcp_active),
+                    ..Default::default()
+                })
+            });
             handle.start_voice(client_runtime::StartVoice {
+                tunnel: state
+                    .tunnel
+                    .as_ref()
+                    .map(|t| Arc::clone(t) as Arc<dyn voice_core::tunnel::VoiceTunnel>),
                 host: start.host,
                 udp_port: start.udp_port,
                 session_id: start.session_id,
@@ -420,5 +496,39 @@ fn devices() -> RpcReply {
             capture: Vec::new(),
             render: Vec::new(),
         }
+    }
+}
+
+/// Private pipe endpoint for one lifecycle request. Never reused after restart.
+#[derive(Default)]
+struct IpcTunnel {
+    incoming: voice_core::tunnel::DatagramQueue,
+    outgoing: voice_core::tunnel::DatagramQueue,
+    requested: AtomicBool,
+    active: AtomicBool,
+    cleared: std::sync::atomic::AtomicU64,
+    remote_dropped: std::sync::atomic::AtomicU64,
+}
+impl voice_core::tunnel::VoiceTunnel for IpcTunnel {
+    fn request_tcp(&self, tcp: bool) {
+        self.requested.store(tcp, Ordering::Release);
+    }
+    fn tcp_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+    fn send(&self, bytes: &[u8]) -> bool {
+        self.outgoing.push(bytes)
+    }
+    fn recv(&self, wait: Duration) -> Option<Vec<u8>> {
+        self.incoming.pop(wait).map(|p| p.bytes)
+    }
+    fn clear_send(&self) {
+        self.outgoing.clear();
+        self.cleared.fetch_add(1, Ordering::AcqRel);
+    }
+    fn dropped(&self) -> u64 {
+        self.incoming.dropped()
+            + self.outgoing.dropped()
+            + self.remote_dropped.load(Ordering::Acquire)
     }
 }

@@ -45,6 +45,7 @@ use protocol::control::{
 };
 use protocol::PublicKey;
 use voice_core::identity::Identity;
+use voice_core::tunnel::DatagramQueue;
 
 use crate::control_io::{IoControl, SocketIo};
 use crate::state::{Broadcast, Server, SessionId};
@@ -85,19 +86,44 @@ enum Outbound {
 fn spawn_writer(
     wire: Arc<Mutex<Wire>>,
     control: Arc<IoControl>,
+    voice: Arc<DatagramQueue>,
 ) -> io::Result<SyncSender<Outbound>> {
     let (tx, rx) = sync_channel(OUTBOUND_CAPACITY);
     std::thread::Builder::new()
         .name("gouhuo-control-write".into())
         .spawn(move || {
-            while let Ok(item) = rx.recv() {
-                let (message, close) = match item {
-                    Outbound::Message(message) => (message, false),
-                    Outbound::Goodbye(message) => (message, true),
+            voice.register_writer();
+            loop {
+                let item = match rx.try_recv() {
+                    Ok(item) => Some(item),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 };
-                let sent = wire.lock().expect("wire poisoned").send(&message);
-                if sent.is_err() || close {
-                    break;
+                if let Some(item) = item {
+                    let (message, close) = match item {
+                        Outbound::Message(message) => (message, false),
+                        Outbound::Goodbye(message) => (message, true),
+                    };
+                    if wire.lock().expect("wire poisoned").send(&message).is_err() || close {
+                        break;
+                    }
+                } else if let Some(datagram) = voice.pop(Duration::ZERO) {
+                    let mut wire = wire.lock().expect("wire poisoned");
+                    if voice.valid(&datagram)
+                        && wire
+                            .send(
+                                &protocol::control::VoiceDatagram {
+                                    datagram: datagram.bytes,
+                                }
+                                .into(),
+                            )
+                            .is_err()
+                    {
+                        break;
+                    }
+                } else {
+                    // Timeout also notices the final sender being dropped.
+                    std::thread::park_timeout(Duration::from_secs(1));
                 }
             }
             control.close();
@@ -136,6 +162,7 @@ impl Wire {
 pub struct Peer {
     pub session: SessionId,
     outbound: SyncSender<Outbound>,
+    voice_queue: Arc<DatagramQueue>,
     shutdown: Arc<IoControl>,
     /// 最后一次收到东西的时刻，看门狗要用。存成 Unix 毫秒的原子值，
     /// 免得为了读一个时间戳还要上锁。
@@ -157,6 +184,7 @@ impl Peer {
         if self.outbound.try_send(item).is_err() {
             self.close();
         }
+        self.voice_queue.wake_writer();
     }
 
     fn touch(&self) {
@@ -245,6 +273,7 @@ impl Hub {
     }
 
     /// 提交入场、给旧成员广播、注册新订阅者是同一次提交。
+    #[allow(clippy::too_many_arguments)]
     fn admit_peer(
         &self,
         public_key: PublicKey,
@@ -252,6 +281,7 @@ impl Hub {
         desired_name: &str,
         keys: (&[u8; 32], &[u8; 32]),
         outbound: SyncSender<Outbound>,
+        voice_queue: Arc<DatagramQueue>,
         shutdown: Arc<IoControl>,
     ) -> Result<Arc<Peer>, crate::state::Denied> {
         let _commit = self.commits.lock().expect("commits poisoned");
@@ -265,6 +295,7 @@ impl Hub {
         let peer = Arc::new(Peer {
             session: admitted.session_id,
             outbound,
+            voice_queue: Arc::clone(&voice_queue),
             shutdown,
             last_seen_ms: AtomicU64::new(now_ms() as u64),
             timed_out: AtomicBool::new(false),
@@ -287,6 +318,8 @@ impl Hub {
 
         let mut welcome = admitted.welcome;
         welcome.udp_port = self.voice.local_port() as u32;
+        welcome.tcp_voice = true;
+        self.voice.attach_tunnel(admitted.session_id, voice_queue);
         // 快照先入队，再注册订阅；提交锁内不允许其他变更插入这两步之间。
         peer.send(&welcome.into());
         // 入场事件只通知现有订阅者；新人的 Welcome 已包含这批变化。
@@ -421,20 +454,19 @@ impl Hub {
                 None => continue,
             };
 
-            // 只查一次状态就放开锁 —— 后面封包和发包都不持锁。
-            let targets = {
-                let state = self.state.lock().expect("state poisoned");
-                match state.channel_of(forward.from) {
-                    Some(channel) => state.sessions_in_channel(channel),
-                    None => Vec::new(),
-                }
-            };
-            if targets.len() < 2 {
-                // 频道里只有他自己。不用发给任何人。
-                continue;
-            }
-            self.voice.deliver(&forward, &targets);
+            self.forward_voice(&forward);
         }
+    }
+
+    fn forward_voice(&self, forward: &crate::voice::Forward) {
+        let targets = {
+            let state = self.state.lock().expect("state poisoned");
+            match state.channel_of(forward.from) {
+                Some(channel) => state.sessions_in_channel(channel),
+                None => Vec::new(),
+            }
+        };
+        self.voice.deliver(forward, &targets);
     }
 
     /// 看门狗：踢掉太久没动静的连接。
@@ -610,7 +642,12 @@ fn authenticate(
 
     // Writer 在状态提交前启动，线程创建失败不会留下已登录的幽灵成员。
     let shutdown = Arc::clone(&wire.lock().expect("wire poisoned").sock.control);
-    let outbound = spawn_writer(Arc::clone(wire), Arc::clone(&shutdown))?;
+    let voice_queue = Arc::new(DatagramQueue::default());
+    let outbound = spawn_writer(
+        Arc::clone(wire),
+        Arc::clone(&shutdown),
+        Arc::clone(&voice_queue),
+    )?;
     match hub.admit_peer(
         public_key,
         &auth.invite_code,
@@ -619,6 +656,7 @@ fn authenticate(
         // 拒绝时 Peer 不会留下 sender；本地这份必须活到 Rejected 写完。
         // 否则 writer 发现队列断开，先关 socket，客户端就收不到拒绝原因了。
         outbound.clone(),
+        voice_queue,
         shutdown,
     ) {
         Ok(peer) => Ok(Some(peer)),
@@ -655,6 +693,17 @@ fn message_loop(reader: &mut Reader, hub: &Arc<Hub>, peer: &Arc<Peer>) -> io::Re
         peer.touch();
 
         match message.payload {
+            Some(client_message::Payload::VoicePath(path)) => {
+                hub.voice.set_tcp(peer.session, path.tcp);
+                peer.send(&path.into());
+            }
+            Some(client_message::Payload::VoiceDatagram(packet)) => {
+                if let Some(Incoming::Voice(forward)) =
+                    hub.voice.accept_tunnel(peer.session, &packet.datagram)
+                {
+                    hub.forward_voice(&forward);
+                }
+            }
             Some(client_message::Payload::Ping(ping)) => {
                 peer.send(
                     &Pong {
@@ -881,6 +930,7 @@ mod regressions {
             Arc::new(Peer {
                 session,
                 outbound,
+                voice_queue: Arc::new(DatagramQueue::default()),
                 shutdown: Arc::new(IoControl::new(shutdown, None)),
                 last_seen_ms: AtomicU64::new(now_ms() as u64),
                 timed_out: AtomicBool::new(false),
@@ -1106,6 +1156,7 @@ mod regressions {
                 "old",
                 (&[1; 32], &[2; 32]),
                 old.outbound.clone(),
+                Arc::clone(&old.voice_queue),
                 Arc::clone(&old.shutdown),
             )
             .unwrap();
@@ -1147,6 +1198,7 @@ mod regressions {
                     "new",
                     (&[3; 32], &[4; 32]),
                     new.outbound.clone(),
+                    Arc::clone(&new.voice_queue),
                     Arc::clone(&new.shutdown),
                 )
                 .unwrap()

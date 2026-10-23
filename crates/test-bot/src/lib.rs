@@ -111,6 +111,7 @@ fn start(
     impairment.netem.seed = impairment.netem.seed.wrapping_add(index as u64);
     let proxy = Proxy::start(server, impairment, epoch)?;
     runtime.start_voice(StartVoice {
+        tunnel: client.voice_tunnel(session_id),
         host: proxy.local.ip().to_string(),
         udp_port: proxy.local.port(),
         session_id,
@@ -246,7 +247,7 @@ pub fn run_bot(
                 let voice = snapshot.voice.as_ref();
                 send(
                     &tx,
-                    json!({"event":if ending {"finished"} else {"sample"}, "bot":index + 1, "elapsed_ms":epoch.elapsed().as_millis() as u64, "generation":generation, "session":snapshot.session_id, "stage":format!("{:?}",snapshot.stage), "udp_ok":voice.is_some_and(|s|s.udp_ok), "udp_failed":voice.is_some_and(|s|s.udp_failed), "sent":voice.map_or(0,|s|s.packets_sent), "received":voice.map_or(0,|s|s.packets_received), "speaking_sessions":voice.map_or_else(Vec::new,|s|s.speaking.clone()), "underruns":voice.map_or(0,|s|s.underruns), "rtt_ms":voice.map_or(0.0,|s|s.rtt_ms), "audio_opens":metrics.opens.load(Ordering::Relaxed), "rendered_frames":metrics.rendered.load(Ordering::Relaxed), "audible_frames":metrics.audible.load(Ordering::Relaxed), "echo_overflow":metrics.echo_overflow.load(Ordering::Relaxed), "server_udp_received":client.server_udp_received(), "up":proxy.as_ref().map(|p|net(&p.up)), "down":proxy.as_ref().map(|p|net(&p.down)) }),
+                    json!({"event":if ending {"finished"} else {"sample"}, "bot":index + 1, "elapsed_ms":epoch.elapsed().as_millis() as u64, "generation":generation, "session":snapshot.session_id, "stage":format!("{:?}",snapshot.stage), "tcp_active":voice.is_some_and(|s|s.tcp_active), "tcp_ok":voice.is_some_and(|s|s.tcp_ok), "tunnel_dropped":voice.map_or(0,|s|s.tunnel_dropped), "udp_ok":voice.is_some_and(|s|s.udp_ok), "udp_failed":voice.is_some_and(|s|s.udp_failed), "sent":voice.map_or(0,|s|s.packets_sent), "received":voice.map_or(0,|s|s.packets_received), "speaking_sessions":voice.map_or_else(Vec::new,|s|s.speaking.clone()), "underruns":voice.map_or(0,|s|s.underruns), "rtt_ms":voice.map_or(0.0,|s|s.rtt_ms), "audio_opens":metrics.opens.load(Ordering::Relaxed), "rendered_frames":metrics.rendered.load(Ordering::Relaxed), "audible_frames":metrics.audible.load(Ordering::Relaxed), "echo_overflow":metrics.echo_overflow.load(Ordering::Relaxed), "server_udp_received":client.server_udp_received(), "up":proxy.as_ref().map(|p|net(&p.up)), "down":proxy.as_ref().map(|p|net(&p.down)) }),
                 )?;
                 next_report = epoch.elapsed() + Duration::from_secs(1);
             }

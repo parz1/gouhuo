@@ -29,9 +29,12 @@ impl SlintAdapter {
         app.set_transmitting(state.transmitting);
         app.set_ptt_mode(state.ptt_mode);
         app.set_voice_error(view.voice_error.clone().into());
+        app.set_processor_warning(view.processor_warning.clone().into());
+        app.set_quality_warning(view.quality_warning.clone().into());
         app.set_voice_notice(view.voice_notice.clone().into());
         app.set_recovery_message(view.recovery_message.clone().into());
         app.set_udp_ok(view.udp_ok);
+        app.set_tcp_voice(view.tcp_active);
         app.set_udp_failed(view.udp_failed);
         app.set_capture_in_use(view.capture.name.clone().into());
         app.set_capture_is_virtual(view.capture.is_virtual);

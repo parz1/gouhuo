@@ -269,6 +269,29 @@ impl JitterBuffer {
         }
     }
 
+    pub fn buffered_frames(&self) -> usize {
+        self.level().max(self.map.len())
+    }
+
+    /// Adaptive live voice must not replay an arbitrarily old queue after an
+    /// outage. Discards are local policy, not inferred network packet loss.
+    pub fn discard_excess(&mut self, max_frames: usize) -> u64 {
+        if self.cfg.adaptive.is_none() || self.buffered_frames() <= max_frames {
+            return 0;
+        }
+        let Some(high) = self.highest_seq else {
+            return 0;
+        };
+        let first = high.saturating_sub(max_frames.saturating_sub(1) as u32);
+        let before = self.map.len();
+        self.map.retain(|&seq, _| seq >= first);
+        if self.playing {
+            self.next_seq = self.next_seq.max(first);
+        }
+        self.stalled = 0;
+        (before - self.map.len()) as u64
+    }
+
     /// 接下来连续有几帧已经到了（从下一个要播的开始数）。
     /// 加速要一口气解几帧出来，先问一下够不够。
     pub fn ready_ahead(&self) -> usize {

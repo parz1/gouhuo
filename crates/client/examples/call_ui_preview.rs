@@ -435,6 +435,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--weak-network-only") {
+        let exports = Rc::new(std::cell::Cell::new(0));
+        let count = exports.clone();
+        app.on_export_diagnostics(move || count.set(count.get() + 1));
+        let weak = app.as_weak();
+        app.on_set_diagnostic_recording(move |on| {
+            let app = weak.upgrade().unwrap();
+            app.set_diagnostic_recording(on);
+            app.set_diagnostic_export_status(
+                if on {
+                    "时间线正在记录；可直接导出最近的故障经过。"
+                } else {
+                    "时间线已暂停，已有记录保留，可以导出。"
+                }
+                .into(),
+            );
+        });
+        for (w, h) in [(400, 360), (760, 520)] {
+            for scale in [1.0, 2.0] {
+                fixture.apply("weak-network");
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("quality-{w}x{h}-{scale}.png")),
+                );
+                app.set_diagnostics_open(true);
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("timeline-{w}x{h}-{scale}.png")),
+                );
+                let (pause_x, row_y, export_x) = if w == 400 {
+                    (106.0, 165.0, 300.0)
+                } else {
+                    (353.0, 141.0, 615.0)
+                };
+                click(&app, pause_x, row_y);
+                assert!(
+                    !app.get_diagnostic_recording(),
+                    "pause button must freeze the timeline"
+                );
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("timeline-paused-{w}x{h}-{scale}.png")),
+                );
+                let before = exports.get();
+                click(&app, export_x, row_y);
+                assert_eq!(
+                    exports.get(),
+                    before + 1,
+                    "export must remain available while paused"
+                );
+                click(&app, pause_x, row_y);
+                assert!(
+                    app.get_diagnostic_recording(),
+                    "continue button must resume"
+                );
+            }
+        }
+        println!(
+            "Timeline pause/resume/export pointer interactions passed at both sizes and scales."
+        );
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--resilience-only") {
+        let retries = Rc::new(std::cell::Cell::new(0));
+        let count = retries.clone();
+        app.on_retry_voice(move || count.set(count.get() + 1));
+        for (w, h) in [(400, 360), (760, 520)] {
+            for scale in [1.0, 2.0] {
+                fixture.apply("apm-failed");
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("apm-call-{w}x{h}-{scale}.png")),
+                );
+                let before = retries.get();
+                click(&app, w as f32 - 44.0, if w == 400 { 104.0 } else { 80.0 });
+                assert_eq!(
+                    retries.get(),
+                    before + 1,
+                    "APM retry must respond to pointer input at both scales"
+                );
+                app.set_show_settings(true);
+                app.set_settings_tab(0);
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("apm-settings-{w}x{h}-{scale}.png")),
+                );
+                fixture.apply("capture-failed");
+                app.set_voice_error("麦克风采集已停滞，正在尝试恢复；请检查设备。".into());
+                app.set_recovery_message(app.get_voice_error());
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("capture-stalled-{w}x{h}-{scale}.png")),
+                );
+                fixture.apply("render-failed");
+                app.set_voice_error("播放已停滞，正在尝试恢复；麦克风仍可能在发送。".into());
+                app.set_recovery_message(app.get_voice_error());
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("render-stalled-{w}x{h}-{scale}.png")),
+                );
+            }
+        }
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--fallback-only") {
+        for (w, h) in [(400, 360), (760, 520)] {
+            for scale in [1.0, 2.0] {
+                fixture.apply("tcp-fallback");
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("fallback-{w}x{h}-{scale}.png")),
+                );
+                app.set_diagnostics_open(true);
+                app.set_diagnostic_recording(true);
+                app.set_diagnostic_export_status(r"已导出：C:\Users\Example\AppData\Local\gouhuo\diagnostics\diagnostics-1791060000000.txt".into());
+                render(
+                    &window,
+                    w,
+                    h,
+                    scale,
+                    &folder.join(format!("diagnostics-{w}x{h}-{scale}.png")),
+                );
+            }
+        }
+        return Ok(());
+    }
     let quick = std::env::args().any(|arg| arg == "--quick");
     if !quick {
         for (w, h) in [

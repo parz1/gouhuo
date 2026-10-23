@@ -40,10 +40,10 @@ impl AudioBackend for DesktopAudio {
         )))
     }
 
-    fn processor(&self) -> Option<Box<dyn AudioProcessor>> {
+    fn try_processor(&self) -> io::Result<Option<Box<dyn AudioProcessor>>> {
         use voice_core::apm::{Apm, ApmConfig};
         Apm::new(voice_core::audio::SAMPLE_RATE, ApmConfig::default())
-            .ok()
-            .map(|apm| Box::new(apm) as Box<dyn AudioProcessor>)
+            .map(|apm| Some(Box::new(apm) as Box<dyn AudioProcessor>))
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 }

@@ -86,6 +86,22 @@ class PublicationTests(unittest.TestCase):
                             lambda url: b'{"schema":1,"version":"0.5.0"}')
         self.assertEqual(uploaded, [])
 
+    def test_invalid_release_page_does_not_promote(self):
+        manifest = self.generate()
+        for page in [None, b'<html>challenge</html>', b'old release notes']:
+            with self.subTest(page=page):
+                remote, uploaded = {}, []
+                def upload(path, key, cache, immutable=False):
+                    uploaded.append(key)
+                    remote[f'{self.base}/{key}'] = path.read_bytes()
+                def read(url):
+                    if url == manifest['release_url']:
+                        return page
+                    return remote.get(url)
+                with self.assertRaisesRegex(ValueError, 'release page verification failed'):
+                    publish.publish(manifest, self.assets, self.output, self.base, upload, read)
+                self.assertNotIn('stable.json', uploaded)
+
 
 if __name__ == '__main__':
     unittest.main()

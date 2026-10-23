@@ -73,6 +73,7 @@ pub struct PlaybackStats {
 }
 
 pub struct Playback<D> {
+    quality: crate::quality::QualityTracker,
     jitter: JitterBuffer,
     decoder: D,
     /// 一帧多少个采样。
@@ -96,6 +97,7 @@ pub struct Playback<D> {
 impl<D: FrameDecoder> Playback<D> {
     pub fn new(cfg: JitterConfig, decoder: D, frame_samples: usize) -> Self {
         Self {
+            quality: crate::quality::QualityTracker::default(),
             jitter: JitterBuffer::new(cfg),
             decoder,
             frame: frame_samples,
@@ -130,12 +132,31 @@ impl<D: FrameDecoder> Playback<D> {
 
     /// 收到一帧。参数见 [`JitterBuffer::push_at`]。
     pub fn push(&mut self, seq: u32, sent_ms: f64, payload: Vec<u8>, arrived_ms: f64) {
+        let late = self.jitter.stats.late;
+        let overflow = self.jitter.stats.overflow;
         self.jitter.push_at(seq, sent_ms, payload, arrived_ms);
+        self.quality.packet(
+            seq,
+            sent_ms,
+            arrived_ms,
+            self.jitter.stats.late > late,
+            self.jitter.stats.overflow > overflow,
+        );
     }
 
     /// 发送端说完了，见 [`JitterBuffer::end_at`]。
     pub fn end_at(&mut self, seq: u32) {
         self.jitter.end_at(seq);
+        self.quality.idle();
+    }
+
+    pub fn quality(&self, now_ms: f64) -> crate::quality::ReceiveQuality {
+        self.quality.snapshot(
+            now_ms,
+            self.jitter.buffered_frames() as f64 * self.frame_ms
+                + self.fifo.len() as f64 * 1000.0 / RATE,
+            self.jitter.target_frames() as f64 * self.frame_ms,
+        )
     }
 
     /// 取这一拍要播的一帧，写进 `out`（长度 = 一帧）。
@@ -143,6 +164,12 @@ impl<D: FrameDecoder> Playback<D> {
     /// 返回 `false` = 这个人现在没声音，不用混进去。
     pub fn pull(&mut self, now_ms: f64, out: &mut [f32]) -> bool {
         debug_assert_eq!(out.len(), self.frame);
+        let discarded = self
+            .jitter
+            .discard_excess((300.0 / self.frame_ms).ceil() as usize);
+        if discarded > 0 {
+            self.quality.discarded(now_ms, discarded);
+        }
         while self.fifo.len() < self.frame && self.refill(now_ms) {}
         if !self.jitter.is_playing() {
             self.excess_ms = None;
@@ -166,6 +193,7 @@ impl<D: FrameDecoder> Playback<D> {
             } => {
                 // 这一帧的第一个采样要等 FIFO 里排在前面的都播完才轮到。
                 let delay = now_ms + self.fifo.len() as f64 * 1000.0 / RATE - sent_ms;
+                self.quality.played(now_ms);
                 self.observe_delay(delay);
                 if !self.decoder.decode(&payload, &mut self.scratch) {
                     self.scratch.fill(0.0);
@@ -177,7 +205,9 @@ impl<D: FrameDecoder> Playback<D> {
                 }
                 true
             }
-            Playout::Lost { .. } | Playout::Stall => {
+            event @ (Playout::Lost { .. } | Playout::Stall) => {
+                self.quality
+                    .concealed(now_ms, matches!(event, Playout::Lost { .. }));
                 if !self.decoder.conceal(&mut self.scratch) {
                     self.scratch.fill(0.0);
                 }
@@ -185,7 +215,11 @@ impl<D: FrameDecoder> Playback<D> {
                 self.fifo.extend(self.scratch.iter());
                 true
             }
-            Playout::Prebuffering | Playout::Underrun => false,
+            Playout::Underrun => {
+                self.quality.idle();
+                false
+            }
+            Playout::Prebuffering => false,
         }
     }
 
@@ -226,6 +260,7 @@ impl<D: FrameDecoder> Playback<D> {
                 Playout::Frame {
                     sent_ms, payload, ..
                 } => {
+                    self.quality.played(now_ms);
                     // 这几帧会跟着 chunk 一起被缩短，这里记的是缩之前的延迟 ——
                     // 偏大一点点（最多一个基音周期），不影响判断。
                     if let Some(delays) = &mut self.delays {

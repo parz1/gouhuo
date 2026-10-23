@@ -35,7 +35,7 @@ impl CallHealth {
             stats.is_some_and(|s| s.capture_error.is_some() || s.render_error.is_some());
         let healthy = !reconnecting
             && stats.is_some_and(|s| {
-                s.udp_ok
+                s.transport_ok()
                     && s.input_available
                     && s.render_available
                     && s.error.is_none()
@@ -49,24 +49,24 @@ impl CallHealth {
             && (snapshot.error.is_some()
                 || device_error
                 || stats.is_some_and(|s| {
-                    s.udp_failed || s.transport_error.is_some() || s.sequences_exhausted
+                    s.path_failed() || s.transport_error.is_some() || s.sequences_exhausted
                 }));
         let mut action = if reconnecting {
             None
         } else {
             self.recovery.tick(now, healthy, failed, device_error)
         };
-        // Keep probing on the current socket during a UDP-only outage. Opening
+        // Keep probing on the current socket during a network-only outage. Opening
         // audio devices cannot repair packet loss and can disrupt virtual or
         // Bluetooth routing. The recovery policy still escalates persistent
         // failure to a rate-limited authenticated reconnect. Fatal transport
         // and preparation failures retain the normal voice replacement path.
-        let udp_only = snapshot.error.is_none()
+        let path_only = snapshot.error.is_none()
             && !device_error
             && stats.is_some_and(|s| {
-                s.udp_failed && s.transport_error.is_none() && !s.sequences_exhausted
+                s.path_failed() && s.transport_error.is_none() && !s.sequences_exhausted
             });
-        if udp_only && action == Some(Action::RetryVoice) {
+        if path_only && action == Some(Action::RetryVoice) {
             action = None;
         }
         let playback_only = stats.is_some_and(|s| {
@@ -74,8 +74,8 @@ impl CallHealth {
                 && s.capture_error.is_none()
                 && s.transport_error.is_none()
                 && s.input_available
-                && s.udp_ok
-                && !s.udp_failed
+                && s.transport_ok()
+                && !s.path_failed()
                 && !s.sequences_exhausted
         });
         let notice = match action {
@@ -104,6 +104,28 @@ impl CallHealth {
 mod tests {
     use super::*;
     use voice_types::VoiceStats;
+
+    #[test]
+    fn healthy_tls_fallback_never_escalates_a_udp_outage() {
+        let mut health = CallHealth::default();
+        let snapshot = RuntimeSnapshot {
+            stage: RuntimeStage::Ready,
+            voice: Some(VoiceStats {
+                udp_failed: true,
+                tcp_active: true,
+                tcp_ok: true,
+                input_available: true,
+                render_available: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for second in 0..90 {
+            let result = health.tick(Duration::from_secs(second), &snapshot, false);
+            assert!(result.healthy);
+            assert!(result.action.is_none());
+        }
+    }
 
     #[test]
     fn udp_outage_keeps_audio_open_until_reconnect_and_can_recover_in_place() {
