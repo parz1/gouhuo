@@ -528,6 +528,32 @@ impl Server {
         })
     }
 
+    /// 网络体检的准入：跟 [`Server::admit`] 同一套封禁和邀请码规则，但**不进名单**。
+    ///
+    /// 分配一个会话号（语音密钥和下行 nonce 要用），不占人数上限，不顶号，
+    /// 不消耗管理员链接，不广播。谁也看不见这个会话，它只会发保活。
+    pub fn admit_probe(
+        &mut self,
+        public_key: PublicKey,
+        invite_code: &str,
+    ) -> Result<SessionId, Denied> {
+        let session_id = u32::try_from(self.next_session).map_err(|_| Denied::Full)?;
+        let configured_admin = self.config.admin_keys.contains(&public_key);
+        if self.bans.contains_key(&public_key) && !configured_admin {
+            return Err(Denied::Banned);
+        }
+        let claimed = !invite_code.is_empty() && self.admin_claim.as_deref() == Some(invite_code);
+        let allowed = configured_admin
+            || claimed
+            || self.granted.contains_key(&public_key)
+            || self.check_invite(invite_code).is_some();
+        if !allowed {
+            return Err(Denied::InviteRequired);
+        }
+        self.next_session += 1;
+        Ok(session_id)
+    }
+
     /// 邀请码策略。返回准进来时该给的角色。
     fn check_invite(&self, provided: &str) -> Option<Role> {
         match (&self.config.invite_code, self.config.require_invite) {
@@ -571,6 +597,7 @@ impl Server {
         let me = self.users.get(&session);
         Welcome {
             tcp_voice: false,
+            probe_only: false,
             session_id: session,
             name: me.map(|u| u.name.clone()).unwrap_or_default(),
             role: me.map(|u| u.role as i32).unwrap_or(Role::Guest as i32),

@@ -271,6 +271,9 @@ pub(crate) fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>
             locked.diagnostic_log.sample(call.connection(), &snapshot);
         }
         let reconnecting = call.connection() == ConnectionState::Reconnecting;
+        if let Some(client) = &client {
+            client.set_voice_report(client_runtime::call::voice_report(snapshot.voice.as_ref()));
+        }
         let mut view = CallViewModel::project_audio(&call, &snapshot, ptt_bound);
         SlintAdapter::apply_audio(&app, &view);
         update_tray(&view, client.as_ref());

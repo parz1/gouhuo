@@ -105,6 +105,7 @@ impl Client {
                 protocol_version: PROTOCOL_VERSION,
                 client_version: "gouhuo test".into(),
                 public_key: identity.public_key().0.to_vec(),
+                probe_only: false,
             }
             .into(),
         );
@@ -352,6 +353,7 @@ fn pong_reports_udp_packet_count() {
         Ping {
             timestamp: 1,
             udp_packets_received: 0,
+            ..Default::default()
         }
         .into(),
     );
@@ -370,6 +372,7 @@ fn pong_reports_udp_packet_count() {
         Ping {
             timestamp: 2,
             udp_packets_received: 0,
+            ..Default::default()
         }
         .into(),
     );

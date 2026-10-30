@@ -123,6 +123,7 @@ impl Client {
         self.send(Ping {
             timestamp: stamp,
             udp_packets_received: 0,
+            ..Default::default()
         });
         for _ in 0..16 {
             if let Some(server_message::Payload::Pong(pong)) = self.recv().payload {
@@ -139,6 +140,7 @@ impl Client {
             protocol_version: PROTOCOL_VERSION,
             client_version: "gouhuo test".into(),
             public_key: self.identity.public_key().0.to_vec(),
+            probe_only: false,
         });
         self.finish_login(code, name, true)
     }
@@ -267,6 +269,7 @@ fn bad_signature_is_rejected() {
         protocol_version: PROTOCOL_VERSION,
         client_version: "gouhuo test".into(),
         public_key: victim.public_key().0.to_vec(),
+        probe_only: false,
     });
     // ……但签名是别的私钥签的
     let rejected = attacker
@@ -308,6 +311,7 @@ fn version_mismatch_says_what_to_do() {
         protocol_version: PROTOCOL_VERSION + 7,
         client_version: "来自未来".into(),
         public_key: vec![1u8; 32],
+        probe_only: false,
     });
     let Some(server_message::Payload::Rejected(rejected)) = client.recv().payload else {
         panic!("版本不对却没被拒");
@@ -459,6 +463,7 @@ fn legacy_v1_is_rejected_before_authentication() {
         protocol_version: 1,
         client_version: "0.1.1".into(),
         public_key: old.identity.public_key().0.to_vec(),
+        probe_only: false,
     });
     let Some(server_message::Payload::Rejected(rejected)) = old.recv().payload else {
         panic!("旧客户端没有收到版本拒绝")

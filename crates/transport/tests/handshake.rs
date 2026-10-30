@@ -68,6 +68,7 @@ fn client_hello() -> ClientMessage {
         protocol_version: PROTOCOL_VERSION,
         client_version: "gouhuo test".into(),
         public_key: vec![9u8; 32],
+        probe_only: false,
     }
     .into()
 }

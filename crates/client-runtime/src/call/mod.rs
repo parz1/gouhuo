@@ -5,9 +5,11 @@
 //! connection flags back to the call state or decide whether audio is sending.
 
 pub mod controller;
+pub mod network;
 pub mod state;
 pub mod viewmodel;
 
 pub use controller::{CallCommand, CallController, CommandResult, IgnoreReason};
+pub use network::{voice_report, MemberNetView};
 pub use state::{CallState, ConnectionPhase};
 pub use viewmodel::{AudioViewModel, BanView, CallViewModel, ChatView, MemberView, RowView};

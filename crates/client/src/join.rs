@@ -205,11 +205,24 @@ pub fn run(
     }
 }
 
-enum Resolved {
+pub enum Resolved {
     /// 指纹有人担保：邀请链接、加入页、以前存下的。可以直接连。
     Vouched(Known),
     /// 指纹是刚从对面取回来的。要用户核对。
     Unvouched(Known),
+}
+
+/// 只走到「知道是哪台服务器」为止，不连。网络体检用：它要的是 Invite，
+/// 之后自己去连。**会阻塞**（可能要查加入页、取指纹）。
+pub fn locate(
+    request: Request,
+    saved: &[SavedServer],
+    progress: &dyn Fn(&str, Option<&Known>),
+) -> Result<Resolved, Failure> {
+    match request {
+        Request::Known(server) => Ok(Resolved::Vouched(server)),
+        Request::Address { text, fresh } => resolve(&text, fresh, saved, progress),
+    }
 }
 
 fn resolve(

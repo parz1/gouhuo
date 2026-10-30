@@ -51,6 +51,9 @@ message Hello {
   string client_version = 2;
   // Ed25519 公钥，32 字节。这就是用户身份，没有账号密码。
   bytes public_key = 3;
+  // 只做网络体检，不进频道、不出现在名单里。服务端照常验邀请码和封禁，
+  // 分配会话和语音密钥，回保活；不声明支持的旧服务端会把它当普通加入处理。
+  bool probe_only = 4;
 }
 
 // 服务端发回的挑战。客户端要用私钥签它，证明自己真的持有那把私钥。
@@ -88,6 +91,9 @@ message Welcome {
   uint32 current_channel_id = 7;
   // Supports authenticated TLS voice; absent on old servers.
   bool tcp_voice = 8;
+  // 服务端确认这是体检会话：没有进频道，channels / users 为空。
+  // 旧服务端不带这个字段，客户端据此知道自己其实被当成普通加入了。
+  bool probe_only = 9;
 }
 
 // 认证没过，或者服务端不收。发完就断开。
@@ -327,6 +333,19 @@ message Ping {
   int64 timestamp = 1;
   // 到现在为止收到了多少语音包。服务端拿它判断 UDP 通不通。
   uint64 udp_packets_received = 2;
+  // 下面是客户端的自报网络状况，服务端汇总进 NetworkReport 给同服的人看。
+  // 旧客户端不填，全是零 —— 服务端用 *_known 区分「没报」和「报了零」。
+  //
+  // 到现在为止发出去了多少语音包（不含保活）。
+  uint64 udp_packets_sent = 3;
+  // 最近一次 UDP 保活往返，毫秒。
+  uint32 rtt_ms = 4;
+  bool rtt_known = 5;
+  // 最近十秒我收到别人语音的缺帧率，千分比，所有说话人合计。
+  uint32 downlink_loss_permille = 6;
+  bool downlink_known = 7;
+  // 语音正走 TLS 兼容连接。
+  bool tcp_voice = 8;
 }
 
 message Pong {
@@ -334,6 +353,31 @@ message Pong {
   // 服务端从这个客户端收到了多少 UDP 语音包。跟客户端的计数一对比，
   // 就知道是哪个方向不通。
   uint64 udp_packets_received = 2;
+}
+
+// ===========================================================================
+// 网络状况
+// ===========================================================================
+
+// 一个人的网络状况。服务端每隔几秒汇总一份发给所有人。
+//
+// 上行丢包是**服务端自己量的**：它看得到每个人语音包的序号，缺了多少就是丢了多少，
+// 不依赖客户端配合，旧客户端也有这一项。RTT 和下行丢包是那个人自报的（Ping 里带来）。
+message MemberNetwork {
+  uint32 session_id = 1;
+  // 最近十秒这个人发到服务端的语音包缺了几千分之几。没在说话时退回保活统计
+  // （窗口更长、样本更粗）。
+  uint32 uplink_loss_permille = 2;
+  bool uplink_known = 3;
+  uint32 rtt_ms = 4;
+  bool rtt_known = 5;
+  uint32 downlink_loss_permille = 6;
+  bool downlink_known = 7;
+  bool tcp_voice = 8;
+}
+
+message NetworkReport {
+  repeated MemberNetwork members = 1;
 }
 
 // ===========================================================================
@@ -382,5 +426,6 @@ message ServerMessage {
     BanList ban_list = 10;
     VoiceDatagram voice_datagram = 11;
     VoicePath voice_path = 12;
+    NetworkReport network_report = 13;
   }
 }

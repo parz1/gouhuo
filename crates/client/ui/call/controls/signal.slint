@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { CallTokens } from "../tokens.slint";
+import { Theme } from "../../theme.slint";
+
+// 三格信号条。1 好（三格绿）、2 有波动（两格黄）、3 差（一格红）。
+// 跟手机信号一样：格数少 = 差，颜色再强调一遍，色弱也分得清。
+export component SignalBars inherits Rectangle {
+    in property <int> level;
+    width: 12px;
+    height: 12px;
+    property <color> tone: root.level >= 3 ? Theme.danger : root.level == 2 ? Theme.warn : CallTokens.speaking;
+    property <int> lit: root.level >= 3 ? 1 : root.level == 2 ? 2 : 3;
+    property <length> bar: root.width / 4;
+    accessible-role: none;
+    Rectangle { x: 0; width: root.bar; height: root.height * 0.4; y: root.height - self.height; border-radius: 1px; background: root.lit >= 1 ? root.tone : CallTokens.line; }
+    Rectangle { x: root.bar * 1.5; width: root.bar; height: root.height * 0.7; y: root.height - self.height; border-radius: 1px; background: root.lit >= 2 ? root.tone : CallTokens.line; }
+    Rectangle { x: root.bar * 3; width: root.bar; height: root.height; y: 0; border-radius: 1px; background: root.lit >= 3 ? root.tone : CallTokens.line; }
+}

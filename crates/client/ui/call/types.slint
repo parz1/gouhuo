@@ -31,6 +31,11 @@ export struct Row {
     can-ban: bool,
     can-set-role: bool,
     can-edit: bool,
+    // 只对人有意义：网络状况。0 不知道、1 好、2 有波动、3 差；
+    // summary 是行尾那几个字，detail 是成员菜单里的几行。规则在 client-runtime。
+    net-level: int,
+    net-summary: string,
+    net-detail: string,
 }
 
 export struct ChatRow {

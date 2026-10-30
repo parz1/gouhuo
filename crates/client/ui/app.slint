@@ -169,6 +169,18 @@ export component App inherits Window {
     in-out property <string> join-code;
     in property <bool> code-rejected: false;
     in property <string> trust-fingerprint;
+    // 网络体检，见 home.slint
+    in property <bool> checking;
+    in property <string> check-stage;
+    in property <int> check-percent;
+    in property <string> check-headline;
+    in property <int> check-level;
+    in property <string> check-text;
+    in property <string> check-saved;
+    callback check-network();
+    callback cancel-check();
+    callback save-check();
+    callback close-check();
     in property <bool> error-can-reverify: false;
     /// 首页上那堆火的像素图，Rust 那边按画面大小画好。
     in property <image> home-fire;
@@ -281,6 +293,9 @@ export component App inherits Window {
     in property <bool> input-available: false;
     in property <bool> render-available: false;
     in property <string> self-status;
+    /// 自己的网络状况，底栏身份块上那几个字。
+    in property <string> self-net-summary;
+    in property <int> self-net-level;
     /// 语音激活的阈值，同一把尺子。
     in-out property <float> vad-level;
     /// 现在在不在往外发。
@@ -456,6 +471,17 @@ export component App inherits Window {
             reverify => { root.reverify-server(); }
             forget(id) => { root.forget-server(id); }
             open-settings => { root.toggle-settings(); }
+            checking: root.checking;
+            check-stage: root.check-stage;
+            check-percent: root.check-percent;
+            check-headline: root.check-headline;
+            check-level: root.check-level;
+            check-text: root.check-text;
+            check-saved: root.check-saved;
+            check-network => { root.check-network(); }
+            cancel-check => { root.cancel-check(); }
+            save-check => { root.save-check(); }
+            close-check => { root.close-check(); }
         }
     }
 
@@ -489,6 +515,8 @@ export component App inherits Window {
         render-available: root.render-available;
         transmitting: root.transmitting;
         self-status: root.self-status;
+        self-net-summary: root.self-net-summary;
+        self-net-level: root.self-net-level;
         recovery-message: root.recovery-message;
         tcp-voice: root.tcp-voice;
         diagnostic-recording: root.diagnostic-recording;

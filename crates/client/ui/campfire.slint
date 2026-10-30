@@ -13,6 +13,7 @@
 import { Theme } from "theme.slint";
 import { CallTokens } from "call/tokens.slint";
 import { CallButton } from "call/controls/button.slint";
+import { SignalBars } from "call/controls/signal.slint";
 import { ScrollView } from "std-widgets.slint";
 
 /// 一个座位。模型固定 8 条，第 n 条就是 n 号座位 ——
@@ -39,6 +40,8 @@ export struct Seat {
     can-kick: bool,
     can-ban: bool,
     can-set-role: bool,
+    /// 网络状况，同名单那一行：0 不知道、1 好、2 有波动、3 差。
+    net-level: int,
 }
 
 component StoneSeat {
@@ -62,7 +65,8 @@ component StoneSeat {
     accessible-role: button;
     accessible-label: root.data.name
         + (root.data.is-me ? "（我）" : "")
-        + (root.talking ? "，正在说话" : root.data.deafened ? "，关了耳朵" : root.data.muted ? "，闭麦" : "");
+        + (root.talking ? "，正在说话" : root.data.deafened ? "，关了耳朵" : root.data.muted ? "，闭麦" : "")
+        + (root.data.net-level >= 3 ? "，网络差" : root.data.net-level == 2 ? "，网络有波动" : "");
     accessible-action-default => { if (!root.data.is-me) { root.clicked(); } }
 
     stone := Rectangle {
@@ -103,6 +107,19 @@ component StoneSeat {
             vertical-alignment: center;
             width: 100%;
             height: 100%;
+        }
+
+        // 网络差：左下角一个信号格。好的时候不画 —— 篝火边不该满是仪表。
+        if root.data.net-level >= 2: Rectangle {
+            width: root.s * 0.4;
+            height: self.width;
+            x: 0 - self.width * 0.2;
+            y: parent.height - self.height * 0.8;
+            border-radius: self.width / 2;
+            border-width: 2px;
+            border-color: #0f1013;
+            background: #1b1c22;
+            SignalBars { level: root.data.net-level; width: parent.width * 0.55; height: self.width; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
         }
 
         if root.data.muted || root.data.deafened: Rectangle {

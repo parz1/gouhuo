@@ -74,6 +74,7 @@ pub fn spawn_watchdog(hub: Arc<conn::Hub>, interval: std::time::Duration) -> io:
         .spawn(move || loop {
             std::thread::sleep(interval);
             hub.sweep_idle();
+            hub.broadcast_network_report();
         })?;
     Ok(())
 }

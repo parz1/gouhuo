@@ -494,6 +494,14 @@ struct State {
     /// 正在加入、或者刚失败的那个服务器不一定是最近用过的，也可能根本没存过 ——
     /// 这时候得把它摆在上面，不然「正在加入」「没能加入」说的是谁都不知道。
     hero: Option<Hero>,
+    /// 第几次网络体检；同 `join_generation` 的用法：过期的结果直接丢。
+    check_generation: u64,
+    check_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 体检要的服务器指纹没人担保，正停在核对那一步；点了「指纹一致」之后
+    /// 接着体检，而不是加入。
+    check_after_trust: bool,
+    /// 最近一次体检的报告原文，「保存为文件」存的就是它。
+    check_report: Option<String>,
 }
 
 impl State {

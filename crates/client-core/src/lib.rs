@@ -29,12 +29,13 @@ pub mod error;
 pub mod roster;
 
 mod client;
+pub mod netcheck;
 mod probe;
 mod wire;
 
 pub use client::{
-    Client, Ended, Event, Options, CONNECT_TIMEOUT, HEARTBEAT, LIVENESS_TIMEOUT, RECONNECT_FIRST,
-    RECONNECT_MAX,
+    Client, Ended, Event, Options, VoiceReport, CONNECT_TIMEOUT, HEARTBEAT, LIVENESS_TIMEOUT,
+    RECONNECT_FIRST, RECONNECT_MAX,
 };
 pub use error::ConnectError;
 pub use probe::probe;

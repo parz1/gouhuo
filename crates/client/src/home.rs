@@ -28,6 +28,16 @@ pub(crate) fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<St
             }
         })
     };
+    let check: Rc<dyn Fn(join::Request)> = {
+        let weak = app.as_weak();
+        let identity = Rc::clone(identity);
+        let state = Arc::clone(state);
+        Rc::new(move |request| {
+            if let Some(app) = weak.upgrade() {
+                begin_check(&app, &identity, &state, request);
+            }
+        })
+    };
 
     {
         // 点链接启动、别的实例转交过来的链接。
@@ -106,12 +116,102 @@ pub(crate) fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<St
     {
         // 用户核对过指纹了：从这一刻起它就是固定下来的，跟邀请链接里带的一样。
         let begin = Rc::clone(&begin);
+        let check = Rc::clone(&check);
         let state = Arc::clone(state);
         app.on_trust_server(move || {
-            let pending = state.lock().expect("state poisoned").pending.clone();
+            let (pending, for_check) = {
+                let locked = state.lock().expect("state poisoned");
+                (locked.pending.clone(), locked.check_after_trust)
+            };
             if let Some(known) = pending {
-                begin(join::Request::Known(known));
+                if for_check {
+                    check(join::Request::Known(known));
+                } else {
+                    begin(join::Request::Known(known));
+                }
             }
+        });
+    }
+
+    {
+        // 网络体检：现在框里有地址就测它；没有就测上面那一大块说的那台。
+        let check = Rc::clone(&check);
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_check_network(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let text = app.get_address_input().to_string();
+            let request = if app.get_home_mode() == 1 && !text.trim().is_empty() {
+                if !check_address(&app, &state, &text) {
+                    return;
+                }
+                Some(join::Request::Address { text, fresh: false })
+            } else {
+                let locked = state.lock().expect("state poisoned");
+                let hero = app.get_hero_id();
+                if hero >= 0 {
+                    locked
+                        .settings
+                        .servers
+                        .get(hero as usize)
+                        .and_then(join::Known::from_saved)
+                        .map(join::Request::Known)
+                } else {
+                    locked.last_request.clone()
+                }
+            };
+            if let Some(request) = request {
+                check(request);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_cancel_check(move || {
+            let Some(app) = weak.upgrade() else { return };
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.check_generation += 1;
+                if let Some(cancel) = locked.check_cancel.take() {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                locked.check_after_trust = false;
+            }
+            app.set_checking(false);
+            app.set_home_mode(0);
+            refresh_home(&app, &state);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_close_check(move || {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_home_mode(0);
+            refresh_home(&app, &state);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_save_check(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let Some(report) = state.lock().expect("state poisoned").check_report.clone() else {
+                return;
+            };
+            app.set_check_saved("正在保存…".into());
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let status = match diagnostic_log::save_text("netcheck", &report) {
+                    Ok(path) => format!("已保存：{}", path.display()),
+                    Err(error) => format!("保存失败：{error}"),
+                };
+                let _ = weak.upgrade_in_event_loop(move |app| app.set_check_saved(status.into()));
+            });
         });
     }
 
@@ -169,6 +269,7 @@ pub(crate) fn wire_home(app: &App, identity: &Rc<Identity>, state: &Arc<Mutex<St
                 // 后台那次连接掐不掉，只能不认它的结果，见 State::join_generation。
                 locked.join_generation += 1;
                 locked.pending = None;
+                locked.check_after_trust = false;
                 locked.hero = None;
                 locked.call.offline();
             }
@@ -431,6 +532,209 @@ pub(crate) fn finish_join(
             });
         }
     }
+    refresh_home(app, state);
+}
+
+/// 开始网络体检。跟 [`begin_join`] 一样在后台线程上做，结果由 [`finish_check`] 搬回来。
+///
+/// 先按加入的规矩认出是哪台服务器（邀请链接、加入页、存过的），指纹没人担保时
+/// 同样停下来让用户核对 —— 体检也要把加入码发给对面，不能发给一台没核对过的机器。
+pub(crate) fn begin_check(
+    app: &App,
+    identity: &Rc<Identity>,
+    state: &Arc<Mutex<State>>,
+    request: join::Request,
+) {
+    if call_connection(state) == ConnectionState::Connecting {
+        return;
+    }
+    let Ok(identity) = Identity::import(&identity.export()) else {
+        return;
+    };
+    let hero = match &request {
+        join::Request::Known(known) => hero_of(known),
+        join::Request::Address { text, .. } => {
+            use client_core::address::{display_address, parse, Target};
+            let shown = match parse(text, join::allow_loopback_http()) {
+                Ok(Target::Invite(invite)) => display_address(&invite.host, invite.port),
+                Ok(Target::Page(page)) => page.host,
+                Ok(Target::Host(host)) => display_address(&host.host, host.port_or_default()),
+                Err(_) => "…".to_string(),
+            };
+            Hero {
+                title: shown.clone(),
+                address: shown,
+                seed: 0,
+            }
+        }
+    };
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (generation, saved) = {
+        let mut locked = state.lock().expect("state poisoned");
+        locked.check_generation += 1;
+        if let Some(previous) = locked.check_cancel.replace(Arc::clone(&cancel)) {
+            previous.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        locked.check_after_trust = false;
+        locked.check_report = None;
+        locked.pending = None;
+        locked.hero = Some(hero);
+        (locked.check_generation, locked.settings.servers.clone())
+    };
+    app.set_checking(true);
+    app.set_check_stage("正在准备…".into());
+    app.set_check_percent(0);
+    app.set_check_headline("".into());
+    app.set_check_text("".into());
+    app.set_check_saved("".into());
+    app.set_check_level(0);
+    app.set_home_mode(4);
+    clear_join_error(app);
+    refresh_home(app, state);
+
+    let weak = app.as_weak();
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        let stage = {
+            let weak = weak.clone();
+            let state = Arc::clone(&state);
+            move |text: String, percent: i32, server: Option<join::Known>| {
+                let state = Arc::clone(&state);
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    {
+                        let mut locked = state.lock().expect("state poisoned");
+                        if locked.check_generation != generation {
+                            return;
+                        }
+                        if let Some(server) = &server {
+                            locked.hero = Some(hero_of(server));
+                        }
+                    }
+                    app.set_check_stage(text.into());
+                    app.set_check_percent(percent);
+                    if server.is_some() {
+                        refresh_home(&app, &state);
+                    }
+                });
+            }
+        };
+        let located = join::locate(request, &saved, &|text, server| {
+            stage(text.to_string(), 0, server.cloned())
+        });
+        let known = match located {
+            Ok(join::Resolved::Vouched(known)) => known,
+            Ok(join::Resolved::Unvouched(known)) => {
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    let mut locked = state.lock().expect("state poisoned");
+                    if locked.check_generation != generation {
+                        return;
+                    }
+                    locked.check_cancel = None;
+                    locked.check_after_trust = true;
+                    locked.hero = Some(hero_of(&known));
+                    locked.pending = Some(known.clone());
+                    drop(locked);
+                    app.set_checking(false);
+                    app.set_trust_fingerprint(known.invite.cert.to_grouped_hex().into());
+                    app.set_home_mode(3);
+                    refresh_home(&app, &state);
+                });
+                return;
+            }
+            Err(failure) => {
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    finish_check(
+                        &app,
+                        &state,
+                        generation,
+                        CheckOutcome::Failed {
+                            headline: failure.headline,
+                            advice: failure.advice,
+                        },
+                    );
+                });
+                return;
+            }
+        };
+        stage("正在连接…".to_string(), 0, Some(known.clone()));
+        let progress = |step: client_core::netcheck::Stage| {
+            let percent = match &step {
+                client_core::netcheck::Stage::Udp { percent, .. } => *percent as i32,
+                client_core::netcheck::Stage::Done => 100,
+                _ => 0,
+            };
+            stage(step.label(), percent, None);
+        };
+        let outcome = match client_core::netcheck::run(
+            &known.invite,
+            &identity,
+            &client_core::netcheck::CheckPlan::default(),
+            &progress,
+            &cancel,
+        ) {
+            Ok(report) => CheckOutcome::Done(Box::new(report)),
+            Err(client_core::netcheck::CheckError::Cancelled) => return,
+            Err(client_core::netcheck::CheckError::Connect(error)) => CheckOutcome::Failed {
+                headline: error.headline(),
+                advice: error.advice(),
+            },
+        };
+        let _ = weak.upgrade_in_event_loop(move |app| {
+            finish_check(&app, &state, generation, outcome);
+        });
+    });
+}
+
+pub(crate) enum CheckOutcome {
+    Done(Box<client_core::netcheck::CheckReport>),
+    Failed { headline: String, advice: String },
+}
+
+pub(crate) fn finish_check(
+    app: &App,
+    state: &Arc<Mutex<State>>,
+    generation: u64,
+    outcome: CheckOutcome,
+) {
+    {
+        let mut locked = state.lock().expect("state poisoned");
+        if locked.check_generation != generation {
+            return;
+        }
+        locked.check_cancel = None;
+    }
+    let (headline, text, level) = match outcome {
+        CheckOutcome::Done(report) => {
+            use client_core::netcheck::Verdict;
+            let level = match report.verdict {
+                Verdict::Good | Verdict::HighLatency => 1,
+                Verdict::Fluctuating => 2,
+                Verdict::Congested | Verdict::RateLimited | Verdict::UdpBlocked => 3,
+                Verdict::Incomplete => 0,
+            };
+            (
+                report.verdict.headline().to_string(),
+                report.to_text(),
+                level,
+            )
+        }
+        CheckOutcome::Failed { headline, advice } => (
+            headline,
+            format!(
+                "{advice}
+
+连接都没建起来，UDP 没有测。先解决上面这个问题。"
+            ),
+            3,
+        ),
+    };
+    state.lock().expect("state poisoned").check_report = Some(text.clone());
+    app.set_checking(false);
+    app.set_check_percent(100);
+    app.set_check_headline(headline.into());
+    app.set_check_text(text.into());
+    app.set_check_level(level);
+    app.set_home_mode(4);
     refresh_home(app, state);
 }
 

@@ -169,6 +169,7 @@ envelope_from!(
     Challenge => server_message::Payload::Challenge,
     VoiceDatagram => server_message::Payload::VoiceDatagram,
     VoicePath => server_message::Payload::VoicePath,
+    NetworkReport => server_message::Payload::NetworkReport,
     Welcome => server_message::Payload::Welcome,
     Rejected => server_message::Payload::Rejected,
     Pong => server_message::Payload::Pong,
@@ -206,6 +207,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             client_version: "gouhuo 0.0.1".into(),
             public_key: vec![7u8; 32],
+            probe_only: false,
         }
         .into()
     }
@@ -228,6 +230,7 @@ mod tests {
         let b: ClientMessage = Ping {
             timestamp: 42,
             udp_packets_received: 7,
+            ..Default::default()
         }
         .into();
         encode_frame(&a, &mut buf).unwrap();
@@ -330,6 +333,7 @@ mod tests {
             protocol_version: 1,
             client_version: "x".into(),
             public_key: vec![1, 2, 3],
+            probe_only: false,
         }
         .encode(&mut body)
         .unwrap();
@@ -425,5 +429,56 @@ mod fallback_compatibility {
         let decoded = LegacyWelcome::decode(current.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, old);
         assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    // Frozen pre-extension Ping: old clients report nothing but the two
+    // original fields, and the server must read them as "unknown", not zero.
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyPing {
+        #[prost(int64, tag = "1")]
+        timestamp: i64,
+        #[prost(uint64, tag = "2")]
+        udp_packets_received: u64,
+    }
+    #[test]
+    fn old_ping_reports_nothing_and_old_reader_ignores_self_report() {
+        let old = LegacyPing {
+            timestamp: 42,
+            udp_packets_received: 9,
+        };
+        let current = Ping::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(!current.rtt_known && !current.downlink_known && !current.tcp_voice);
+        assert_eq!(current.udp_packets_sent, 0);
+        let current = Ping {
+            udp_packets_sent: 1000,
+            rtt_ms: 180,
+            rtt_known: true,
+            downlink_loss_permille: 35,
+            downlink_known: true,
+            tcp_voice: false,
+            ..current
+        };
+        let decoded = LegacyPing::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, old);
+    }
+
+    #[test]
+    fn old_reader_treats_network_report_as_unknown_payload() {
+        // An old client decodes unknown oneof variants as None and ignores them;
+        // the envelope test above covers the mechanism, this pins the tag.
+        let report: ServerMessage = NetworkReport {
+            members: vec![MemberNetwork {
+                session_id: 3,
+                uplink_loss_permille: 120,
+                uplink_known: true,
+                ..Default::default()
+            }],
+        }
+        .into();
+        let bytes = report.encode_to_vec();
+        // Field 13, wire type 2 (length-delimited).
+        assert_eq!(bytes[0], (13 << 3) | 2);
+        let back = ServerMessage::decode(bytes.as_slice()).unwrap();
+        assert_eq!(back, report);
     }
 }
