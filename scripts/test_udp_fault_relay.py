@@ -24,11 +24,30 @@ class RelayTests(unittest.TestCase):
             client.close()
 
     def roundtrip(self, index, data=b"encrypted-packet-placeholder"):
+        """Send one packet and collect what each side receives.
+
+        Finishes when the relay has accounted for every packet in both
+        directions (each one is counted exactly once as delivered or
+        dropped) and everything delivered has been read, instead of after a
+        fixed wall-clock window that a slow runner can overrun.
+        """
+        start = dict(self.relay.counts)
+        delta = lambda key: self.relay.counts[key] - start[key]
         self.clients[index].sendto(data, self.front)
         upstream = []
         downstream = []
-        deadline = time.monotonic() + 0.08
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + 5.0
+        while True:
+            up_resolved = delta("up_delivered") + delta("up_dropped") + delta("capacity_dropped") + delta("errors")
+            down_resolved = delta("down_delivered") + delta("down_dropped")
+            if (
+                up_resolved >= 1
+                and len(upstream) == delta("up_delivered")
+                and down_resolved == len(upstream)
+                and len(downstream) == delta("down_delivered")
+            ):
+                break
+            self.assertLess(time.monotonic(), deadline, "relay did not account for the packet")
             self.relay.step(0.001)
             try:
                 packet, source = self.backend.recvfrom(4096)
