@@ -141,7 +141,6 @@ impl MicCheck {
                             if shared.stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            shared.running.store(true, Ordering::Relaxed);
                             if let Some(processor) = &processor {
                                 processor.process_capture(&mut frame);
                             }
@@ -149,6 +148,9 @@ impl MicCheck {
                                 (crate::pipeline::frame_db(&frame) * 100.0) as i32,
                                 Ordering::Relaxed,
                             );
+                            // 电平写完再报「在跑」：看到在跑的人读电平，读到的必须是
+                            // 这一帧，不能是初始的静音值。Release 配 is_running 的 Acquire。
+                            shared.running.store(true, Ordering::Release);
                             if shared.monitoring.load(Ordering::Relaxed) {
                                 let mut queue = shared.monitor.lock().expect("monitor poisoned");
                                 if queue.len() >= MONITOR_MAX_FRAMES {
@@ -239,7 +241,7 @@ impl MicCheckControl {
 
     /// 采集那边真的转起来了没有。
     pub fn is_running(&self) -> bool {
-        !self.shared.stop.load(Ordering::Relaxed) && self.shared.running.load(Ordering::Relaxed)
+        !self.shared.stop.load(Ordering::Relaxed) && self.shared.running.load(Ordering::Acquire)
     }
 
     /// 设备出了什么问题，能直接显示给用户。
