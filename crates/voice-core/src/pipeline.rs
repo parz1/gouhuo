@@ -984,8 +984,9 @@ fn send_loop(
 
         // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
         // 这时候还漏出去一声是很糟糕的那种 bug。
+        let gated_mode = mode.load(Ordering::Relaxed);
         let sending = gate.update(
-            TransmitMode::decode(mode.load(Ordering::Relaxed)),
+            TransmitMode::decode(gated_mode),
             level,
             transmitting.load(Ordering::Relaxed),
             muted.load(Ordering::Relaxed) || !send_enabled.load(Ordering::Relaxed),
@@ -1030,13 +1031,15 @@ fn send_loop(
             flags: 0,
         };
         // 编码期间控制意愿可能变化；提交之前再检查，避免已退场的候选链路漏包。
+        // 模式也要跟开门时一样：按住说话放行的帧不能在切到语音激活之后发出去，
+        // 否则这一帧没经过 VAD 判定，还会留下一个过期的「正在发送」。
+        let current_mode = mode.load(Ordering::Relaxed);
         let permitted = !stop.load(Ordering::Relaxed)
             && send_enabled.load(Ordering::Relaxed)
             && !muted.load(Ordering::Relaxed)
-            && (!matches!(
-                TransmitMode::decode(mode.load(Ordering::Relaxed)),
-                TransmitMode::PushToTalk
-            ) || transmitting.load(Ordering::Relaxed));
+            && current_mode == gated_mode
+            && (!matches!(TransmitMode::decode(current_mode), TransmitMode::PushToTalk)
+                || transmitting.load(Ordering::Relaxed));
         let mut submitted = false;
         if permitted && cipher.seal(header, packet, &mut wire).is_ok() {
             match send_voice(&socket, server, shared, &wire) {
