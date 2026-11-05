@@ -153,6 +153,28 @@ impl Recorder {
     }
 }
 
+/// 把一段文字存到诊断目录里，文件名带前缀和时间戳。网络体检报告用。
+pub fn save_text(prefix: &str, body: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let base = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| std::io::Error::other("LOCALAPPDATA unavailable"))?;
+    let directory = std::path::PathBuf::from(base)
+        .join("gouhuo")
+        .join("diagnostics");
+    std::fs::create_dir_all(&directory)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = directory.join(format!("{prefix}-{timestamp}.txt"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(body.as_bytes())?;
+    Ok(path)
+}
+
 pub fn export(report: &str) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     let base = std::env::var_os("LOCALAPPDATA")

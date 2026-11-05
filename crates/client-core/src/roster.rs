@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
-use protocol::control::{BannedUser, Channel, Role, User, Welcome};
+use protocol::control::{BannedUser, Channel, MemberNetwork, NetworkReport, Role, User, Welcome};
 
 /// 聊天记录最多留多少条。
 ///
@@ -48,9 +48,45 @@ pub struct Roster {
     pub chat: VecDeque<ChatLine>,
     /// 封禁名单。**只有管理员有**：服务端只把它发给管理员，别人这里永远是空的。
     pub bans: Vec<BannedUser>,
+    /// 每个人的网络状况，按会话 id。来自服务端的 `NetworkReport`；
+    /// 旧服务端不发，那时候只有自己那一条，是用 Pong 的收包数估出来的。
+    pub network: BTreeMap<u32, MemberNetwork>,
+    /// 收到过服务端的报告。之后 Pong 的本地估算就不再覆盖它。
+    pub network_from_server: bool,
 }
 
 impl Roster {
+    pub fn network_of(&self, session: u32) -> Option<&MemberNetwork> {
+        self.network.get(&session)
+    }
+
+    /// 服务端发来一份所有人的网络状况：整个换掉，不在报告里的人就没有数据。
+    pub fn apply_network_report(&mut self, report: NetworkReport) {
+        self.network_from_server = true;
+        self.network = report
+            .members
+            .into_iter()
+            .map(|m| (m.session_id, m))
+            .collect();
+    }
+
+    /// 旧服务端：只有自己这一条，拿本地估算填。返回有没有变化。
+    pub fn note_local_network(&mut self, mine: MemberNetwork) -> bool {
+        if self.network_from_server {
+            return false;
+        }
+        let session = self.me;
+        let mine = MemberNetwork {
+            session_id: session,
+            ..mine
+        };
+        if self.network.get(&session) == Some(&mine) {
+            return false;
+        }
+        self.network.insert(session, mine);
+        true
+    }
+
     pub fn from_welcome(welcome: &Welcome) -> Self {
         let mut roster = Self {
             me: welcome.session_id,
@@ -438,6 +474,7 @@ mod tests {
     fn welcome_populates_everything() {
         let welcome = Welcome {
             tcp_voice: false,
+            probe_only: false,
             session_id: 3,
             name: "阿狸".into(),
             role: Role::Member as i32,

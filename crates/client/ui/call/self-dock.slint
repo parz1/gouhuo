@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { CallTokens } from "tokens.slint";
 import { CallButton } from "controls/button.slint";
+import { Theme } from "../theme.slint";
 
 component SelfIdentity inherits Rectangle {
     in property <string> nick;
     in property <image> stone;
+    /// 自己的网络：有数据就替掉那个「我」字。
+    in property <string> net-summary;
+    in property <int> net-level;
     callback details();
     callback focused();
     in property <int> focus-epoch: 0;
@@ -22,7 +26,7 @@ component SelfIdentity inherits Rectangle {
     border-color: CallTokens.warm;
     border-radius: 6px;
     accessible-role: button;
-    accessible-label: root.nick + "，我，查看身份详情";
+    accessible-label: root.nick + "，我" + (root.net-summary == "" ? "" : "，网络 " + root.net-summary) + "，查看身份详情";
     accessible-action-default => { root.details(); }
     HorizontalLayout {
         spacing: 8px;
@@ -43,7 +47,7 @@ component SelfIdentity inherits Rectangle {
             spacing: 2px;
             min-width: 0;
             Text { text: root.nick; height: 18px; min-width: 0; overflow: elide; color: CallTokens.text; font-size: 13px; }
-            Text { text: "我"; height: 14px; color: CallTokens.dim; font-size: 11px; }
+            Text { text: root.net-summary == "" ? "我" : root.net-summary; height: 14px; min-width: 0; overflow: elide; color: root.net-level >= 3 ? Theme.danger : root.net-level == 2 ? Theme.warn : CallTokens.dim; font-size: 11px; }
         }
     }
     TouchArea { mouse-cursor: pointer; clicked => { identity-focus.focus(); root.details(); } }
@@ -204,6 +208,8 @@ component CallActions inherits Rectangle {
 // One dock instance. Only the inner arrangement changes at its own breakpoint.
 export component SelfDock inherits Rectangle {
     in property <string> nick;
+    in property <string> net-summary;
+    in property <int> net-level;
     in property <image> identity-image;
     in property <bool> input-available;
     in property <float> input-level;
@@ -236,7 +242,7 @@ export component SelfDock inherits Rectangle {
         if !root.compact: HorizontalLayout {
             padding: 12px;
             spacing: 8px;
-            SelfIdentity { width: 112px; height: 40px; nick: root.nick; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
+            SelfIdentity { width: 112px; height: 40px; nick: root.nick; net-summary: root.net-summary; net-level: root.net-level; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
             Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
             InputMeter { width: 124px; height: 40px; available: root.input-available; level: root.input-level; threshold: root.vad-level; ptt: root.ptt-mode; }
             Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
@@ -253,7 +259,7 @@ export component SelfDock inherits Rectangle {
             HorizontalLayout {
                 height: 40px;
                 spacing: 6px;
-                SelfIdentity { preferred-width: 100px; height: 40px; min-width: 0; horizontal-stretch: 1; nick: root.nick; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
+                SelfIdentity { preferred-width: 100px; height: 40px; min-width: 0; horizontal-stretch: 1; nick: root.nick; net-summary: root.net-summary; net-level: root.net-level; stone: root.identity-image; focus-epoch: root.identity-focus; details => { root.identity-details(); } focused => { root.focused(); } }
                 Rectangle { width: 1px; height: 40px; background: CallTokens.line; }
                 InputMeter { preferred-width: 110px; height: 40px; min-width: 0; horizontal-stretch: 1; available: root.input-available; level: root.input-level; threshold: root.vad-level; ptt: root.ptt-mode; }
                 Rectangle { width: 1px; height: 40px; background: CallTokens.line; }

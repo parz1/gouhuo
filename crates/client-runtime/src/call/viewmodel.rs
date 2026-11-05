@@ -64,6 +64,10 @@ pub struct RowView {
     pub can_ban: bool,
     pub can_set_role: bool,
     pub can_edit: bool,
+    /// 网络状况，见 `network` 模块。频道行恒为 0 / 空。
+    pub net_level: i32,
+    pub net_summary: String,
+    pub net_detail: String,
 }
 
 /// Member data without images, seat assignment or a GUI string/model type.
@@ -82,6 +86,9 @@ pub struct MemberView {
     pub can_kick: bool,
     pub can_ban: bool,
     pub can_set_role: bool,
+    pub net_level: i32,
+    pub net_summary: String,
+    pub net_detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,9 +259,12 @@ impl CallViewModel {
                 can_ban: false,
                 can_set_role: false,
                 can_edit: roster.can_edit_channel(node.channel.id),
+                net_level: 0,
+                net_summary: String::new(),
+                net_detail: String::new(),
             });
             for user in users {
-                let member = project_member(user, roster, &audio, user_volumes);
+                let member = project_member(user, roster, &audio, user_volumes, snapshot);
                 rows.push(RowView {
                     is_channel: false,
                     id: member.id,
@@ -273,13 +283,16 @@ impl CallViewModel {
                     can_ban: member.can_ban,
                     can_set_role: member.can_set_role,
                     can_edit: false,
+                    net_level: member.net_level,
+                    net_summary: member.net_summary,
+                    net_detail: member.net_detail,
                 });
             }
         }
         let members: Vec<_> = roster
             .users_in(channel_id)
             .into_iter()
-            .map(|user| project_member(user, roster, &audio, user_volumes))
+            .map(|user| project_member(user, roster, &audio, user_volumes, snapshot))
             .collect();
         let chat = roster
             .chat
@@ -327,8 +340,10 @@ fn project_member(
     roster: &Roster,
     audio: &AudioViewModel,
     user_volumes: &BTreeMap<String, u32>,
+    snapshot: &RuntimeSnapshot,
 ) -> MemberView {
     let is_me = user.session_id == roster.me;
+    let network = super::network::project_network(user.session_id, is_me, roster, snapshot);
     MemberView {
         id: user.session_id,
         public_key: user.public_key.clone(),
@@ -356,6 +371,9 @@ fn project_member(
         can_kick: roster.can_kick(user.session_id),
         can_ban: roster.can_ban(user.session_id),
         can_set_role: roster.can_set_role(user.session_id),
+        net_level: network.level,
+        net_summary: network.summary(is_me),
+        net_detail: network.detail(is_me),
     }
 }
 

@@ -34,8 +34,10 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use voice_core::tunnel::{DatagramQueue, ReplayWindow};
 
+use protocol::control::MemberNetwork;
 use protocol::{ProtocolError, VoiceCipher, VoiceHeader, MAX_DATAGRAM};
 
 use crate::state::SessionId;
@@ -58,6 +60,10 @@ struct VoicePeer {
     /// （刚登录、或者 UDP 不通）。
     addr: Option<SocketAddr>,
     received: u64,
+    /// 服务端自己量的上行丢包：语音按序号缺口算，保活另算一份。
+    uplink: UplinkStats,
+    /// 这个人在 Ping 里自报的 RTT 和下行丢包。旧客户端不报。
+    report: SelfReport,
     replay: ReplayWindow,
     /// 保活包**单独一个窗口**。
     ///
@@ -65,6 +71,131 @@ struct VoicePeer {
     /// 共用一个窗口的话，保活的序号会飞快地落到窗口外，然后被当成重放丢掉 ——
     /// 表现是「UDP 时通时不通」，而语音本身看着一切正常。
     keepalive_replay: ReplayWindow,
+}
+
+/// 客户端在 Ping 里自报的网络状况。`None` = 没报（旧客户端）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelfReport {
+    pub rtt_ms: Option<u32>,
+    pub downlink_loss_permille: Option<u32>,
+}
+
+/// 语音统计的窗口：十秒，一秒一格。说话的人每秒一百包，十秒足够稳。
+pub const VOICE_LOSS_WINDOW_SECS: usize = 10;
+/// 保活统计的窗口：三十秒。保活两秒一个，窗口太短就只有几个样本。
+pub const KEEPALIVE_LOSS_WINDOW_SECS: usize = 30;
+/// 窗口里至少要有这么多「应到」的包，算出来的丢包率才拿出去给人看。
+pub const MIN_VOICE_SAMPLES: u64 = 20;
+pub const MIN_KEEPALIVE_SAMPLES: u64 = 5;
+
+/// 按序号缺口量上行丢包。
+///
+/// 每个人的语音序号每包加一（见 `protocol::VoiceSequences`），静音时不发包
+/// 也不推进。所以序号从 a 走到 b 就该收到 b − a 个包，少收的就是路上丢的。
+/// 这是**服务端自己量的**，不靠客户端配合，旧客户端一样有数。
+///
+/// 保活是另一条序号流，单独量：没人说话的时候只有它能说明上行通不通。
+#[derive(Debug, Default)]
+pub struct UplinkStats {
+    voice: GapWindow<VOICE_LOSS_WINDOW_SECS>,
+    keepalive: GapWindow<KEEPALIVE_LOSS_WINDOW_SECS>,
+}
+
+impl UplinkStats {
+    pub fn record(&mut self, header: VoiceHeader, now: Instant) {
+        if header.is_keepalive() {
+            self.keepalive.record(header.seq, now);
+        } else {
+            self.voice.record(header.seq, now);
+        }
+    }
+
+    /// 最近窗口里的丢包千分比。有语音样本用语音，否则退回保活；都不够就是 `None`。
+    pub fn loss_permille(&mut self, now: Instant) -> Option<u32> {
+        if let Some(v) = self.voice.loss_permille(now, MIN_VOICE_SAMPLES) {
+            return Some(v);
+        }
+        self.keepalive.loss_permille(now, MIN_KEEPALIVE_SAMPLES)
+    }
+}
+
+/// 一秒一格的环：每格记「应到几个、实到几个」。
+#[derive(Debug)]
+struct GapWindow<const SECS: usize> {
+    /// 窗口起点；格子按距它的秒数取模。
+    epoch: Option<Instant>,
+    /// 每格 (应到, 实到, 属于第几秒)。翻过一圈回到同一格时按秒号清零。
+    buckets: [(u64, u64, u64); SECS],
+    highest: Option<u32>,
+    /// 上一个包落在第几秒。隔了整个窗口还没包，再来的包按新起点算：
+    /// 中间丢的那些都发生在早已滚出窗口的秒里，不该记到现在头上。
+    last_second: u64,
+}
+
+impl<const SECS: usize> Default for GapWindow<SECS> {
+    fn default() -> Self {
+        Self {
+            epoch: None,
+            buckets: [(0, 0, u64::MAX); SECS],
+            highest: None,
+            last_second: 0,
+        }
+    }
+}
+
+impl<const SECS: usize> GapWindow<SECS> {
+    fn second(&mut self, now: Instant) -> u64 {
+        let epoch = *self.epoch.get_or_insert(now);
+        now.saturating_duration_since(epoch).as_secs()
+    }
+
+    fn bucket(&mut self, second: u64) -> &mut (u64, u64, u64) {
+        let slot = &mut self.buckets[(second % SECS as u64) as usize];
+        if slot.2 != second {
+            *slot = (0, 0, second);
+        }
+        slot
+    }
+
+    fn record(&mut self, seq: u32, now: Instant) {
+        let second = self.second(now);
+        if second.saturating_sub(self.last_second) >= SECS as u64 {
+            self.highest = None;
+        }
+        self.last_second = second;
+        let expected = match self.highest {
+            // 第一个包：只知道它到了，缺口无从谈起。
+            None => 1,
+            Some(high) if seq > high => u64::from(seq - high),
+            // 乱序补到的旧包：之前已经按缺口算成「应到」了，现在只补「实到」。
+            Some(high) if high - seq < REPLAY_WINDOW => 0,
+            // 跳回很远（链路重建、序号重置）：当作新起点。
+            Some(_) => 1,
+        };
+        if expected > 0 {
+            self.highest = Some(seq);
+        }
+        // 窗口内的缺口全记到当前这一秒：十秒的窗口里差一两秒无所谓，
+        // 窗口外的已经在上面按新起点处理掉了。
+        let bucket = self.bucket(second);
+        bucket.0 += expected;
+        bucket.1 += 1;
+    }
+
+    fn loss_permille(&mut self, now: Instant, min_expected: u64) -> Option<u32> {
+        let current = self.second(now);
+        let oldest = current.saturating_sub(SECS as u64 - 1);
+        let (expected, got) = self
+            .buckets
+            .iter()
+            .filter(|b| b.2 != u64::MAX && b.2 >= oldest && b.2 <= current)
+            .fold((0u64, 0u64), |acc, b| (acc.0 + b.0, acc.1 + b.1));
+        if expected < min_expected {
+            return None;
+        }
+        let lost = expected.saturating_sub(got);
+        Some(((lost * 1000) / expected).min(1000) as u32)
+    }
 }
 
 /// UDP 这一半。
@@ -115,10 +246,64 @@ impl VoiceRouter {
                 downstream: VoiceCipher::new(downstream),
                 addr: None,
                 received: 0,
+                uplink: UplinkStats::default(),
+                report: SelfReport::default(),
                 replay: ReplayWindow::default(),
                 keepalive_replay: ReplayWindow::default(),
             },
         );
+    }
+
+    /// 记下这个人在 Ping 里自报的网络状况。
+    pub fn note_report(&self, session: SessionId, report: SelfReport) {
+        if let Some(peer) = self
+            .peers
+            .lock()
+            .expect("voice peers poisoned")
+            .get_mut(&session)
+        {
+            peer.report = report;
+        }
+    }
+
+    /// 所有人的网络状况，按会话 id 排好，给 `NetworkReport` 用。
+    pub fn network_snapshot(&self) -> Vec<MemberNetwork> {
+        self.network_snapshot_at(Instant::now())
+    }
+
+    pub fn network_snapshot_at(&self, now: Instant) -> Vec<MemberNetwork> {
+        let mut peers = self.peers.lock().expect("voice peers poisoned");
+        let mut out: Vec<MemberNetwork> = peers
+            .iter_mut()
+            .map(|(session, peer)| {
+                let uplink = peer.uplink.loss_permille(now);
+                MemberNetwork {
+                    session_id: *session,
+                    uplink_loss_permille: uplink.unwrap_or(0),
+                    uplink_known: uplink.is_some(),
+                    rtt_ms: peer.report.rtt_ms.unwrap_or(0),
+                    rtt_known: peer.report.rtt_ms.is_some(),
+                    downlink_loss_permille: peer.report.downlink_loss_permille.unwrap_or(0),
+                    downlink_known: peer.report.downlink_loss_permille.is_some(),
+                    tcp_voice: peer.tcp,
+                }
+            })
+            .collect();
+        out.sort_by_key(|m| m.session_id);
+        out
+    }
+
+    /// 测试用：按给定时刻记一个已验过的包。
+    #[cfg(test)]
+    fn record_uplink_at(&self, session: SessionId, header: VoiceHeader, now: Instant) {
+        if let Some(peer) = self
+            .peers
+            .lock()
+            .expect("voice peers poisoned")
+            .get_mut(&session)
+        {
+            peer.uplink.record(header, now);
+        }
     }
 
     pub fn attach_tunnel(&self, session: SessionId, queue: Arc<DatagramQueue>) {
@@ -159,6 +344,7 @@ impl VoiceRouter {
         if !replay.accept(header.seq) {
             return None;
         }
+        peer.uplink.record(header, Instant::now());
         if header.is_keepalive() {
             let mut wire = Vec::new();
             peer.downstream.seal(header, &[], &mut wire).ok()?;
@@ -227,6 +413,7 @@ impl VoiceRouter {
             return None;
         }
         peer.received += 1;
+        peer.uplink.record(header, Instant::now());
 
         // **到这里才动地址。** 先验签再学地址，见模块文档。
         let previous = peer.addr.replace(from);
@@ -323,6 +510,7 @@ impl VoiceRouter {
 mod tests {
     use super::*;
     use protocol::FLAG_KEEPALIVE;
+    use std::time::Duration;
 
     #[test]
     fn tunnel_requires_selected_authenticated_session_and_shares_replay_window() {
@@ -612,5 +800,115 @@ mod tests {
             router.by_addr.lock().unwrap().is_empty(),
             "走了之后地址映射也要清掉"
         );
+    }
+
+    fn voice_header(seq: u32, flags: u8) -> VoiceHeader {
+        VoiceHeader {
+            session: 1,
+            seq,
+            timestamp: 0,
+            flags,
+        }
+    }
+
+    #[test]
+    fn uplink_loss_counts_sequence_gaps_within_the_window() {
+        let mut stats = UplinkStats::default();
+        let start = Instant::now();
+        // 100 包里丢了 10 个：序号 0..100 跳过所有 7 的倍数之外的……简单点：跳过 10 个。
+        let mut sent = 0u32;
+        for seq in 0..100u32 {
+            if seq % 10 == 3 {
+                continue;
+            }
+            stats.record(
+                voice_header(seq, 0),
+                start + Duration::from_millis(u64::from(seq) * 10),
+            );
+            sent += 1;
+        }
+        assert_eq!(sent, 90);
+        let loss = stats.loss_permille(start + Duration::from_secs(1)).unwrap();
+        assert_eq!(loss, 100, "丢了 10/100，千分之 100");
+    }
+
+    #[test]
+    fn uplink_loss_forgets_old_seconds_and_tolerates_reordering() {
+        let mut stats = UplinkStats::default();
+        let start = Instant::now();
+        // 第一秒丢一半。
+        for seq in (0..100u32).step_by(2) {
+            stats.record(voice_header(seq, 0), start);
+        }
+        // 第一个包没有「前一个」可比缺口，只算应到 1 实到 1；之后每步应到 2 实到 1：
+        // 应到 1 + 49×2 = 99，实到 50，丢 49/99。
+        assert_eq!(stats.loss_permille(start).unwrap(), 494);
+        // 十一秒之后全部补齐、另一段完整的 100 包，老的那一秒已经滚出窗口。
+        let later = start + Duration::from_secs(12);
+        for seq in 200..300u32 {
+            stats.record(voice_header(seq, 0), later);
+        }
+        assert_eq!(stats.loss_permille(later).unwrap(), 0);
+        // 乱序：300 之后先到 302 再到 301，应到 3 实到 3，不算丢。
+        stats.record(voice_header(300, 0), later);
+        stats.record(voice_header(302, 0), later);
+        stats.record(voice_header(301, 0), later);
+        assert_eq!(stats.loss_permille(later).unwrap(), 0);
+    }
+
+    #[test]
+    fn uplink_falls_back_to_keepalives_when_nobody_talks() {
+        let mut stats = UplinkStats::default();
+        let start = Instant::now();
+        assert_eq!(stats.loss_permille(start), None, "一个包都没有：不知道");
+        // 保活每两秒一个，发了 10 个只到 8 个。
+        for i in 0..10u32 {
+            if i == 4 || i == 7 {
+                continue;
+            }
+            stats.record(
+                voice_header(i, FLAG_KEEPALIVE),
+                start + Duration::from_secs(u64::from(i) * 2),
+            );
+        }
+        let now = start + Duration::from_secs(20);
+        assert_eq!(stats.loss_permille(now).unwrap(), 200);
+        // 只有三个语音包：样本不够，仍然用保活的数。
+        for seq in 0..3u32 {
+            stats.record(voice_header(seq, 0), now);
+        }
+        assert_eq!(stats.loss_permille(now).unwrap(), 200);
+    }
+
+    #[test]
+    fn network_snapshot_reports_measured_and_self_reported_values() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        router.register(1, &[1; 32], &[2; 32]);
+        router.register(2, &[3; 32], &[4; 32]);
+        let now = Instant::now();
+        for seq in 0..50u32 {
+            if seq % 5 == 0 {
+                continue;
+            }
+            router.record_uplink_at(2, voice_header(seq, 0), now);
+        }
+        router.note_report(
+            2,
+            SelfReport {
+                rtt_ms: Some(180),
+                downlink_loss_permille: Some(35),
+            },
+        );
+        let snapshot = router.network_snapshot_at(now);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].session_id, 1);
+        assert!(!snapshot[0].uplink_known && !snapshot[0].rtt_known);
+        let two = &snapshot[1];
+        assert_eq!(two.session_id, 2);
+        assert!(two.uplink_known);
+        // 序号 1..49 里跳过了 5 的倍数（0 本身没发）：应到 49，实到 40，丢 9/49。
+        assert_eq!(two.uplink_loss_permille, 183);
+        assert_eq!((two.rtt_ms, two.rtt_known), (180, true));
+        assert_eq!((two.downlink_loss_permille, two.downlink_known), (35, true));
     }
 }

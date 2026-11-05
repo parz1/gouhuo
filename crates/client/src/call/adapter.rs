@@ -90,6 +90,13 @@ impl SlintAdapter {
         ));
         app.set_channel_name(view.channel_name.clone().into());
         app.set_channel_count(view.channel_count as i32);
+        let me = view.rows.iter().find(|row| !row.is_channel && row.is_me);
+        app.set_self_net_summary(
+            me.map(|row| row.net_summary.clone())
+                .unwrap_or_default()
+                .into(),
+        );
+        app.set_self_net_level(me.map(|row| row.net_level).unwrap_or(0));
         app.set_can_create_channel(view.can_create_channel);
         app.set_is_admin(view.is_admin);
         Self::refresh_selection(app);
@@ -117,6 +124,7 @@ impl SlintAdapter {
                 can_kick: member.can_kick,
                 can_ban: member.can_ban,
                 can_set_role: member.can_set_role,
+                net_level: member.net_level,
             })
             .collect()
     }
@@ -222,6 +230,9 @@ fn row(view: &RowView) -> Row {
         can_ban: view.can_ban,
         can_set_role: view.can_set_role,
         can_edit: view.can_edit,
+        net_level: view.net_level,
+        net_summary: view.net_summary.clone().into(),
+        net_detail: view.net_detail.clone().into(),
     }
 }
 

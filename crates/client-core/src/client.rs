@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use protocol::connection::{ConnectionCause, ConnectionReason};
 use protocol::control::{
     goodbye, server_message, Authenticate, BanUser, CreateChannel, DeleteChannel, EditChannel,
-    Hello, JoinChannel, KickUser, Ping, Role, SelfState, ServerMessage, SetRole, TextMessage,
-    Unban, Welcome, PROTOCOL_VERSION,
+    Hello, JoinChannel, KickUser, MemberNetwork, Ping, Role, SelfState, ServerMessage, SetRole,
+    TextMessage, Unban, Welcome, PROTOCOL_VERSION,
 };
 use protocol::Invite;
 use rustls::pki_types::ServerName;
@@ -196,6 +196,67 @@ pub struct VoiceKeys {
     pub sequences: Arc<protocol::VoiceSequences>,
     pub upstream: VoiceKey,
     pub downstream: VoiceKey,
+}
+
+/// 语音内核那边的事实，心跳顺手报给服务端，也用来估自己的上行丢包。
+///
+/// 界面进程每次轮询到新快照就喂一次。`None` 表示现在不知道
+/// （UDP 还没通、没人说话），不要报零 —— 零是一个真实的测量值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceReport {
+    /// 到现在为止发出去的语音包数（不含保活）。
+    pub packets_sent: u64,
+    pub rtt_ms: Option<u32>,
+    /// 最近十秒收到别人语音的缺帧率，千分比，所有说话人合计。
+    pub downlink_loss_permille: Option<u32>,
+    pub tcp_voice: bool,
+}
+
+/// 旧服务端不发 `NetworkReport`，自己的上行丢包只能拿 Pong 估：
+/// 两次 Pong 之间我发了多少、服务端多收了多少，差额就是路上丢的。
+///
+/// 粗：服务端的计数把保活也算在内，窗口两头还有在途的包。
+/// 所以样本少于 [`MIN_ESTIMATE_PACKETS`] 不算，并且只在服务端没给数时用。
+#[derive(Debug, Default)]
+struct UplinkEstimate {
+    /// 最近几次 Ping：(时间戳, 当时的发包数)。Pong 原样带回时间戳，据此配对。
+    pings: std::collections::VecDeque<(i64, u64)>,
+    /// 上一次配对成功的 (我方发包数, 服务端收包数)。
+    last: Option<(u64, u64)>,
+    loss_permille: Option<u32>,
+}
+
+/// 两次 Pong 之间至少发了这么多包，估出来的丢包率才算数。
+pub const MIN_ESTIMATE_PACKETS: u64 = 50;
+
+impl UplinkEstimate {
+    fn sent_ping(&mut self, timestamp: i64, packets_sent: u64) {
+        self.pings.push_back((timestamp, packets_sent));
+        while self.pings.len() > 8 {
+            self.pings.pop_front();
+        }
+    }
+
+    fn got_pong(&mut self, timestamp: i64, server_received: u64) {
+        let Some(index) = self.pings.iter().position(|(ts, _)| *ts == timestamp) else {
+            return;
+        };
+        let (_, sent) = self.pings[index];
+        self.pings.drain(..=index);
+        if let Some((sent_before, received_before)) = self.last {
+            let delta_sent = sent.saturating_sub(sent_before);
+            let delta_received = server_received.saturating_sub(received_before);
+            if delta_sent >= MIN_ESTIMATE_PACKETS {
+                let lost = delta_sent.saturating_sub(delta_received);
+                self.loss_permille = Some(((lost * 1000) / delta_sent).min(1000) as u32);
+            }
+        }
+        self.last = Some((sent, server_received));
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// 一次成功的连接。重连就是换掉这一整个。
@@ -472,6 +533,8 @@ struct Shared {
     last_heard_ms: AtomicU64,
     server_udp_received: AtomicU64,
     epoch: Instant,
+    voice_report: Mutex<VoiceReport>,
+    uplink: Mutex<UplinkEstimate>,
 }
 
 impl Shared {
@@ -559,6 +622,8 @@ impl Client {
             wake_lock: Mutex::new(()),
             last_heard_ms: AtomicU64::new(0),
             server_udp_received: AtomicU64::new(0),
+            voice_report: Mutex::new(VoiceReport::default()),
+            uplink: Mutex::new(UplinkEstimate::default()),
             epoch: Instant::now(),
         });
 
@@ -775,6 +840,15 @@ impl Client {
         );
     }
 
+    /// 语音内核的最新事实：心跳带给服务端，并用来估自己的上行丢包。
+    pub fn set_voice_report(&self, report: VoiceReport) {
+        *self
+            .shared
+            .voice_report
+            .lock()
+            .expect("voice report poisoned") = report;
+    }
+
     /// Last server-reported UDP count, including keepalives; not a delivery acknowledgement.
     pub fn server_udp_received(&self) -> u64 {
         self.shared.server_udp_received.load(Ordering::Relaxed)
@@ -871,6 +945,9 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     shared
                         .server_udp_received
                         .store(pong.udp_packets_received, Ordering::Relaxed);
+                    if note_pong(shared, pong) && tx.send(Event::RosterChanged).is_err() {
+                        return Outcome::Abandoned;
+                    }
                 }
                 if let Some(server_message::Payload::Goodbye(bye)) = &message.payload {
                     let reason = goodbye::Reason::try_from(bye.reason)
@@ -1031,6 +1108,7 @@ fn install(shared: &Shared, link: Link, welcome: &Welcome, wanted: Option<&(u32,
     // 两步之间醒来，看到一个「已经十几秒没动静」的新连接，把它当死连接掐掉。
     shared.heard();
     shared.server_udp_received.store(0, Ordering::Relaxed);
+    shared.uplink.lock().expect("uplink poisoned").reset();
     *shared.link.lock().expect("link poisoned") = Arc::clone(&link);
 
     if let Some(channel_id) = target {
@@ -1084,14 +1162,52 @@ fn heartbeat(shared: Arc<Shared>) {
             );
             continue;
         }
+        let report = *shared.voice_report.lock().expect("voice report poisoned");
+        let timestamp = now_ms();
+        shared
+            .uplink
+            .lock()
+            .expect("uplink poisoned")
+            .sent_ping(timestamp, report.packets_sent);
         link.send(
             &Ping {
-                timestamp: now_ms(),
+                timestamp,
                 udp_packets_received: 0,
+                udp_packets_sent: report.packets_sent,
+                rtt_ms: report.rtt_ms.unwrap_or(0),
+                rtt_known: report.rtt_ms.is_some(),
+                downlink_loss_permille: report.downlink_loss_permille.unwrap_or(0),
+                downlink_known: report.downlink_loss_permille.is_some(),
+                tcp_voice: report.tcp_voice,
             }
             .into(),
         );
     }
+}
+
+/// 旧服务端的退路：Pong 一到就更新自己那条网络状况。返回界面要不要重画。
+fn note_pong(shared: &Shared, pong: &protocol::control::Pong) -> bool {
+    let estimate = {
+        let mut uplink = shared.uplink.lock().expect("uplink poisoned");
+        uplink.got_pong(pong.timestamp, pong.udp_packets_received);
+        uplink.loss_permille
+    };
+    let report = *shared.voice_report.lock().expect("voice report poisoned");
+    let mut roster = shared.roster.lock().expect("roster poisoned");
+    if roster.network_from_server {
+        return false;
+    }
+    let me = roster.me;
+    roster.note_local_network(MemberNetwork {
+        session_id: me,
+        uplink_loss_permille: estimate.unwrap_or(0),
+        uplink_known: estimate.is_some() && !report.tcp_voice,
+        rtt_ms: report.rtt_ms.unwrap_or(0),
+        rtt_known: report.rtt_ms.is_some(),
+        downlink_loss_permille: report.downlink_loss_permille.unwrap_or(0),
+        downlink_known: report.downlink_loss_permille.is_some(),
+        tcp_voice: report.tcp_voice,
+    })
 }
 
 /// 建一条连接：TCP、TLS、派生语音密钥、认证。
@@ -1155,6 +1271,7 @@ fn establish(
         identity,
         invite.code.as_deref().unwrap_or(""),
         desired_name,
+        false,
     )?;
 
     // 认证走完就把读超时撤掉。**留着它会吃数据** ——
@@ -1291,6 +1408,10 @@ fn apply(roster: &Mutex<Roster>, message: ServerMessage) -> Vec<Event> {
             roster.bans = list.entries;
             vec![Event::RosterChanged]
         }
+        Some(server_message::Payload::NetworkReport(report)) => {
+            roster.apply_network_report(report);
+            vec![Event::RosterChanged]
+        }
         // Pong 暂时不产生界面事件。接上 UDP 之后它会变成「语音通不通」的指示。
         Some(server_message::Payload::Pong(_)) => Vec::new(),
         // 认不出来的分支：新服务端发了我们不懂的东西。**忽略，不要断开。**
@@ -1306,7 +1427,10 @@ pub(crate) fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectErr
 // cloned Winsock handle after TLS authentication. A late getpeername can fail
 // with WSAENOTCONN even after the welcome was read. The address is published
 // only after authentication and uses the same DNS attempt as that TCP stream.
-fn connect_tcp_peer(host: &str, port: u16) -> Result<(TcpStream, SocketAddr), ConnectError> {
+pub(crate) fn connect_tcp_peer(
+    host: &str,
+    port: u16,
+) -> Result<(TcpStream, SocketAddr), ConnectError> {
     use std::net::ToSocketAddrs;
 
     let unreachable = |source: std::io::Error| ConnectError::Unreachable {
@@ -1335,12 +1459,13 @@ fn connect_tcp_peer(host: &str, port: u16) -> Result<(TcpStream, SocketAddr), Co
     Err(unreachable(last.expect("上面判过非空")))
 }
 
-fn authenticate(
+pub(crate) fn authenticate(
     wire: &Arc<Mutex<Wire>>,
     reader: &mut Reader,
     identity: &Identity,
     invite_code: &str,
     desired_name: &str,
+    probe_only: bool,
 ) -> Result<Welcome, ConnectError> {
     {
         let mut w = wire.lock().expect("wire poisoned");
@@ -1348,6 +1473,7 @@ fn authenticate(
             protocol_version: PROTOCOL_VERSION,
             client_version: crate::client_version(),
             public_key: identity.public_key().0.to_vec(),
+            probe_only,
         }))?;
     }
 
@@ -1374,7 +1500,7 @@ fn authenticate(
     }
 }
 
-fn rejected(r: protocol::control::Rejected) -> ConnectError {
+pub(crate) fn rejected(r: protocol::control::Rejected) -> ConnectError {
     ConnectError::Rejected {
         reason: protocol::control::rejected::Reason::try_from(r.reason)
             .unwrap_or(protocol::control::rejected::Reason::Unspecified),

@@ -41,7 +41,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::control::{
     client_message, decode_frame, encode_frame, goodbye, peek_frame_len, Challenge, ClientMessage,
-    Goodbye, Rejected, Role, ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
+    Goodbye, NetworkReport, Rejected, Role, ServerMessage, Welcome, MAX_FRAME_BODY,
+    PROTOCOL_VERSION,
 };
 use protocol::PublicKey;
 use voice_core::identity::Identity;
@@ -54,6 +55,10 @@ use crate::voice::{Incoming, VoiceRouter};
 
 /// 多久没收到任何东西就算掉线。客户端每隔几秒会发一次 Ping。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 体检会话最多活多久。客户端十几秒就测完了；没主动断的（崩了、卡了）到点清掉，
+/// 免得有人拿它当免费的 UDP 回声器挂着。
+pub const PROBE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// 认证必须在这个时间内走完。
 ///
@@ -172,6 +177,9 @@ pub struct Peer {
     /// 两种情况读线程看到的都是 `read` 返回 0，分不出来 —— 但广播给别人的
     /// `UserLeft` 理由不一样，「掉线了」和「自己退了」在界面上是两回事。
     timed_out: AtomicBool,
+    /// 网络体检会话：不在名单里，只回 Ping 和保活，到 [`PROBE_MAX_AGE`] 就清。
+    pub probe: bool,
+    started_ms: u64,
 }
 
 impl Peer {
@@ -194,6 +202,10 @@ impl Peer {
     fn idle_for(&self) -> Duration {
         let last = self.last_seen_ms.load(Ordering::Relaxed);
         Duration::from_millis((now_ms() as u64).saturating_sub(last))
+    }
+
+    fn age(&self) -> Duration {
+        Duration::from_millis((now_ms() as u64).saturating_sub(self.started_ms))
     }
 
     /// 把这条连接踢掉，并先告诉对面为什么。阻塞在 read 上的线程会立刻返回 0
@@ -274,6 +286,7 @@ impl Hub {
 
     /// 提交入场、给旧成员广播、注册新订阅者是同一次提交。
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn admit_peer(
         &self,
         public_key: PublicKey,
@@ -283,8 +296,42 @@ impl Hub {
         outbound: SyncSender<Outbound>,
         voice_queue: Arc<DatagramQueue>,
         shutdown: Arc<IoControl>,
+        probe_only: bool,
     ) -> Result<Arc<Peer>, crate::state::Denied> {
         let _commit = self.commits.lock().expect("commits poisoned");
+        if probe_only {
+            let session = {
+                let mut state = self.state.lock().expect("state poisoned");
+                state.admit_probe(public_key, invite_code)?
+            };
+            let peer = Arc::new(Peer {
+                session,
+                outbound,
+                voice_queue: Arc::clone(&voice_queue),
+                shutdown,
+                last_seen_ms: AtomicU64::new(now_ms() as u64),
+                timed_out: AtomicBool::new(false),
+                probe: true,
+                started_ms: now_ms() as u64,
+            });
+            self.voice.register(session, keys.0, keys.1);
+            self.voice.attach_tunnel(session, voice_queue);
+            peer.send(
+                &Welcome {
+                    session_id: session,
+                    udp_port: self.voice.local_port() as u32,
+                    tcp_voice: true,
+                    probe_only: true,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            self.peers
+                .lock()
+                .expect("peers poisoned")
+                .insert(session, Arc::clone(&peer));
+            return Ok(peer);
+        }
         let admitted = {
             let mut state = self.state.lock().expect("state poisoned");
             let admitted = state.admit(public_key, invite_code, desired_name);
@@ -299,6 +346,8 @@ impl Hub {
             shutdown,
             last_seen_ms: AtomicU64::new(now_ms() as u64),
             timed_out: AtomicBool::new(false),
+            probe: false,
+            started_ms: now_ms() as u64,
         });
 
         // 顶号：把旧连接踢掉。状态里已经摘干净了，这里只管关 socket。
@@ -469,18 +518,37 @@ impl Hub {
         self.voice.deliver(forward, &targets);
     }
 
-    /// 看门狗：踢掉太久没动静的连接。
+    /// 看门狗：踢掉太久没动静的连接，以及活过头的体检会话。
     pub fn sweep_idle(&self) {
         let stale: Vec<Arc<Peer>> = {
             let peers = self.peers.lock().expect("peers poisoned");
             peers
                 .values()
-                .filter(|p| p.idle_for() > IDLE_TIMEOUT)
+                .filter(|p| p.idle_for() > IDLE_TIMEOUT || (p.probe && p.age() > PROBE_MAX_AGE))
                 .cloned()
                 .collect()
         };
         for peer in stale {
             peer.kick_idle();
+        }
+    }
+
+    /// 把所有人的网络状况发给所有人。看门狗每隔几秒调一次。
+    ///
+    /// 体检会话既不在报告里，也收不到报告：它不在名单上，别人看不见它。
+    pub fn broadcast_network_report(&self) {
+        let peers: Vec<Arc<Peer>> = {
+            let peers = self.peers.lock().expect("peers poisoned");
+            peers.values().filter(|p| !p.probe).cloned().collect()
+        };
+        if peers.is_empty() {
+            return;
+        }
+        let mut members = self.voice.network_snapshot();
+        members.retain(|m| peers.iter().any(|p| p.session == m.session_id));
+        let report: ServerMessage = NetworkReport { members }.into();
+        for peer in &peers {
+            peer.send(&report);
         }
     }
 }
@@ -588,6 +656,7 @@ fn authenticate(
         return Ok(None);
     };
 
+    let probe_only = hello.probe_only;
     if hello.protocol_version != PROTOCOL_VERSION {
         reject(
             wire,
@@ -658,6 +727,7 @@ fn authenticate(
         outbound.clone(),
         voice_queue,
         shutdown,
+        probe_only,
     ) {
         Ok(peer) => Ok(Some(peer)),
         Err(denied) => {
@@ -705,6 +775,15 @@ fn message_loop(reader: &mut Reader, hub: &Arc<Hub>, peer: &Arc<Peer>) -> io::Re
                 }
             }
             Some(client_message::Payload::Ping(ping)) => {
+                hub.voice.note_report(
+                    peer.session,
+                    crate::voice::SelfReport {
+                        rtt_ms: ping.rtt_known.then_some(ping.rtt_ms),
+                        downlink_loss_permille: ping
+                            .downlink_known
+                            .then_some(ping.downlink_loss_permille.min(1000)),
+                    },
+                );
                 peer.send(
                     &Pong {
                         timestamp: ping.timestamp,
@@ -715,6 +794,9 @@ fn message_loop(reader: &mut Reader, hub: &Arc<Hub>, peer: &Arc<Peer>) -> io::Re
                     .into(),
                 );
             }
+            // 体检会话只配拥有上面三样：路径、语音隧道里的保活、心跳。
+            // 它不在名单里，频道和管理操作对它没有意义，也不该有副作用。
+            Some(_) if peer.probe => (),
             Some(client_message::Payload::JoinChannel(join)) => {
                 hub.mutate(|state| state.join_channel(peer.session, join.channel_id))
             }
@@ -934,6 +1016,8 @@ mod regressions {
                 shutdown: Arc::new(IoControl::new(shutdown, None)),
                 last_seen_ms: AtomicU64::new(now_ms() as u64),
                 timed_out: AtomicBool::new(false),
+                probe: false,
+                started_ms: now_ms() as u64,
             }),
             rx,
             client,
@@ -990,6 +1074,7 @@ mod regressions {
                         protocol_version: PROTOCOL_VERSION,
                         client_version: "test".into(),
                         public_key: identity.public_key().0.to_vec(),
+                        probe_only: false,
                     }),
                     &mut frame,
                 )
@@ -1158,6 +1243,7 @@ mod regressions {
                 old.outbound.clone(),
                 Arc::clone(&old.voice_queue),
                 Arc::clone(&old.shutdown),
+                false,
             )
             .unwrap();
         assert!(matches!(
@@ -1200,6 +1286,7 @@ mod regressions {
                     new.outbound.clone(),
                     Arc::clone(&new.voice_queue),
                     Arc::clone(&new.shutdown),
+                    false,
                 )
                 .unwrap()
         });
