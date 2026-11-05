@@ -84,7 +84,7 @@
 - 输出故障不被误写为没有采集；输入条按实际采集可用性显示，错误/恢复期暂停发送展示。恢复策略沿用 [connection-recovery.md](connection-recovery.md)。
 
 对应源码：`crates/voice-core/src/pipeline.rs`（VoiceStats、TransmitGate、send_loop、stats）与
-`crates/client/src/main.rs`（spawn_ptt_poll、语音轮询、toggle_deafen、refresh、Event::Reconnecting）。
+`crates/client/src/`（`settings_page.rs` 的 spawn_ptt_poll，`session.rs` 的语音轮询、refresh、Event::Reconnecting，`main.rs` 的 toggle_deafen）。
 
 ## 正常与窄窗口的主要路径
 

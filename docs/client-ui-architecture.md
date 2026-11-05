@@ -27,7 +27,8 @@ flowchart LR
 | 展示投影 | `client-runtime/src/call/viewmodel.rs` | 将连接阶段、运行快照、名单和音量偏好投影为普通 Rust DTO；不含 Slint、图片或窗口 API |
 | 音频运行层 | `client-runtime` | 本地音频意愿、采集 / 播放 / 传输事实、设备生命周期、恢复策略 |
 | GUI 适配器 | `client/src/call/adapter.rs` | DTO 转 Slint 字符串 / 属性 / 模型；格式化本地时间；保持模型身份；同步名单、石座和成员菜单 |
-| 桌面组合根 | `client/src/main.rs` | 后台连接接线、设备选择、扫描、热键、托盘、身份与设置保存；事件更新状态，回调提交命令 |
+| 桌面组合根 | `client/src/main.rs` | 启动、共享 `State`、定时器、通话操作与关闭处理；事件更新状态，回调提交命令 |
+| 桌面接线 | `client/src/{home,session,voice,settings_page,scene,tray,platform,clock}.rs` | 首页加入流程、事件泵与状态轮询、声音内核与设备/扫描、设置与连接历史、篝火节奏、托盘、Win32 胶水、时间格式 |
 | View / 官方篝火 | `client/ui/call/`、`ui/scenes/host.slint`、`src/campfire/` | 布局、断点、焦点、浮层、滚动位置、石座分配、像素图和动效 |
 
 `CallState` 只拥有连接阶段与恢复提示。`Roster` 是服务端成员和权限的来源；`RuntimeHandle` 是本地静音 / 关闭声音 / PTT 意愿的来源；`RuntimeSnapshot` 提供音频事实。`CallViewModel` 每次按这些来源生成，不成为另一份需要双向同步的业务状态。

@@ -53,7 +53,7 @@ impl SlintAdapter {
                 .map(|line| ChatRow {
                     sender: line.sender.clone().into(),
                     body: line.body.clone().into(),
-                    time: crate::clock_time(line.timestamp_ms).into(),
+                    time: crate::clock::clock_time(line.timestamp_ms).into(),
                     is_me: line.is_me,
                 })
                 .collect(),
@@ -75,7 +75,7 @@ impl SlintAdapter {
                     key: ban.key.clone().into(),
                     detail: format!(
                         "{} 被 {} 封禁{}",
-                        crate::clock_date(ban.banned_at_ms),
+                        crate::clock::clock_date(ban.banned_at_ms),
                         ban.banned_by,
                         if ban.reason.is_empty() {
                             String::new()
