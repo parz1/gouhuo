@@ -124,21 +124,13 @@ fn reason(value: Reason) -> &'static str {
     }
 }
 
-/// UTC Gregorian date, extending the existing client's civil_from_days formula.
+/// UTC Gregorian date with seconds, so exported history is unambiguous.
 fn date(timestamp_ms: u64) -> String {
     if timestamp_ms > 253_402_300_799_999 {
         return "时间不可用".into();
     }
     let seconds = (timestamp_ms / 1000) as i64;
-    let z = seconds / 86_400 + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = crate::clock::civil_from_days(seconds / 86_400);
     let time = seconds % 86_400;
     format!(
         "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
