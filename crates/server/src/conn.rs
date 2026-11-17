@@ -286,7 +286,6 @@ impl Hub {
 
     /// 提交入场、给旧成员广播、注册新订阅者是同一次提交。
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn admit_peer(
         &self,
         public_key: PublicKey,
