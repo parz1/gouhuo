@@ -37,8 +37,8 @@ export component CallButton inherits Rectangle {
         }
     }
     HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
+        padding-left: root.label == "" ? 0px : 8px;
+        padding-right: root.label == "" ? 0px : 8px;
         spacing: root.icon.width > 0 ? 6px : 0px;
         alignment: center;
         if root.icon.width > 0: Rectangle {

@@ -27,6 +27,20 @@ export component ChannelNavigator inherits Rectangle {
     property <string> create-name;
     property <int> renaming: -1;
     property <string> rename-name;
+    property <int> deleting: -1;
+    function begin-rename(row: Row) {
+        root.deleting = -1;
+        root.creating = false;
+        root.rename-name = row.name;
+        root.renaming = row.id;
+    }
+    function save-rename(id: int) {
+        if (root.rename-name != "") {
+            root.rename-channel(id, root.rename-name);
+            root.renaming = -1;
+            list-focus.focus();
+        }
+    }
     background: CallTokens.panel;
     forward-focus: list-focus;
     public function focus-list() { list-focus.focus(); }
@@ -52,7 +66,8 @@ export component ChannelNavigator inherits Rectangle {
                 if (event.text == Key.DownArrow && root.rows.length > 0) { root.move-cursor(1); return accept; }
                 if (event.text == Key.UpArrow && root.rows.length > 0) { root.move-cursor(-1); return accept; }
                 if ((event.text == Key.Return || event.text == " ") && root.rows.length > root.cursor && root.rows[root.cursor].id == root.cursor-id && root.rows[root.cursor].is-channel == root.cursor-channel) { root.activate(root.rows[root.cursor]); return accept; }
-                if (!root.preview-enabled && event.text == Key.F2 && root.rows.length > root.cursor && root.rows[root.cursor].can-edit) { root.rename-name = root.rows[root.cursor].name; root.renaming = root.cursor-id; return accept; }
+                if (event.text == Key.Escape && (root.renaming >= 0 || root.deleting >= 0 || root.creating)) { root.renaming = -1; root.deleting = -1; root.creating = false; list-focus.focus(); return accept; }
+                if (!root.preview-enabled && event.text == Key.F2 && root.rows.length > root.cursor && root.cursor-channel && root.rows[root.cursor].id == root.cursor-id && root.rows[root.cursor].is-channel && root.rows[root.cursor].can-edit) { root.begin-rename(root.rows[root.cursor]); return accept; }
                 return reject;
             }
             navigation-scroll := ScrollView {
@@ -61,12 +76,13 @@ export component ChannelNavigator inherits Rectangle {
                     spacing: 2px;
                     alignment: start;
                     for row[i] in root.rows: VerticalLayout {
-                        if row.is-channel && root.renaming == row.id: HorizontalLayout {
+                        if row.is-channel && row.can-edit && root.renaming == row.id: HorizontalLayout {
                             spacing: 4px;
-                            Field { height: 32px; min-width: 0; horizontal-stretch: 1; text <=> root.rename-name; init => { self.focus(); } accepted => { if (root.rename-name != "") { root.rename-channel(row.id, root.rename-name); root.renaming = -1; list-focus.focus(); } } }
+                            Field { height: 32px; min-width: 0; horizontal-stretch: 1; text <=> root.rename-name; init => { self.focus(); } accepted => { root.save-rename(row.id); } }
+                            CallButton { width: 44px; height: 32px; label: "保存"; enabled: root.rename-name != "" && row.can-edit; clicked => { root.save-rename(row.id); } }
                             CallButton { width: 30px; height: 32px; icon: @image-url("icons/close.svg"); accessible-label: "取消频道改名"; clicked => { root.renaming = -1; list-focus.focus(); } }
                         }
-                        if root.renaming != row.id || !row.is-channel: Rectangle {
+                        if root.renaming != row.id || !row.is-channel || !row.can-edit: Rectangle {
                             height: row.is-channel ? 34px : 32px;
                             border-radius: 6px;
                             border-width: list-focus.has-focus && root.cursor-id == row.id && root.cursor-channel == row.is-channel ? 2px : 0px;
@@ -82,7 +98,7 @@ export component ChannelNavigator inherits Rectangle {
                             changed restore-id => { if (!row.is-channel && row.id == self.restore-id) { root.cursor = i; root.cursor-id = row.id; root.cursor-channel = row.is-channel; list-focus.focus(); } }
                             HorizontalLayout {
                                 padding-left: 8px + Math.min(row.depth * 10px, 30px);
-                                padding-right: row.is-channel && (row-touch.has-hover || (list-focus.has-focus && root.cursor == i)) ? (6px + (row.can-edit ? 26px : 0px) + (row.can-delete ? 26px : 0px)) : 6px;
+                                padding-right: row.is-channel ? 42px : 6px;
                                 spacing: 6px;
                                 if !row.is-channel: Rectangle { width: 14px; height: 100%; Image {
                                     x: 0; y: (parent.height - self.height) / 2;
@@ -92,25 +108,47 @@ export component ChannelNavigator inherits Rectangle {
                                     colorize: !root.stale && (row.is-me ? root.sending : row.speaking) ? CallTokens.speaking : row.deafened || row.muted ? CallTokens.warm : CallTokens.dim;
                                 } }
                                 Text { text: row.name + (row.is-me ? "（我）" : ""); min-width: 0; horizontal-stretch: 1; overflow: elide; color: row.is-me ? CallTokens.warm : CallTokens.text; font-size: row.is-channel ? 13px : 14px; font-weight: row.is-channel ? 600 : 400; vertical-alignment: center; }
-                                if row.is-channel && !(row-touch.has-hover || (list-focus.has-focus && root.cursor == i)): Text { text: row.count; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; }
+                                if row.is-channel: Text { text: row.count; color: CallTokens.dim; font-size: 11px; vertical-alignment: center; }
                                 if !row.is-channel && !row.is-me && row.volume != 100: Text { text: row.volume == 0 ? "静音" : row.volume + "%"; color: CallTokens.warm; font-size: 10px; vertical-alignment: center; }
                                 // 网络差才写字，好的时候只亮三格 —— 名单是给人扫一眼的。
                                 if !row.is-channel && row.net-level >= 2: Text { text: row.net-summary; color: row.net-level >= 3 ? Theme.danger : Theme.warn; font-size: 10px; vertical-alignment: center; }
                                 if !row.is-channel && row.net-level >= 1: Rectangle { width: 12px; height: 100%; SignalBars { level: row.net-level; x: 0; y: (parent.height - self.height) / 2; } }
                             }
                             row-touch := TouchArea { mouse-cursor: pointer; clicked => { root.cursor = i; root.cursor-id = row.id; root.cursor-channel = row.is-channel; list-focus.focus(); root.activate(row); } }
-                            // Channel management remains available by pointer and keyboard.
-                            if row.is-channel && (row-touch.has-hover || (list-focus.has-focus && root.cursor == i)): HorizontalLayout {
+                            channel-menu := ContextMenuArea {
+                                enabled: row.is-channel;
+                                Menu {
+                                    MenuItem { title: "进入频道"; enabled: !row.is-current; activated => { root.join-channel(row.id); } }
+                                    MenuSeparator { }
+                                    MenuItem { title: "重命名频道"; enabled: row.can-edit; activated => { root.begin-rename(row); } }
+                                    MenuItem { title: "删除频道…"; enabled: row.can-delete; activated => { root.creating = false; root.renaming = -1; root.deleting = row.id; list-focus.focus(); } }
+                                }
+                            }
+                            // The menu button also exposes management without a right mouse button.
+                            if row.is-channel: Rectangle {
                                 x: parent.width - self.width - 4px;
                                 y: 3px;
-                                width: (row.can-edit ? 26px : 0px) + (row.can-delete ? 26px : 0px);
+                                width: 34px;
                                 height: 28px;
-                                if row.can-edit: CallButton { width: 26px; height: 28px; icon: @image-url("icons/edit.svg"); accessible-label: "重命名频道 " + row.name; clicked => { root.rename-name = row.name; root.renaming = row.id; } }
-                                if row.can-delete: CallButton { width: 26px; height: 28px; icon: @image-url("icons/close.svg"); accessible-label: "删除频道 " + row.name; danger: true; clicked => { root.delete-channel(row.id); } }
+                                CallButton {
+                                    width: 100%; height: 100%; quiet: true; icon: @image-url("icons/more.svg");
+                                    accessible-label: "频道菜单 " + row.name;
+                                    clicked => { root.cursor = i; root.cursor-id = row.id; root.cursor-channel = true; channel-menu.show({ x: parent.x, y: parent.y + parent.height }); }
+                                }
+                            }
+                        }
+                        if row.is-channel && root.deleting == row.id && row.can-delete: VerticalLayout {
+                            padding: 6px;
+                            spacing: 6px;
+                            Text { text: "删除「" + row.name + "」？此操作无法撤销，成员和子频道将移至根频道。"; wrap: word-wrap; color: CallTokens.text; font-size: 12px; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                CallButton { label: "取消"; clicked => { root.deleting = -1; list-focus.focus(); } }
+                                CallButton { label: "确认删除"; danger: true; clicked => { root.delete-channel(row.id); root.deleting = -1; list-focus.focus(); } }
                             }
                         }
                     }
-                    if root.can-create && !root.creating: CallButton { height: 34px; quiet: true; label: "＋ 新建频道"; clicked => { root.creating = true; root.create-name = ""; } }
+                    if root.can-create && !root.creating: CallButton { height: 34px; quiet: true; label: "＋ 新建频道"; clicked => { root.renaming = -1; root.deleting = -1; root.creating = true; root.create-name = ""; } }
                     if root.can-create && root.creating: HorizontalLayout {
                         spacing: 4px;
                         Field { height: 32px; min-width: 0; horizontal-stretch: 1; placeholder: "频道名"; text <=> root.create-name; init => { self.focus(); } accepted => { if (root.create-name != "") { root.create-channel(root.create-name); root.creating = false; list-focus.focus(); } } }

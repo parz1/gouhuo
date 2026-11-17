@@ -501,5 +501,98 @@ fn portable_call_state_reaches_actual_slint_models_and_preserves_delegates() {
         "PTT mode must come from the snapshot while offline too"
     );
     assert_eq!(app.get_input_level(), 0.5);
+    // Exercise channel management through real delegates and popup menus.
+    app.set_connected(false);
+    settle(&window);
+    app.set_rows(ModelRc::new(VecModel::from(vec![
+        Row {
+            is_channel: true,
+            id: 71,
+            name: "Root".into(),
+            is_current: true,
+            can_edit: true,
+            ..Default::default()
+        },
+        Row {
+            is_channel: true,
+            id: 72,
+            name: "Room".into(),
+            can_edit: true,
+            can_delete: true,
+            ..Default::default()
+        },
+    ])));
+    app.set_connected(true);
+    app.set_recovery_message("".into());
+    window.set_size(slint::LogicalSize::new(760.0, 520.0));
+    settle(&window);
+    let joined = Rc::new(Cell::new(0));
+    let target = joined.clone();
+    app.on_join_channel(move |id| target.set(id));
+    let renamed = Rc::new(RefCell::new(Vec::new()));
+    let result = renamed.clone();
+    app.on_rename_channel(move |id, name| result.borrow_mut().push((id, name.to_string())));
+    let deleted = Rc::new(Cell::new(0));
+    let target = deleted.clone();
+    app.on_delete_channel(move |id| target.set(id));
+
+    let position = slint::LogicalPosition::new(40.0, 116.0);
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Right,
+    });
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: PointerEventButton::Right,
+    });
+    settle(&window);
+    assert_eq!(joined.get(), 0, "right-click must not join the channel");
+    key(&app, slint::platform::Key::DownArrow);
+    key(&app, slint::platform::Key::DownArrow);
+    key(&app, slint::platform::Key::Return);
+    settle(&window);
+    key(&app, slint::platform::Key::End);
+    key(&app, "X");
+    key(&app, slint::platform::Key::Return);
+    settle(&window);
+    assert_eq!(&*renamed.borrow(), &[(72, "RoomX".to_string())]);
+
+    // The visible menu button follows the same route. Deleting requires a
+    // second, explicit action, and Escape must cancel it without a request.
+    click(&app, 184.0, 116.0);
+    settle(&window);
+    key(&app, slint::platform::Key::UpArrow);
+    key(&app, slint::platform::Key::Return);
+    settle(&window);
+    assert_eq!(deleted.get(), 0);
+    key(&app, slint::platform::Key::Escape);
+    settle(&window);
+    assert_eq!(deleted.get(), 0);
+    click(&app, 184.0, 116.0);
+    settle(&window);
+    key(&app, slint::platform::Key::UpArrow);
+    key(&app, slint::platform::Key::Return);
+    settle(&window);
+    click(&app, 148.0, 207.0);
+    settle(&window);
+    assert_eq!(
+        deleted.get(),
+        72,
+        "confirmation must delete the selected channel"
+    );
+    // Even an administrator cannot delete the root channel.
+    click(&app, 184.0, 80.0);
+    settle(&window);
+    key(&app, slint::platform::Key::UpArrow);
+    key(&app, slint::platform::Key::Return);
+    settle(&window);
+    assert_eq!(
+        deleted.get(),
+        72,
+        "the root delete entry must remain disabled"
+    );
+    key(&app, slint::platform::Key::Escape);
     app.hide().unwrap();
 }
