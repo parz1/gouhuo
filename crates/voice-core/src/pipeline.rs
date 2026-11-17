@@ -1590,7 +1590,7 @@ mod tests {
         if mode == TransmitMode::PushToTalk {
             pipeline.set_transmitting(true);
         }
-        for chunk in onset.chunks_exact(FRAME_SAMPLES) {
+        for chunk in onset.as_chunks::<FRAME_SAMPLES>().0 {
             input
                 .send(chunk.iter().map(|&x| x as f32 / 32768.).collect())
                 .unwrap();
