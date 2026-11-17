@@ -257,6 +257,7 @@ pub struct PipelineControl {
 }
 
 struct Shared {
+    capture_epoch: AtomicU64,
     tunnel: Option<Arc<dyn crate::tunnel::VoiceTunnel>>,
     session_id: u32,
     udp_probe: AtomicU64,
@@ -420,6 +421,7 @@ impl Pipeline {
         let monitoring = Arc::new(AtomicBool::new(initial.monitoring));
         let send_enabled = Arc::new(AtomicBool::new(initial.send_enabled));
         let shared = Arc::new(Shared {
+            capture_epoch: AtomicU64::new(0),
             tunnel: tunnel.clone(),
             session_id: cfg.session_id,
             udp_probe: AtomicU64::new(0),
@@ -597,7 +599,9 @@ impl PipelineControl {
 
     /// 改变会话许可；禁用时不发送语音或保活，仍可检查设备就绪状态。
     pub fn set_send_enabled(&self, enabled: bool) {
-        self.send_enabled.store(enabled, Ordering::Relaxed);
+        if self.send_enabled.swap(enabled, Ordering::AcqRel) != enabled {
+            self.shared.capture_epoch.fetch_add(1, Ordering::Release);
+        }
         if !enabled {
             if let Some(tunnel) = &self.shared.tunnel {
                 tunnel.clear_send();
@@ -648,7 +652,9 @@ impl PipelineControl {
 
     /// 闭麦。压过说话键和 VAD。
     pub fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Relaxed);
+        if self.muted.swap(muted, Ordering::AcqRel) != muted {
+            self.shared.capture_epoch.fetch_add(1, Ordering::Release);
+        }
         if muted {
             if let Some(tunnel) = &self.shared.tunnel {
                 tunnel.clear_send();
@@ -690,7 +696,9 @@ impl PipelineControl {
 
     /// 换发送方式。链路不断，下一帧就生效。
     pub fn set_mode(&self, mode: TransmitMode) {
-        self.mode.store(mode.encode(), Ordering::Relaxed);
+        if self.mode.swap(mode.encode(), Ordering::AcqRel) != mode.encode() {
+            self.shared.capture_epoch.fetch_add(1, Ordering::Release);
+        }
         // 从语音激活切到按住说话时，如果不清一下，可能会卡在「一直在发」
         self.transmitting.store(false, Ordering::Relaxed);
         self.shared.sending.store(false, Ordering::Relaxed);
@@ -936,8 +944,14 @@ fn send_loop(
     // 中间静默了多久，而不是以为包丢了。
     let mut was_sending = false;
     let mut gate = TransmitGate::default();
+    // Up to 50 ms of weak onset immediately before VAD opens. Keep capture
+    // timestamps, and avoid adding digital silence to the receiver's queue.
+    const ONSET_FRAMES: usize = 5;
+    let mut onset = VecDeque::<(u32, [f32; FRAME_SAMPLES])>::with_capacity(ONSET_FRAMES);
+    let mut previous_epoch = shared.capture_epoch.load(Ordering::Acquire);
 
     while !stop.load(Ordering::Relaxed) {
+        let capture_epoch = shared.capture_epoch.load(Ordering::Acquire);
         match capture.read(&mut frame) {
             Ok(true) => {}
             Ok(false) => {
@@ -985,15 +999,35 @@ fn send_loop(
         // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
         // 这时候还漏出去一声是很糟糕的那种 bug。
         let gated_mode = mode.load(Ordering::Relaxed);
+        let blocked = muted.load(Ordering::Relaxed) || !send_enabled.load(Ordering::Relaxed);
+        let epoch = shared.capture_epoch.load(Ordering::Acquire);
+        if blocked || epoch != previous_epoch {
+            onset.clear();
+        }
+        previous_epoch = epoch;
         let sending = gate.update(
             TransmitMode::decode(gated_mode),
             level,
             transmitting.load(Ordering::Relaxed),
-            muted.load(Ordering::Relaxed) || !send_enabled.load(Ordering::Relaxed),
+            blocked,
         );
 
         if !sending {
             shared.sending.store(false, Ordering::Relaxed);
+            if !blocked && !was_sending && capture_epoch == epoch {
+                if let TransmitMode::VoiceActivity { threshold_db } =
+                    TransmitMode::decode(gated_mode)
+                {
+                    if level <= threshold_db - 18.0 {
+                        onset.clear();
+                    } else {
+                        if onset.len() == ONSET_FRAMES {
+                            onset.pop_front();
+                        }
+                        onset.push_back((timestamp, frame.as_slice().try_into().unwrap()));
+                    }
+                }
+            }
             if was_sending {
                 // 说完了。补一个 terminator，对面立刻收尾而不是等欠载。
                 let Some(seq) = sequences.next(false) else {
@@ -1016,43 +1050,50 @@ fn send_loop(
             continue;
         }
 
-        let Ok(packet) = encoder.encode(&frame) else {
-            shared.sending.store(false, Ordering::Relaxed);
-            continue;
-        };
-        let Some(seq) = sequences.next(false) else {
-            shared.transport_failed("语音加密序号已耗尽，需要重新连接。".into(), true);
-            return;
-        };
-        let header = VoiceHeader {
-            session: session_id,
-            seq,
-            timestamp,
-            flags: 0,
-        };
-        // 编码期间控制意愿可能变化；提交之前再检查，避免已退场的候选链路漏包。
-        // 模式也要跟开门时一样：按住说话放行的帧不能在切到语音激活之后发出去，
-        // 否则这一帧没经过 VAD 判定，还会留下一个过期的「正在发送」。
-        let current_mode = mode.load(Ordering::Relaxed);
-        let permitted = !stop.load(Ordering::Relaxed)
-            && send_enabled.load(Ordering::Relaxed)
-            && !muted.load(Ordering::Relaxed)
-            && current_mode == gated_mode
-            && (!matches!(TransmitMode::decode(current_mode), TransmitMode::PushToTalk)
-                || transmitting.load(Ordering::Relaxed));
-        let mut submitted = false;
-        if permitted && cipher.seal(header, packet, &mut wire).is_ok() {
-            match send_voice(&socket, server, shared, &wire) {
-                Ok(_) => {
-                    shared.packets_sent.fetch_add(1, Ordering::Relaxed);
-                    shared.transport_sent();
-                    submitted = true;
+        let pending = onset.iter().map(|(t, f)| (*t, f.as_slice()));
+        for (timestamp, samples) in pending.chain(std::iter::once((timestamp, frame.as_slice()))) {
+            let Ok(packet) = encoder.encode(samples) else {
+                shared.sending.store(false, Ordering::Relaxed);
+                continue;
+            };
+            let Some(seq) = sequences.next(false) else {
+                shared.transport_failed("语音加密序号已耗尽，需要重新连接。".into(), true);
+                return;
+            };
+            let header = VoiceHeader {
+                session: session_id,
+                seq,
+                timestamp,
+                flags: 0,
+            };
+            // 编码期间控制意愿可能变化；提交之前再检查，避免已退场的候选链路漏包。
+            // 模式也要跟开门时一样：按住说话放行的帧不能在切到语音激活之后发出去，
+            // 否则这一帧没经过 VAD 判定，还会留下一个过期的「正在发送」。
+            let current_mode = mode.load(Ordering::Relaxed);
+            let permitted = !stop.load(Ordering::Relaxed)
+                && send_enabled.load(Ordering::Relaxed)
+                && !muted.load(Ordering::Relaxed)
+                && shared.capture_epoch.load(Ordering::Acquire) == epoch
+                && current_mode == gated_mode
+                && (!matches!(TransmitMode::decode(current_mode), TransmitMode::PushToTalk)
+                    || transmitting.load(Ordering::Relaxed));
+            let mut submitted = false;
+            if permitted && cipher.seal(header, packet, &mut wire).is_ok() {
+                match send_voice(&socket, server, shared, &wire) {
+                    Ok(_) => {
+                        shared.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        shared.transport_sent();
+                        submitted = true;
+                    }
+                    Err(error) => {
+                        shared.transport_failed(format!("语音包发送失败：{error}"), false)
+                    }
                 }
-                Err(error) => shared.transport_failed(format!("语音包发送失败：{error}"), false),
             }
+            shared.sending.store(submitted, Ordering::Relaxed);
+            was_sending = submitted;
         }
-        shared.sending.store(submitted, Ordering::Relaxed);
-        was_sending = submitted;
+        onset.clear();
     }
 }
 
@@ -1507,6 +1548,103 @@ mod tests {
             Some("sequence exhausted")
         );
         assert_eq!(owner.stats().error.as_deref(), Some("sequence exhausted"));
+    }
+
+    // No platform audio backend: feed PCM one frame at a time, decrypt and
+    // decode the outgoing packets on localhost, and inspect the samples.
+    fn short_callout(mode: TransmitMode) {
+        struct Frames(std::sync::mpsc::Receiver<Vec<f32>>);
+        impl Capture for Frames {
+            fn read(&mut self, out: &mut [f32]) -> io::Result<bool> {
+                let Ok(frame) = self.0.recv() else {
+                    return Ok(false);
+                };
+                out.copy_from_slice(&frame);
+                Ok(true)
+            }
+        }
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (input, frames) = std::sync::mpsc::sync_channel(0);
+        let pipeline = Pipeline::start_with_state(
+            PipelineConfig {
+                sequences: Arc::new(protocol::VoiceSequences::default()),
+                session_id: 1,
+                server: sink.local_addr().unwrap(),
+                upstream_key: [1; 32],
+                downstream_key: [2; 32],
+                jitter: default_jitter(),
+                mode,
+            },
+            Box::new(Frames(frames)),
+            Box::new(crate::audio::NullRender::default()),
+            None,
+            PipelineState::default(),
+        )
+        .unwrap();
+        // Quiet 40 ms onset followed by a louder, distinct vowel-like tone.
+        let onset = crate::signal::chirp(4 * FRAME_SAMPLES, SAMPLE_RATE, 800., 2200., 0.006);
+        for _ in 0..10 {
+            input.send(vec![0.; FRAME_SAMPLES]).unwrap();
+        }
+        if mode == TransmitMode::PushToTalk {
+            pipeline.set_transmitting(true);
+        }
+        for chunk in onset.as_chunks::<FRAME_SAMPLES>().0 {
+            input
+                .send(chunk.iter().map(|&x| x as f32 / 32768.).collect())
+                .unwrap();
+        }
+        for _ in 0..8 {
+            input
+                .send(
+                    (0..FRAME_SAMPLES)
+                        .map(|i| 0.2 * (i as f32 * 0.04).sin())
+                        .collect(),
+                )
+                .unwrap();
+        }
+        drop(input);
+        let cipher = VoiceCipher::new(&[1; 32]);
+        let mut wire = [0; MAX_DATAGRAM];
+        let mut packet = Vec::new();
+        let mut decoder = VoiceDecoder::new().unwrap();
+        let mut decoded = Vec::new();
+        let mut times = Vec::new();
+        loop {
+            let n = sink.recv(&mut wire).unwrap();
+            let Ok(h) = cipher.open(&wire[..n], &mut packet) else {
+                continue;
+            };
+            if h.flags != 0 {
+                continue;
+            }
+            let mut frame = [0.; FRAME_SAMPLES];
+            decoder.decode(&packet, &mut frame).unwrap();
+            times.push(h.timestamp / FRAME_SAMPLES as u32);
+            decoded.extend(frame.map(|s| (s * 32767.) as i16));
+            if times.last() == Some(&22) {
+                break;
+            }
+        }
+        assert!(
+            times.contains(&11),
+            "{mode:?} missing onset; received {times:?}"
+        );
+        let offset = times.iter().position(|&t| t == 11).unwrap() * FRAME_SAMPLES;
+        let score = crate::signal::best_lag(&onset, &decoded[offset..], 120, 1000, 600)
+            .unwrap()
+            .peak;
+        eprintln!("{mode:?} onset correlation {score:.3}");
+        assert!(score > 0.5);
+    }
+    #[test]
+    fn short_callout_ptt() {
+        short_callout(TransmitMode::PushToTalk);
+    }
+    #[test]
+    fn short_callout_vad() {
+        short_callout(TransmitMode::VoiceActivity { threshold_db: -45. });
     }
 
     #[test]
