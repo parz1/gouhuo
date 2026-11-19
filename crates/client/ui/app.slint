@@ -312,20 +312,9 @@ export component App inherits Window {
     in property <bool> capture-is-virtual: false;
     /// 我能不能建频道（访客不能）。决定显不显示列表底部那一行。
     in property <bool> can-create-channel: false;
-    /// 「新建频道」那一行有没有展开成输入框。纯界面状态，不出这个文件。
-    property <bool> newchan-open: false;
-    property <string> newchan-name;
-    /// 展开了音量滑条的那个人的会话 id。-1 表示都收着。纯界面状态。
-    property <int> volume-open: -1;
-    /// 点了一次「封禁」、等第二次确认的那个人。-1 表示没有。
-    property <int> ban-armed: -1;
-    /// 正在改名的频道。-1 表示没有。
-    property <int> renaming: -1;
-    property <string> rename-draft;
     /// 我是不是管理员。决定显不显示封禁名单。
     in property <bool> is-admin: false;
     in property <[BanRow]> bans;
-    property <bool> bans-open: false;
     /// 正在挨个试麦克风。
     in property <bool> scanning: false;
     in property <[ScanRow]> scan-results;
